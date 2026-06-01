@@ -1,0 +1,230 @@
+#!/usr/bin/python3
+# Use system python explicitly: PyGObject (gi) ships with the distro's
+# python and venvs (.platformio etc.) typically don't have it. `env python3`
+# would resolve to whatever venv comes first in PATH and fail with
+# ModuleNotFoundError: gi.
+"""
+immurok 指纹认证弹窗 — 由 daemon 在收到 AUTH 或 AGENT_APPROVE 请求时启动
+
+两种模式：
+  默认（无参数）：通用 PAM 指纹弹窗（gdm-password / login / polkit-1
+  这种被动 AUTH 触发），只显示"请按指纹"。
+  --agent --command STR [--timeout 30]：imk run --agent 主动调用，显示
+  被包裹的命令 pill + 倒计时进度条，让用户清楚知道授权范围。
+
+退出语义：
+  daemon 在认证完成（指纹通过 / BLE 失败 / 超时）后发 SIGTERM 关闭窗口
+  （exit 0）。用户主动点"取消"或关闭窗口走 exit 1，daemon 读到非 0
+  退出码即视为 REJECT。
+"""
+
+import argparse
+import signal
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk
+
+
+def _truncate(text: str, limit: int = 80) -> str:
+    """单行化 + 截断超长命令，pill 不会撑爆窗口"""
+    text = text.replace("\n", " ").replace("\r", " ").strip()
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+class AuthDialog(Adw.Application):
+    def __init__(self, *, agent_mode: bool, command: str, timeout: int) -> None:
+        super().__init__(application_id="com.immurok.auth-dialog")
+        self.agent_mode = agent_mode
+        self.command = command
+        self.timeout_total = max(1, timeout)
+        self._countdown_remaining = self.timeout_total
+        self._tick_source = None
+        self._t_start = 0.0
+        self._progress = None
+        self._count_label = None
+
+    def do_activate(self) -> None:
+        win = Adw.Window(application=self, title="immurok")
+        win.set_default_size(420 if self.agent_mode else 340, -1)
+        win.set_resizable(False)
+        win.connect("close-request", lambda _: self._on_cancel())
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(28)
+        content.set_margin_bottom(12)
+        content.set_margin_start(28)
+        content.set_margin_end(28)
+        content.set_halign(Gtk.Align.CENTER)
+
+        # 图标：agent 模式用 key，普通模式用 fingerprint
+        icon_name = "dialog-password-symbolic" if self.agent_mode else "fingerprint-symbolic"
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(56)
+        if self.agent_mode:
+            icon.add_css_class("accent")
+        else:
+            icon.add_css_class("dim-label")
+        content.append(icon)
+
+        # 标题
+        title_text = "Agent 授权请求" if self.agent_mode else "指纹认证"
+        title = Gtk.Label(label=title_text)
+        title.add_css_class("title-2")
+        content.append(title)
+
+        # 提示文字
+        body_text = (
+            "agent 正在请求执行命令，按指纹批准："
+            if self.agent_mode
+            else "请按指纹传感器进行认证"
+        )
+        body = Gtk.Label(label=body_text)
+        body.add_css_class("body")
+        body.add_css_class("dim-label")
+        body.set_wrap(True)
+        body.set_max_width_chars(40)
+        content.append(body)
+
+        # agent 模式下：命令 pill (card-styled box with monospace label)
+        if self.agent_mode and self.command:
+            frame = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            frame.add_css_class("card")
+            frame.set_halign(Gtk.Align.CENTER)
+
+            inner = Gtk.Label(label=_truncate(self.command))
+            inner.set_selectable(True)
+            inner.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+            inner.set_max_width_chars(48)
+            inner.add_css_class("monospace")
+            inner.set_margin_top(8)
+            inner.set_margin_bottom(8)
+            inner.set_margin_start(14)
+            inner.set_margin_end(14)
+            frame.append(inner)
+            content.append(frame)
+
+        # spinner（永远转）
+        spinner = Gtk.Spinner(spinning=True)
+        spinner.set_size_request(24, 24)
+        spinner.set_halign(Gtk.Align.CENTER)
+        spinner.set_margin_top(4)
+        content.append(spinner)
+
+        outer.append(content)
+
+        # agent 模式：倒计时进度条 + 数字
+        if self.agent_mode:
+            count_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            count_box.set_margin_start(28)
+            count_box.set_margin_end(28)
+            count_box.set_margin_top(4)
+            count_box.set_margin_bottom(8)
+
+            self._progress = Gtk.ProgressBar()
+            self._progress.set_fraction(1.0)
+            self._progress.set_hexpand(True)
+            self._progress.set_valign(Gtk.Align.CENTER)
+            count_box.append(self._progress)
+
+            self._count_label = Gtk.Label(label=f"{self.timeout_total}s")
+            self._count_label.add_css_class("caption")
+            self._count_label.add_css_class("dim-label")
+            self._count_label.set_width_chars(4)
+            self._count_label.set_xalign(1.0)
+            count_box.append(self._count_label)
+
+            outer.append(count_box)
+
+            self._t_start = time.monotonic()
+            # 每 250ms 刷一次：进度条平滑，数字按整秒变
+            self._tick_source = GLib.timeout_add(250, self._on_tick)
+
+        outer.append(Gtk.Separator())
+
+        # 取消按钮
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        btn_box.set_margin_top(12)
+        btn_box.set_margin_bottom(12)
+        btn_box.set_margin_start(12)
+        btn_box.set_margin_end(12)
+        btn_box.set_halign(Gtk.Align.END)
+
+        cancel_btn = Gtk.Button(label="取消")
+        cancel_btn.add_css_class("pill")
+        if self.agent_mode:
+            cancel_btn.add_css_class("destructive-action")
+        cancel_btn.connect("clicked", lambda _: self._on_cancel())
+        btn_box.append(cancel_btn)
+
+        outer.append(btn_box)
+
+        win.set_content(outer)
+        win.present()
+
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._on_term)
+
+    def _on_tick(self) -> bool:
+        elapsed = time.monotonic() - self._t_start
+        remaining = max(0.0, self.timeout_total - elapsed)
+        fraction = remaining / self.timeout_total
+        if self._progress is not None:
+            self._progress.set_fraction(fraction)
+        whole = int(remaining + 0.5)
+        if whole != self._countdown_remaining:
+            self._countdown_remaining = whole
+            if self._count_label is not None:
+                self._count_label.set_label(f"{whole}s")
+        if remaining <= 0:
+            # 进度归零 — 维持窗口直到 daemon 发 SIGTERM 或用户取消。
+            # 不主动退出避免 dialog 时钟和 daemon FP gate 超时不同步
+            # 导致的"用户还在按指纹结果窗口先关了"诡异体验。
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _on_cancel(self) -> bool:
+        if self._tick_source is not None:
+            GLib.source_remove(self._tick_source)
+            self._tick_source = None
+        self.quit()
+        sys.exit(1)
+
+    def _on_term(self) -> bool:
+        if self._tick_source is not None:
+            GLib.source_remove(self._tick_source)
+            self._tick_source = None
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="immurok auth dialog")
+    p.add_argument("--agent", action="store_true",
+                   help="agent approval mode (show command + countdown)")
+    p.add_argument("--command", default="",
+                   help="wrapped command string (agent mode only)")
+    p.add_argument("--timeout", type=int, default=30,
+                   help="countdown seconds (default 30)")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    app = AuthDialog(
+        agent_mode=args.agent,
+        command=args.command,
+        timeout=args.timeout,
+    )
+    app.run([])
+
+
+if __name__ == "__main__":
+    main()
