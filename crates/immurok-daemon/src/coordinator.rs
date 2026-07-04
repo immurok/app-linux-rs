@@ -99,6 +99,21 @@ pub struct FpMatchEvent {
     pub page_id: u16,
 }
 
+/// In-progress FP-gate feedback, broadcast so the SSH agent can echo a hint
+/// on the client's own terminal (which it otherwise has no way to reach).
+/// Only the per-attempt mismatch is broadcast here; the final approve/deny
+/// outcome already flows back as the gated command's result.
+#[derive(Debug, Clone, Copy)]
+pub enum FpGateEvent {
+    /// A touch didn't match; `remaining` attempts left before the gate fails.
+    Mismatch { remaining: u8 },
+    /// The touch matched (device sent RSP_FP_GATE_APPROVED). The device now
+    /// spends ~2 s computing the signature before the gated call returns, so
+    /// this is the right moment to show "verified — signing…" — not when the
+    /// signature finally lands.
+    Approved,
+}
+
 pub struct Coordinator {
     // Shared state
     pub pairing: RwLock<Option<PairingData>>,
@@ -116,6 +131,7 @@ pub struct Coordinator {
     pub ble_cmd_tx: mpsc::Sender<BleCommand>,
     pub fp_match_tx: broadcast::Sender<FpMatchEvent>,
     pub enroll_tx: broadcast::Sender<EnrollEvent>,
+    pub fp_gate_tx: broadcast::Sender<FpGateEvent>,
 
     // PAM pending auth
     pending_pam: RwLock<Option<tokio::sync::oneshot::Sender<bool>>>,
@@ -157,6 +173,7 @@ impl Coordinator {
     ) -> Arc<Self> {
         let (fp_match_tx, _) = broadcast::channel(16);
         let (enroll_tx, _) = broadcast::channel(16);
+        let (fp_gate_tx, _) = broadcast::channel(16);
 
         Arc::new(Self {
             pairing: RwLock::new(None),
@@ -170,6 +187,7 @@ impl Coordinator {
             ble_cmd_tx,
             fp_match_tx,
             enroll_tx,
+            fp_gate_tx,
             pending_pam: RwLock::new(None),
             pre_auth: RwLock::new(None),
             last_auth_flow: RwLock::new(None),
@@ -362,6 +380,17 @@ impl Coordinator {
             .await
             .map_err(|_| "BLE channel closed".to_string())?;
         rx.await.map_err(|_| "BLE reply dropped".to_string())?
+    }
+
+    /// Broadcast an in-progress FP-gate event (best-effort; no-op when nobody
+    /// is subscribed, e.g. a sudo/PAM gate rather than an SSH sign).
+    pub fn emit_fp_gate_event(&self, ev: FpGateEvent) {
+        let _ = self.fp_gate_tx.send(ev);
+    }
+
+    /// Subscribe to in-progress FP-gate events for the duration of one gate.
+    pub fn subscribe_fp_gate(&self) -> broadcast::Receiver<FpGateEvent> {
+        self.fp_gate_tx.subscribe()
     }
 
     /// Send an FP-gated BLE command (device prompts for fingerprint before executing)

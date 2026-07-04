@@ -36,7 +36,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ── Main run loop ───────────────────────────────────────────────────────────
 
 pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCommand>) {
+    let mut backoff_secs = BLE_RECONNECT_INTERVAL_SECS;
     loop {
+        let session_start = tokio::time::Instant::now();
         match connect_and_serve(&coordinator, &mut cmd_rx).await {
             Ok(()) => info!("BLE session ended normally"),
             Err(e) => warn!("BLE session error: {}", e),
@@ -45,12 +47,26 @@ pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCo
         coordinator.is_device_verified.store(false, Ordering::Relaxed);
         *coordinator.device_status.write().await = None;
 
-        // Brief backoff before retrying. Without this, a GATT discovery
-        // failure (transient BlueZ state where Connected=true but the GATT
-        // tree hasn't repopulated yet) spins the loop hundreds of times
-        // per second, flooding the log file and keeping BlueZ saturated
-        // long enough that it never recovers.
-        tokio::time::sleep(Duration::from_millis(BLE_RECONNECT_INTERVAL_SECS * 1000)).await;
+        // Backoff before retrying. A GATT discovery failure (transient BlueZ
+        // state where Connected=true but the GATT tree hasn't repopulated yet)
+        // makes connect_and_serve fail almost instantly, which without backoff
+        // would re-spawn the helper hundreds of times per second, flood the log
+        // file, and keep BlueZ saturated long enough that it never recovers.
+        //
+        // A session that survived BLE_SESSION_STABLE_SECS was real work (normal
+        // connect → later disconnect) → reset to the fast base so a normal drop
+        // reconnects promptly. A session that died almost immediately is the
+        // degenerate state above → grow the backoff 1→2→4…→ceiling so the
+        // stuck case idles quietly instead of spinning.
+        if session_start.elapsed() >= Duration::from_secs(BLE_SESSION_STABLE_SECS) {
+            backoff_secs = BLE_RECONNECT_INTERVAL_SECS;
+        } else {
+            warn!("BLE session failed fast (<{}s) — backoff {}s", BLE_SESSION_STABLE_SECS, backoff_secs);
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        // Arm the next level AFTER sleeping, so the first fast failure still
+        // only waits the base interval; a stable session already reset it.
+        backoff_secs = (backoff_secs * 2).min(BLE_RECONNECT_BACKOFF_MAX_SECS);
 
         info!("Waiting for device reconnection...");
         wait_for_device_connected(&coordinator).await;
@@ -239,15 +255,24 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
         }
     };
 
-    // Polling fallback: periodically check in case events are missed.
-    // 2s (was 5s) — small enough that resume-without-logind-signal still
-    // recovers reasonably, large enough not to thrash BlueZ.
+    // Active-connect fallback. Previously this only *polled* Connected state,
+    // which recovers only if SOMETHING else reconnects the device. But BlueZ
+    // does not reliably auto-reconnect BLE LE devices, and the resume kick
+    // below only covers suspend/resume — so a plain out-of-range → back-in-
+    // range drop (no suspend) had no active reconnection path and the daemon
+    // could wait forever. Here we periodically fire an active Device.Connect()
+    // ourselves. check_immurok_connected() first is the cheap fast path when
+    // the link is already up (e.g. BlueZ HID auto-reconnect did fire).
     let poll_wait = async {
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
             if check_immurok_connected().await {
                 return;
             }
+            if try_active_connect().await {
+                info!("Device connected (active-connect fallback)");
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(BLE_ACTIVE_RECONNECT_INTERVAL_SECS)).await;
         }
     };
 
@@ -781,6 +806,12 @@ async fn route_notification(
     // 4. FP-gate approved (0x10) — swallow
     if first == RSP_FP_GATE_APPROVED && (state.gate_pending || state.pair_fp_gate) {
         debug!("FP-gate approved, waiting for result");
+        if state.gate_pending {
+            // Touch matched; signing (~2s) starts now. Let the SSH agent flip
+            // the terminal hint to "verified — signing…" at this instant
+            // rather than when the signature finally returns.
+            coordinator.emit_fp_gate_event(crate::coordinator::FpGateEvent::Approved);
+        }
         return;
     }
 
@@ -793,6 +824,12 @@ async fn route_notification(
             if rem == 0 {
                 if let Some(tx) = state.gate_tx.take() { let _ = tx.send((false, Some(RSP_ERR_FP_NOT_MATCH))); }
                 state.gate_pending = false;
+            } else {
+                // Still retryable — let the SSH agent echo the count on the
+                // client terminal (the final rem==0 deny rides the result).
+                coordinator.emit_fp_gate_event(
+                    crate::coordinator::FpGateEvent::Mismatch { remaining: rem },
+                );
             }
             return;
         }
@@ -1144,10 +1181,25 @@ async fn read_name_entries(
                 let name_bytes: Vec<u8> =
                     data[0..name_len].iter().copied().take_while(|&b| b != 0).collect();
                 let name = String::from_utf8_lossy(&name_bytes).to_string();
+                // OTP entries carry an issuer/service field right after the
+                // name (otp_entry_t.service[30]); surface it in the cache.
+                let service = if category == KEY_CAT_OTP
+                    && data.len() >= name_len + SERVICE_LEN_OTP
+                {
+                    let svc_bytes: Vec<u8> = data[name_len..name_len + SERVICE_LEN_OTP]
+                        .iter()
+                        .copied()
+                        .take_while(|&b| b != 0)
+                        .collect();
+                    String::from_utf8_lossy(&svc_bytes).to_string()
+                } else {
+                    String::new()
+                };
                 entries.push(keystore::KeyNameEntry {
                     index: idx,
                     category: cat_str.to_string(),
                     name,
+                    service,
                 });
             }
             Err(e) => warn!("Failed to read {} key name {}: {}", cat_str, idx, e),
@@ -1215,7 +1267,10 @@ async fn send_fp_gated_inner(
     if rsp.is_empty() { return Err("empty response".into()); }
 
     let status = rsp[0];
-    if status == RSP_OK { return Ok((RSP_OK, rsp)); }
+    // Cooldown fast path: the command ran immediately. Strip the status
+    // byte like the plain SendCommand path does — callers that consume the
+    // payload (KEY_OTP_GET's 6-digit code) must not see the frame header.
+    if status == RSP_OK { return Ok((RSP_OK, rsp[1..].to_vec())); }
 
     // Two paths into the gate:
     //   - 0x11 RSP_WAIT_FP: cold path, firmware needs the user to touch

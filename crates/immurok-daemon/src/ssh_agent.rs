@@ -13,7 +13,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -78,7 +78,9 @@ pub async fn serve(coordinator: Arc<Coordinator>, socket_path: &Path) {
 }
 
 /// Verify peer is current user via SO_PEERCRED.
-fn verify_peer_uid(stream: &UnixStream) -> Result<(), String> {
+/// Verify the connecting process runs as our own UID and return its PID
+/// (from SO_PEERCRED) so the sign path can find the client's terminal.
+fn verify_peer_uid(stream: &UnixStream) -> Result<i32, String> {
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();
@@ -107,7 +109,7 @@ fn verify_peer_uid(stream: &UnixStream) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok(cred.pid)
 }
 
 /// Handle a single SSH agent client connection (multiple request/response exchanges).
@@ -115,10 +117,13 @@ async fn handle_agent_client(
     mut stream: UnixStream,
     coord: Arc<Coordinator>,
 ) -> Result<(), String> {
-    if let Err(e) = verify_peer_uid(&stream) {
-        warn!("SSH agent peer check failed: {}", e);
-        return Err(e);
-    }
+    let peer_pid = match verify_peer_uid(&stream) {
+        Ok(pid) => pid,
+        Err(e) => {
+            warn!("SSH agent peer check failed: {}", e);
+            return Err(e);
+        }
+    };
 
     // SSH agent protocol: multiple request/response per connection
     loop {
@@ -148,7 +153,7 @@ async fn handle_agent_client(
                 handle_request_identities(&mut stream, &coord).await;
             }
             SSH_AGENTC_SIGN_REQUEST => {
-                handle_sign_request(&mut stream, &coord, payload).await;
+                handle_sign_request(&mut stream, &coord, payload, peer_pid).await;
             }
             _ => {
                 debug!("SSH agent: unknown message type: {}", msg_type);
@@ -185,6 +190,7 @@ async fn handle_sign_request(
     stream: &mut UnixStream,
     coord: &Arc<Coordinator>,
     payload: &[u8],
+    peer_pid: i32,
 ) {
     // Parse: [string key_blob][string data][uint32 flags]
     let mut offset = 0;
@@ -261,22 +267,80 @@ async fn handle_sign_request(
     let mut sign_payload = vec![protocol::KEY_CAT_SSH, idx, 0];
     sign_payload.extend_from_slice(&hash);
 
-    // KEY_SIGN is FP-gated — device prompts for fingerprint
-    let sign_result = tokio::time::timeout(
-        Duration::from_secs(50), // 30s FP gate + margin
-        coord.ble_send_fp_gated(protocol::CMD_KEY_SIGN, sign_payload),
-    )
-    .await;
+    // The ssh-agent is a background daemon with no handle to the terminal
+    // that issued this request, so it can't print a "touch your finger" hint
+    // the way the PAM module does for sudo. Resolve the client's controlling
+    // terminal from its PID (SO_PEERCRED) and animate a spinner there for the
+    // duration of the FP gate. Best-effort: no tty → no spinner, never fatal.
+    // Yellow to match the PAM (sudo) spinner. The message carries its own
+    // colour so set_message can switch to red/green mid-gate; the frame is
+    // coloured by the spinner itself.
+    let mut spinner = client_tty_path(peer_pid).and_then(|tty| {
+        spawn_tty_spinner(tty, "\x1b[33mPlease verify your fingerprint...\x1b[0m")
+    });
+
+    // KEY_SIGN is FP-gated. Drive the gated call while listening for gate
+    // events so the client terminal tracks the device in real time: each
+    // mismatch ("✗ not recognized — N left"), and the approval status code
+    // ("✓ Verified — signing…") which the device sends ~2s *before* the
+    // signature returns. The final outcome is the gated call's own result.
+    // Own 50s deadline = 30s FP gate + margin.
+    let mut gate_events = coord.subscribe_fp_gate();
+    let gate_fut = coord.ble_send_fp_gated(protocol::CMD_KEY_SIGN, sign_payload);
+    tokio::pin!(gate_fut);
+    let deadline = tokio::time::sleep(Duration::from_secs(50));
+    tokio::pin!(deadline);
+    let sign_result = loop {
+        tokio::select! {
+            r = &mut gate_fut => break Ok(r),
+            _ = &mut deadline => break Err(()),
+            ev = gate_events.recv() => {
+                match ev {
+                    Ok(crate::coordinator::FpGateEvent::Mismatch { remaining }) => {
+                        if let Some(sp) = spinner.as_ref() {
+                            let noun = if remaining == 1 { "attempt" } else { "attempts" };
+                            sp.set_message(format!(
+                                "\x1b[31m✗ Fingerprint not recognized\x1b[0m — {} {} left, touch again…",
+                                remaining, noun
+                            ));
+                        }
+                    }
+                    Ok(crate::coordinator::FpGateEvent::Approved) => {
+                        // Touch matched — device is now signing. The spinner
+                        // keeps spinning until the signature is actually read
+                        // back, so the hint tracks real progress (no fixed delay).
+                        if let Some(sp) = spinner.as_ref() {
+                            sp.set_message("\x1b[32m✓ Verified — signing...\x1b[0m");
+                        }
+                    }
+                    Err(_) => {} // Lagged/Closed → keep awaiting the gate result.
+                }
+            }
+        }
+    };
 
     let (status, key_sign_resp) = match sign_result {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             warn!("SSH agent: KEY_SIGN BLE error: {}", e);
+            let line = if e.contains("0x07") {
+                "\x1b[31m✗ Fingerprint not recognized — verification failed\x1b[0m"
+            } else if e.contains("timeout") || e.contains("0x06") {
+                "\x1b[31m✗ Fingerprint verification timed out\x1b[0m"
+            } else {
+                "\x1b[31m✗ Fingerprint verification failed\x1b[0m"
+            };
+            if let Some(sp) = spinner.take() {
+                sp.finish(Some(line.into()));
+            }
             send_failure(stream).await;
             return;
         }
-        Err(_) => {
+        Err(()) => {
             warn!("SSH agent: KEY_SIGN timeout");
+            if let Some(sp) = spinner.take() {
+                sp.finish(Some("\x1b[31m✗ Fingerprint verification timed out\x1b[0m".into()));
+            }
             send_failure(stream).await;
             return;
         }
@@ -284,9 +348,17 @@ async fn handle_sign_request(
 
     if status != protocol::RSP_OK && status != protocol::RSP_FP_GATE_APPROVED {
         warn!("SSH agent: KEY_SIGN failed: status=0x{:02x}", status);
+        if let Some(sp) = spinner.take() {
+            sp.finish(Some("\x1b[31m✗ Fingerprint verification failed\x1b[0m".into()));
+        }
         send_failure(stream).await;
         return;
     }
+
+    // FP gate approved. Keep the "✓ Verified — signing…" spinner running while
+    // we read the signature back over BLE (KEY_RESULT, ~1-2s) — it's erased
+    // only once the signature is actually in hand, so the hint covers the real
+    // duration with no blank gap and no fixed delay.
 
     // After KEY_SIGN approval, read the actual signature via KEY_RESULT.
     // Wire-level response: [status:1B][total:1B][offset:1B][data:<=59B]
@@ -341,6 +413,9 @@ async fn handle_sign_request(
                 "SSH agent: failed to read signature (got {} bytes)",
                 signature.len()
             );
+            if let Some(sp) = spinner.take() {
+                sp.finish(Some("\x1b[31m✗ Signing failed\x1b[0m".into()));
+            }
             send_failure(stream).await;
             return;
         }
@@ -369,6 +444,12 @@ async fn handle_sign_request(
     let mut body = Vec::new();
     body.push(SSH_AGENT_SIGN_RESPONSE);
     append_ssh_string(&mut body, &sig_blob);
+
+    // Signature in hand — stop the spinner (erase, like sudo) right as we hand
+    // it back, so "signing…" spans exactly the real signing+readback window.
+    if let Some(sp) = spinner.take() {
+        sp.finish(None);
+    }
 
     send_agent_message(stream, &body).await;
     info!(
@@ -415,6 +496,114 @@ async fn send_agent_message(stream: &mut UnixStream, body: &[u8]) {
 /// Send SSH_AGENT_FAILURE.
 async fn send_failure(stream: &mut UnixStream) {
     send_agent_message(stream, &[SSH_AGENT_FAILURE]).await;
+}
+
+/// Resolve the controlling terminal of the process connected to the agent
+/// socket, so the FP-gate prompt lands on the terminal that ran `git push` /
+/// `ssh host`. ssh keeps its stderr (fd 2) on the terminal even when git
+/// pipes its stdin/stdout, so try fd 2 first, then 0/1. None if no fd points
+/// at a pts/tty (e.g. fully detached / piped).
+fn client_tty_path(pid: i32) -> Option<std::path::PathBuf> {
+    for fd in [2, 0, 1] {
+        if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+            let s = target.to_string_lossy();
+            if s.starts_with("/dev/pts/") || s.starts_with("/dev/tty") {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// Animated spinner written directly to the client's terminal while the FP
+/// gate is open — the ssh-agent equivalent of the PAM module's spinner. A
+/// dedicated OS thread re-draws the (mutable) message line every 80 ms.
+/// `set_message` swaps the text mid-gate (e.g. on a mismatch); `finish`
+/// stops the thread and either leaves a final line or erases it. `Drop`
+/// erases as a fallback for any return path that didn't call `finish`.
+struct TtySpinner {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    msg: Arc<Mutex<String>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    tty: std::path::PathBuf,
+    finalized: bool,
+}
+
+impl TtySpinner {
+    /// Replace the spinning line's text (kept until the next call / finish).
+    fn set_message(&self, m: impl Into<String>) {
+        if let Ok(mut g) = self.msg.lock() {
+            *g = m.into();
+        }
+    }
+
+    /// Stop the spinner. `Some(line)` leaves that line on the terminal (with a
+    /// trailing newline); `None` erases the spinner line. Consumes self.
+    fn finish(mut self, final_line: Option<String>) {
+        self.finalize(final_line);
+    }
+
+    fn finalize(&mut self, final_line: Option<String>) {
+        use std::io::Write;
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.tty) {
+            match final_line {
+                Some(l) => {
+                    let _ = write!(f, "\r\x1b[K{}\n", l);
+                }
+                None => {
+                    let _ = f.write_all(b"\r\x1b[K"); // carriage return + erase to EOL
+                }
+            }
+            let _ = f.flush();
+        }
+    }
+}
+
+impl Drop for TtySpinner {
+    fn drop(&mut self) {
+        self.finalize(None);
+    }
+}
+
+/// Start a [`TtySpinner`] on `tty`. None if the terminal can't be opened.
+fn spawn_tty_spinner(tty: std::path::PathBuf, initial_msg: &str) -> Option<TtySpinner> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).open(&tty).ok()?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_t = stop.clone();
+    let msg = Arc::new(Mutex::new(initial_msg.to_string()));
+    let msg_t = msg.clone();
+    let join = std::thread::Builder::new()
+        .name("imk-ssh-spinner".into())
+        .spawn(move || {
+            const FRAMES: [&str; 10] =
+                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0usize;
+            while !stop_t.load(Ordering::Relaxed) {
+                let line = msg_t.lock().map(|g| g.clone()).unwrap_or_default();
+                // \r + erase-line + yellow frame + " " + message (self-coloured)
+                let _ = write!(f, "\r\x1b[K\x1b[33m{}\x1b[0m {}", FRAMES[i % FRAMES.len()], line);
+                let _ = f.flush();
+                i += 1;
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        })
+        .ok()?;
+    Some(TtySpinner {
+        stop,
+        msg,
+        join: Some(join),
+        tty,
+        finalized: false,
+    })
 }
 
 // ── SSH wire format helpers ─────────────────────────────────

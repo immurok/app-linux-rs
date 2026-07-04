@@ -96,6 +96,15 @@ pub const NAME_LEN_SSH: usize = 16;
 pub const NAME_LEN_OTP: usize = 30;
 pub const NAME_LEN_API: usize = 32;
 
+// Remaining otp_entry_t / api_entry_t fields (firmware structs):
+//   otp_entry_t = name[30] + service[30] + secret[32]  (92B)
+//   api_entry_t = name[32] + key[128]                  (160B)
+// TOTP reads the secret at offset 60 — an import payload that omits the
+// service field lands the secret in the wrong slot and yields no codes.
+pub const SERVICE_LEN_OTP: usize = 30;
+pub const SECRET_LEN_OTP: usize = 32;
+pub const VALUE_LEN_API: usize = 128;
+
 // Enroll status values
 pub const ENROLL_WAITING: u8 = 0x00;
 pub const ENROLL_CAPTURED: u8 = 0x01;
@@ -112,6 +121,23 @@ pub const MAX_PAYLOAD_SIZE: usize = 62;
 pub const BLE_COMMAND_TIMEOUT_SECS: u64 = 5;
 pub const BLE_RECONNECT_INTERVAL_SECS: u64 = 1;
 pub const BLE_CONNECTING_TIMEOUT_SECS: u64 = 10;
+// Reconnect backoff ceiling. The 1s base above is the FAST path for a normal
+// disconnect (device left, session was stable). A session that dies almost
+// immediately (Connected=true but GATT never resolves — a BlueZ degenerate
+// state) would otherwise re-spawn the helper ~once/second forever, so the
+// backoff grows 1→2→4…→ceiling until a session survives BLE_SESSION_STABLE_SECS.
+pub const BLE_RECONNECT_BACKOFF_MAX_SECS: u64 = 30;
+// A BLE session that lasted at least this long is treated as "real work"
+// (normal connect → later disconnect) and resets the reconnect backoff.
+pub const BLE_SESSION_STABLE_SECS: u64 = 10;
+// How often the wait-for-device loop fires an ACTIVE Device.Connect() when the
+// device is absent. BlueZ does not reliably auto-reconnect BLE LE devices, and
+// the logind resume kick only covers the suspend case — so a plain
+// out-of-range → back-in-range drop (no suspend) needs this periodic active
+// nudge, otherwise the daemon can wait forever for a passive event that never
+// comes. try_active_connect() itself blocks up to BLE_CONNECTING_TIMEOUT_SECS,
+// so the effective cadence when the peer is gone is this interval + that timeout.
+pub const BLE_ACTIVE_RECONNECT_INTERVAL_SECS: u64 = 8;
 pub const BLE_FP_GATE_TIMEOUT_SECS: u64 = 30;
 pub const BLE_AUTH_TIMEOUT_SECS: u64 = 30;
 // 30s 等按钮 + 2×2s ECC + 余量
@@ -146,6 +172,8 @@ pub const OTA_ERASE_TIMEOUT_SECS: u64 = 15;
 pub const IMMUROK_DIR: &str = ".immurok";
 pub const PAIRING_FILE: &str = "pairing.json";
 pub const SETTINGS_FILE: &str = "settings.json";
+/// Daemon log file (tracing output — the journal only has systemd start/stop lines).
+pub const LOG_FILE: &str = "logs.txt";
 pub const SSH_KEYS_FILE: &str = "ssh_keys.json";
 pub const KEY_NAMES_FILE: &str = "key_names.json";
 // Per-category (count, checksum) digests for sync_ssh_keys to short-circuit

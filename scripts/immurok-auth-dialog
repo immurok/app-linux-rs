@@ -4,18 +4,20 @@
 # would resolve to whatever venv comes first in PATH and fail with
 # ModuleNotFoundError: gi.
 """
-immurok 指纹认证弹窗 — 由 daemon 在收到 AUTH 或 AGENT_APPROVE 请求时启动
+immurok fingerprint authentication dialog - launched by the daemon when it receives an AUTH or AGENT_APPROVE request
 
-两种模式：
-  默认（无参数）：通用 PAM 指纹弹窗（gdm-password / login / polkit-1
-  这种被动 AUTH 触发），只显示"请按指纹"。
-  --agent --command STR [--timeout 30]：imk run --agent 主动调用，显示
-  被包裹的命令 pill + 倒计时进度条，让用户清楚知道授权范围。
+Two modes:
+  Default (no arguments): generic PAM fingerprint dialog (triggered by passive AUTH
+  flows such as gdm-password / login / polkit-1), showing only "Touch fingerprint".
+  --agent --command STR [--timeout 30]: invoked proactively by imk run --agent;
+  shows the wrapped command pill plus a countdown progress bar so the user can
+  clearly understand the authorization scope.
 
-退出语义：
-  daemon 在认证完成（指纹通过 / BLE 失败 / 超时）后发 SIGTERM 关闭窗口
-  （exit 0）。用户主动点"取消"或关闭窗口走 exit 1，daemon 读到非 0
-  退出码即视为 REJECT。
+Exit semantics:
+  After authentication completes (fingerprint accepted / BLE failure / timeout),
+  the daemon sends SIGTERM to close the window (exit 0). If the user clicks
+  "Cancel" or closes the window, the dialog exits 1; when the daemon sees a
+  non-zero exit code, it treats the request as REJECT.
 """
 
 import argparse
@@ -31,7 +33,7 @@ from gi.repository import Adw, GLib, Gtk
 
 
 def _truncate(text: str, limit: int = 80) -> str:
-    """单行化 + 截断超长命令，pill 不会撑爆窗口"""
+    """Normalize to one line and truncate overlong commands so the pill does not overflow the window"""
     text = text.replace("\n", " ").replace("\r", " ").strip()
     if len(text) > limit:
         return text[:limit] + "…"
@@ -65,7 +67,7 @@ class AuthDialog(Adw.Application):
         content.set_margin_end(28)
         content.set_halign(Gtk.Align.CENTER)
 
-        # 图标：agent 模式用 key，普通模式用 fingerprint
+        # Icon: use a key in agent mode, fingerprint in normal mode
         icon_name = "dialog-password-symbolic" if self.agent_mode else "fingerprint-symbolic"
         icon = Gtk.Image.new_from_icon_name(icon_name)
         icon.set_pixel_size(56)
@@ -75,17 +77,17 @@ class AuthDialog(Adw.Application):
             icon.add_css_class("dim-label")
         content.append(icon)
 
-        # 标题
-        title_text = "Agent 授权请求" if self.agent_mode else "指纹认证"
+        # Title
+        title_text = "Agent authorization request" if self.agent_mode else "Fingerprint authentication"
         title = Gtk.Label(label=title_text)
         title.add_css_class("title-2")
         content.append(title)
 
-        # 提示文字
+        # Prompt text
         body_text = (
-            "agent 正在请求执行命令，按指纹批准："
+            "The agent is requesting permission to run a command. Touch fingerprint to approve:"
             if self.agent_mode
-            else "请按指纹传感器进行认证"
+            else "Touch the fingerprint sensor to authenticate"
         )
         body = Gtk.Label(label=body_text)
         body.add_css_class("body")
@@ -94,7 +96,7 @@ class AuthDialog(Adw.Application):
         body.set_max_width_chars(40)
         content.append(body)
 
-        # agent 模式下：命令 pill (card-styled box with monospace label)
+        # In agent mode: command pill (card-styled box with monospace label)
         if self.agent_mode and self.command:
             frame = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             frame.add_css_class("card")
@@ -112,7 +114,7 @@ class AuthDialog(Adw.Application):
             frame.append(inner)
             content.append(frame)
 
-        # spinner（永远转）
+        # Spinner (always running)
         spinner = Gtk.Spinner(spinning=True)
         spinner.set_size_request(24, 24)
         spinner.set_halign(Gtk.Align.CENTER)
@@ -121,7 +123,7 @@ class AuthDialog(Adw.Application):
 
         outer.append(content)
 
-        # agent 模式：倒计时进度条 + 数字
+        # Agent mode: countdown progress bar and number
         if self.agent_mode:
             count_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             count_box.set_margin_start(28)
@@ -145,12 +147,12 @@ class AuthDialog(Adw.Application):
             outer.append(count_box)
 
             self._t_start = time.monotonic()
-            # 每 250ms 刷一次：进度条平滑，数字按整秒变
+            # Refresh every 250 ms: smooth progress bar, number changes by whole seconds
             self._tick_source = GLib.timeout_add(250, self._on_tick)
 
         outer.append(Gtk.Separator())
 
-        # 取消按钮
+        # Cancel button
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         btn_box.set_margin_top(12)
         btn_box.set_margin_bottom(12)
@@ -158,7 +160,7 @@ class AuthDialog(Adw.Application):
         btn_box.set_margin_end(12)
         btn_box.set_halign(Gtk.Align.END)
 
-        cancel_btn = Gtk.Button(label="取消")
+        cancel_btn = Gtk.Button(label="Cancel")
         cancel_btn.add_css_class("pill")
         if self.agent_mode:
             cancel_btn.add_css_class("destructive-action")
@@ -184,9 +186,9 @@ class AuthDialog(Adw.Application):
             if self._count_label is not None:
                 self._count_label.set_label(f"{whole}s")
         if remaining <= 0:
-            # 进度归零 — 维持窗口直到 daemon 发 SIGTERM 或用户取消。
-            # 不主动退出避免 dialog 时钟和 daemon FP gate 超时不同步
-            # 导致的"用户还在按指纹结果窗口先关了"诡异体验。
+            # Progress reached zero; keep the window open until the daemon sends SIGTERM or the user cancels.
+            # Do not exit proactively, to avoid clock drift between the dialog and the daemon fingerprint gate
+            # causing the awkward case where the result window closes while the user is still touching the sensor.
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 

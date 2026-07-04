@@ -57,7 +57,7 @@ pub fn run_show() {
         ("polkit-1", "polkit"),
         ("gdm-password", "screen"),
     ] {
-        let installed = check_pam(service);
+        let installed = immurok_common::pam::pam_line_present(service);
         let state = if installed {
             "\x1b[32minstalled\x1b[0m"
         } else {
@@ -129,14 +129,5 @@ pub fn run_sound(value: &str) {
     } else {
         eprintln!("\x1b[31mFailed to set sound: {}\x1b[0m", rsp);
         std::process::exit(1);
-    }
-}
-
-/// Check if PAM is configured for a service.
-fn check_pam(service: &str) -> bool {
-    let path = format!("/etc/pam.d/{}", service);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents.contains("pam_immurok.so"),
-        Err(_) => false,
     }
 }

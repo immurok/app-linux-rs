@@ -2,23 +2,24 @@
 #
 # immurok PAM 配置助手 — 通过 pkexec 以 root 运行
 #
-# 用法: immurok-pam-helper add <service>
-#        immurok-pam-helper remove <service>
+# 用法: immurok-pam-helper add <service> [service...]
+#        immurok-pam-helper remove <service> [service...]
 #
 # service: sudo | gdm-password | polkit-1
 #
-set -e
 
 PAM_LINE="auth        sufficient    pam_immurok.so"
+
+PAM_D="${IMMUROK_PAM_D:-/etc/pam.d}"
 
 # 选择 polkit-1 模板的 include 目标：
 #   - Arch / Fedora 用 password-auth（system-auth 的常用别名）
 #   - Debian / Ubuntu 没有 password-auth，用 common-auth 等
 # 同时存在时优先 password-auth（即使在 Debian 衍生发行版上，
 # password-auth 也是 PAM 1.0 推荐用法）。
-if [ -f /etc/pam.d/password-auth ]; then
+if [ -f "$PAM_D/password-auth" ]; then
     PAM_INCLUDE_TARGET="password-auth"
-elif [ -f /etc/pam.d/common-auth ]; then
+elif [ -f "$PAM_D/common-auth" ]; then
     PAM_INCLUDE_TARGET="common-auth"
 else
     PAM_INCLUDE_TARGET="password-auth"  # fallback — 至少 PAM 会报错而不是悄悄过
@@ -35,6 +36,8 @@ session     include       $PAM_INCLUDE_TARGET"
 
 # ── PAM 模块目录检测 ─────────────────────────────────────────
 pam_module_dir() {
+    # 允许测试通过 IMMUROK_PAM_MODDIR 覆盖，默认探测真实路径
+    [ -n "${IMMUROK_PAM_MODDIR:-}" ] && echo "$IMMUROK_PAM_MODDIR" && return
     for d in /usr/lib64/security /lib/aarch64-linux-gnu/security \
              /lib/x86_64-linux-gnu/security /lib/security; do
         [ -d "$d" ] && echo "$d" && return
@@ -43,89 +46,51 @@ pam_module_dir() {
 }
 
 check_module() {
+    [ "${IMMUROK_SKIP_MODULE_CHECK:-}" = "1" ] && return
     PAM_DIR=$(pam_module_dir)
-    if [ ! -f "$PAM_DIR/pam_immurok.so" ]; then
-        echo "ERROR:MODULE_NOT_INSTALLED"
-        exit 1
-    fi
+    [ ! -f "$PAM_DIR/pam_immurok.so" ] && return 1
+    return 0
 }
 
-# ── 参数校验 ─────────────────────────────────────────────────
-ACTION="$1"
-SERVICE="$2"
-
-case "$SERVICE" in
-    sudo|gdm-password|polkit-1) ;;
-    *) echo "ERROR:INVALID_SERVICE"; exit 1 ;;
-esac
-
-PAM_FILE="/etc/pam.d/$SERVICE"
-
 # ── 操作 ─────────────────────────────────────────────────────
-case "$ACTION" in
-    add)
-        check_module
+ACTION="$1"; shift || true
 
-        # polkit-1: 文件不存在则创建完整模板
-        if [ "$SERVICE" = "polkit-1" ] && [ ! -f "$PAM_FILE" ]; then
-            echo "$POLKIT_TEMPLATE" > "$PAM_FILE"
-            chmod 644 "$PAM_FILE"
-            echo "OK:CREATED"
-            exit 0
-        fi
+process_one() {
+    local SERVICE="$1"
+    case "$SERVICE" in
+        sudo|gdm-password|polkit-1) ;;
+        *) echo "ERROR:INVALID_SERVICE($SERVICE)"; return 0 ;;
+    esac
+    local PAM_FILE="$PAM_D/$SERVICE"
 
-        if [ ! -f "$PAM_FILE" ]; then
-            echo "ERROR:FILE_NOT_FOUND"
-            exit 1
-        fi
+    case "$ACTION" in
+        add)
+            check_module || { echo "ERROR:MODULE_NOT_INSTALLED($SERVICE)"; return 0; }
+            if [ "$SERVICE" = "polkit-1" ] && [ ! -f "$PAM_FILE" ]; then
+                echo "$POLKIT_TEMPLATE" > "$PAM_FILE"; chmod 644 "$PAM_FILE"
+                echo "OK:CREATED($SERVICE)"; return 0
+            fi
+            if [ ! -f "$PAM_FILE" ]; then echo "ERROR:FILE_NOT_FOUND($SERVICE)"; return 0; fi
+            if grep -q 'pam_immurok\.so' "$PAM_FILE"; then echo "OK:ALREADY_PRESENT($SERVICE)"; return 0; fi
+            local first_auth
+            first_auth=$(grep -nE '^(auth[[:space:]]|@include[[:space:]])' "$PAM_FILE" | head -1 | cut -d: -f1)
+            if [ -z "$first_auth" ]; then echo "ERROR:NO_AUTH_LINE($SERVICE)"; return 0; fi
+            sed -i "${first_auth}i\\${PAM_LINE}" "$PAM_FILE"
+            echo "OK:ADDED($SERVICE)"
+            ;;
+        remove)
+            if [ ! -f "$PAM_FILE" ]; then echo "OK:NOT_PRESENT($SERVICE)"; return 0; fi
+            if ! grep -q 'pam_immurok\.so' "$PAM_FILE"; then echo "OK:NOT_PRESENT($SERVICE)"; return 0; fi
+            if [ "$SERVICE" = "polkit-1" ] && grep -q 'Created by immurok' "$PAM_FILE"; then
+                rm -f "$PAM_FILE"; echo "OK:REMOVED($SERVICE)"; return 0
+            fi
+            sed -i '/pam_immurok\.so/d' "$PAM_FILE"
+            echo "OK:REMOVED($SERVICE)"
+            ;;
+        *) echo "ERROR:INVALID_ACTION"; return 0 ;;
+    esac
+}
 
-        # 幂等: 已存在则跳过
-        if grep -q 'pam_immurok\.so' "$PAM_FILE"; then
-            echo "OK:ALREADY_PRESENT"
-            exit 0
-        fi
-
-        # 在第一行 auth-stack 指令之前插入：
-        #   - ^auth   (Arch / Fedora 显式 auth 行)
-        #   - ^@include (Debian / Ubuntu 把整个 auth/account/session
-        #     栈通过 @include common-auth 等带进来)
-        # 任一种都是 auth 栈的入口；我们用 sufficient pam_immurok.so
-        # 抢在它前面，命中就直接 PAM_SUCCESS。
-        first_auth=$(grep -nE '^(auth[[:space:]]|@include[[:space:]])' "$PAM_FILE" | head -1 | cut -d: -f1)
-        if [ -z "$first_auth" ]; then
-            echo "ERROR:NO_AUTH_LINE"
-            exit 1
-        fi
-
-        sed -i "${first_auth}i\\${PAM_LINE}" "$PAM_FILE"
-        echo "OK:ADDED"
-        ;;
-
-    remove)
-        if [ ! -f "$PAM_FILE" ]; then
-            echo "OK:NOT_PRESENT"
-            exit 0
-        fi
-
-        # 幂等: 不存在则跳过
-        if ! grep -q 'pam_immurok\.so' "$PAM_FILE"; then
-            echo "OK:NOT_PRESENT"
-            exit 0
-        fi
-
-        # polkit-1: 如果是我们创建的，直接删除文件
-        if [ "$SERVICE" = "polkit-1" ] && grep -q 'Created by immurok' "$PAM_FILE"; then
-            rm -f "$PAM_FILE"
-            echo "OK:REMOVED"
-            exit 0
-        fi
-
-        sed -i '/pam_immurok\.so/d' "$PAM_FILE"
-        echo "OK:REMOVED"
-        ;;
-
-    *)
-        echo "ERROR:INVALID_ACTION"
-        exit 1
-        ;;
-esac
+if [ "$#" -eq 0 ]; then echo "ERROR:NO_SERVICE"; exit 1; fi
+for s in "$@"; do process_one "$s"; done
+exit 0

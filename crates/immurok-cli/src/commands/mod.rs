@@ -5,6 +5,7 @@ pub mod info;
 pub mod keys;
 pub mod ota;
 pub mod pair;
+pub mod pam;
 pub mod settings;
 pub mod status;
 
@@ -50,7 +51,7 @@ pub enum Commands {
     #[command(subcommand)]
     Pam(PamCommands),
 
-    /// View daemon logs (journalctl)
+    /// Tail daemon logs (~/.immurok/logs.txt)
     Logs,
 
     /// Interactive TUI panel
@@ -171,6 +172,10 @@ pub enum PamCommands {
         /// PAM service name
         service: String,
     },
+    /// Check PAM config against enabled features (exit 1 if anything missing)
+    Check,
+    /// Install any missing PAM config for enabled features (one pkexec)
+    Repair,
 }
 
 // ── Shared helpers ───────────────────────────────────────────

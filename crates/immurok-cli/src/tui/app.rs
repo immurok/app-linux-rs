@@ -14,25 +14,91 @@ pub const LOG_BUFFER_CAP: usize = 1000;
 /// Lines moved per PgUp / PgDn keystroke.
 pub const LOG_PAGE_STEP: usize = 20;
 
-/// TUI interaction mode.
+/// Top-level page shown in the content area. Switched with 1-4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Dashboard,
+    Keys,
+    Pam,
+    Logs,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Keys, Tab::Pam, Tab::Logs];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Tab::Dashboard => "Dashboard",
+            Tab::Keys => "Keys",
+            Tab::Pam => "PAM",
+            Tab::Logs => "Logs",
+        }
+    }
+
+    pub fn hotkey(self) -> char {
+        match self {
+            Tab::Dashboard => '1',
+            Tab::Keys => '2',
+            Tab::Pam => '3',
+            Tab::Logs => '4',
+        }
+    }
+}
+
+/// Modal interaction state layered on top of the active tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    EnrollSelect,
     DeleteSelect,
-    /// Key management panel — SSH/OTP/API list + actions.
-    Keys,
-    /// SSH key generation: text-input for the key name.
-    KeyGenInput,
+    /// Add-key text input (SSH: name only; OTP/API: name then secret/value).
+    KeyInput,
     /// Confirm key deletion (y / n). Stores the pending category+index.
     KeyDeleteConfirm,
     /// Full-screen help overlay (read-only).
     Help,
-    /// PAM service install/remove panel.
-    Pam,
-    /// In-TUI daemon log viewer (streams journalctl).
-    Logs,
 }
+
+/// Staged add-key input flow (Mode::KeyInput).
+/// SSH: name only. API: name → value. OTP: name → service → secret.
+#[derive(Debug, Clone)]
+pub struct KeyAddFlow {
+    pub cat: KeyTab,
+    /// Set once the name stage is confirmed.
+    pub name: Option<String>,
+    /// Set once the OTP service stage is confirmed (may be empty).
+    pub service: Option<String>,
+}
+
+/// Which field a KeyAddFlow is currently collecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyInputStage {
+    Name,
+    Service,
+    Secret,
+}
+
+impl KeyAddFlow {
+    pub fn stage(&self) -> KeyInputStage {
+        if self.name.is_none() {
+            KeyInputStage::Name
+        } else if self.cat == KeyTab::Otp && self.service.is_none() {
+            KeyInputStage::Service
+        } else {
+            KeyInputStage::Secret
+        }
+    }
+}
+
+/// One entry in the Dashboard event feed.
+#[derive(Debug, Clone)]
+pub struct EventEntry {
+    pub time: String,
+    pub text: String,
+    pub style: MessageStyle,
+}
+
+/// Max entries retained in the Dashboard event feed.
+pub const EVENT_BUFFER_CAP: usize = 200;
 
 /// Which key category the Keys panel is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +132,14 @@ impl KeyTab {
             KeyTab::Api => KeyTab::Ssh,
         }
     }
+
+    pub fn prev(self) -> Self {
+        match self {
+            KeyTab::Ssh => KeyTab::Api,
+            KeyTab::Otp => KeyTab::Ssh,
+            KeyTab::Api => KeyTab::Otp,
+        }
+    }
 }
 
 /// SSH key entry shown in the TUI.
@@ -83,6 +157,8 @@ pub struct SshKeyRow {
 pub struct NameKeyRow {
     pub index: u8,
     pub name: String,
+    /// Issuer / service (OTP only; empty for API).
+    pub service: String,
 }
 
 /// One PAM service the panel can install/remove.
@@ -123,13 +199,19 @@ pub struct App {
     pub pam_screen: bool,
 
     // UI state
+    pub tab: Tab,
     pub mode: Mode,
     pub busy: bool,
     pub message: String,
     pub message_style: MessageStyle,
+    /// Recent event feed shown on the Dashboard (newest at the back).
+    pub events: VecDeque<EventEntry>,
 
     // Enrollment progress (only meaningful while busy in Normal mode)
     pub enroll_active: bool,
+    /// True while the FP gate is pending — the device wants an *enrolled*
+    /// finger to authorize before new-finger capture starts.
+    pub enroll_gate: bool,
     pub enroll_slot: u8,
     pub enroll_current: u8,
     pub enroll_total: u8,
@@ -140,8 +222,10 @@ pub struct App {
     pub ssh_keys: Vec<SshKeyRow>,
     pub otp_keys: Vec<NameKeyRow>,
     pub api_keys: Vec<NameKeyRow>,
-    /// Pending text input (SSH key name during KeyGenInput).
+    /// Pending text input (key name / secret during KeyInput).
     pub input_buf: String,
+    /// Active add-key flow while in KeyInput mode.
+    pub key_add_flow: Option<KeyAddFlow>,
     /// Pending delete target (cat + index) while in KeyDeleteConfirm.
     pub pending_delete: Option<(KeyTab, u8)>,
 
@@ -153,7 +237,7 @@ pub struct App {
     /// 0 = follow tail; >0 = number of lines above the tail the viewport
     /// is anchored at.
     pub log_scroll: usize,
-    /// Owned journalctl child while the Logs panel is open. Kept here so
+    /// Owned `tail -F` child while the Logs panel is open. Kept here so
     /// that exiting the panel can `kill()` it deterministically.
     pub log_child: Option<Child>,
 
@@ -174,11 +258,16 @@ pub enum MessageStyle {
 pub enum ActionResult {
     Refresh,
     Message(String, MessageStyle),
+    /// Message shown in the footer only — never mirrored into the event
+    /// feed (used for secrets like API key values).
+    SecretMessage(String),
+    /// FP gate passed — new-finger capture begins (clears the gate hint).
+    EnrollStarted,
     /// Live enrollment progress update (current, total).
     EnrollProgress { current: u8, total: u8 },
-    /// One line of streamed journalctl output for the Logs panel.
+    /// One line of streamed log-tail output for the Logs panel.
     LogLine(String),
-    /// journalctl pipe closed (process exited or readers hit EOF).
+    /// log-tail pipe closed (process exited or readers hit EOF).
     LogEnded,
     Done,
 }
@@ -202,11 +291,14 @@ impl App {
             pam_sudo: false,
             pam_polkit: false,
             pam_screen: false,
+            tab: Tab::Dashboard,
             mode: Mode::Normal,
             busy: false,
             message: "Ready".into(),
             message_style: MessageStyle::Dim,
+            events: VecDeque::with_capacity(EVENT_BUFFER_CAP),
             enroll_active: false,
+            enroll_gate: false,
             enroll_slot: 0,
             enroll_current: 0,
             enroll_total: 0,
@@ -216,6 +308,7 @@ impl App {
             otp_keys: Vec::new(),
             api_keys: Vec::new(),
             input_buf: String::new(),
+            key_add_flow: None,
             pending_delete: None,
             pam_cursor: 0,
             log_lines: VecDeque::with_capacity(LOG_BUFFER_CAP),
@@ -233,10 +326,16 @@ impl App {
         while let Ok(result) = self.action_rx.try_recv() {
             match result {
                 ActionResult::Message(msg, style) => {
+                    self.set_msg(&msg, style);
+                }
+                ActionResult::SecretMessage(msg) => {
                     self.message = msg;
-                    self.message_style = style;
+                    self.message_style = MessageStyle::Green;
                 }
                 ActionResult::Refresh => needs_refresh = true,
+                ActionResult::EnrollStarted => {
+                    self.enroll_gate = false;
+                }
                 ActionResult::EnrollProgress { current, total } => {
                     self.enroll_current = current;
                     self.enroll_total = total;
@@ -248,7 +347,7 @@ impl App {
                     self.log_lines.push_back(line);
                 }
                 ActionResult::LogEnded => {
-                    if self.mode == Mode::Logs {
+                    if self.tab == Tab::Logs {
                         if self.log_lines.len() >= LOG_BUFFER_CAP {
                             self.log_lines.pop_front();
                         }
@@ -259,6 +358,7 @@ impl App {
                 ActionResult::Done => {
                     self.busy = false;
                     self.enroll_active = false;
+                    self.enroll_gate = false;
                 }
             }
         }
@@ -325,9 +425,9 @@ impl App {
         }
 
         // PAM status
-        self.pam_sudo = check_pam("sudo");
-        self.pam_polkit = check_pam("polkit-1");
-        self.pam_screen = check_pam("gdm-password");
+        self.pam_sudo = immurok_common::pam::pam_line_present("sudo");
+        self.pam_polkit = immurok_common::pam::pam_line_present("polkit-1");
+        self.pam_screen = immurok_common::pam::pam_line_present("gdm-password");
 
         // Key cache (cheap — just JSON files maintained by the daemon)
         self.refresh_keys();
@@ -369,8 +469,9 @@ impl App {
             for e in &entries {
                 let idx = e["index"].as_u64().unwrap_or(0) as u8;
                 let name = e["name"].as_str().unwrap_or("-").to_string();
+                let service = e["service"].as_str().unwrap_or("").to_string();
                 let cat = e["category"].as_str().unwrap_or("");
-                let row = NameKeyRow { index: idx, name };
+                let row = NameKeyRow { index: idx, name, service };
                 match cat {
                     "otp" => otp_rows.push(row),
                     "api" => api_rows.push(row),
@@ -419,21 +520,10 @@ impl App {
 
     // ── Actions ─────────────────────────────────────────────
 
+    /// Enroll into the lowest empty slot. Slot picking is intentionally
+    /// not exposed in the TUI — `immurok-cli fp enroll <slot>` still takes
+    /// an explicit slot if ever needed.
     pub fn auto_enroll(&mut self) {
-        if !self.connected {
-            self.set_msg("Device not connected", MessageStyle::Red);
-            return;
-        }
-        // Find first empty slot
-        let slot = (0..protocol::MAX_FINGERPRINT_SLOTS)
-            .find(|i| self.fp_bitmap & (1 << i) == 0);
-        match slot {
-            Some(s) => self.action_enroll(s),
-            None => self.set_msg("All fingerprint slots are full", MessageStyle::Red),
-        }
-    }
-
-    pub fn enter_enroll_select(&mut self) {
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
             return;
@@ -441,14 +531,12 @@ impl App {
         if self.busy {
             return;
         }
-        self.mode = Mode::EnrollSelect;
-        self.set_msg(
-            &format!(
-                "Press 0-{} to choose enroll slot (E = first empty, Esc = cancel)",
-                protocol::MAX_FINGERPRINT_SLOTS - 1
-            ),
-            MessageStyle::Yellow,
-        );
+        let slot = (0..protocol::MAX_FINGERPRINT_SLOTS)
+            .find(|i| self.fp_bitmap & (1 << i) == 0);
+        match slot {
+            Some(s) => self.action_enroll(s),
+            None => self.set_msg("All fingerprint slots are full", MessageStyle::Red),
+        }
     }
 
     pub fn enter_delete_select(&mut self) {
@@ -568,13 +656,26 @@ impl App {
         self.mode = Mode::Normal;
         self.busy = true;
         self.enroll_active = true;
+        // With fingerprints already enrolled the firmware FP-gates
+        // ENROLL_START: an *enrolled* finger must authorize first.
+        self.enroll_gate = self.fp_bitmap != 0;
         self.enroll_slot = slot;
         self.enroll_current = 0;
-        self.enroll_total = 12;
-        self.set_msg(
-            &format!("Enrolling slot {} — place finger on sensor…", slot),
-            MessageStyle::Yellow,
-        );
+        self.enroll_total = 6;
+        if self.enroll_gate {
+            self.set_msg(
+                &format!(
+                    "Enrolling slot {} — verify with an enrolled finger to authorize…",
+                    slot
+                ),
+                MessageStyle::Yellow,
+            );
+        } else {
+            self.set_msg(
+                &format!("Enrolling slot {} — place finger on sensor…", slot),
+                MessageStyle::Yellow,
+            );
+        }
 
         let tx = self.action_tx.clone();
         thread::spawn(move || {
@@ -584,12 +685,13 @@ impl App {
                     return Err(format!("Start failed: {}", rsp));
                 }
 
+                let _ = tx.send(ActionResult::EnrollStarted);
                 let _ = tx.send(ActionResult::Message(
                     "Enrollment started — place finger…".into(),
                     MessageStyle::Yellow,
                 ));
 
-                // Poll FP:STATUS for enrollment progress (12 captures × 30s = 360s max)
+                // Poll FP:STATUS for enrollment progress (6 captures × 30s = 180s max)
                 let mut last_event = 255u8;
                 let mut last_current = 255u8;
                 let mut bitmap_polls = 0u32;
@@ -629,7 +731,7 @@ impl App {
                             Err(_) => continue,
                         };
                         let current: u8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let total: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(12);
+                        let total: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
                         let _ = tx.send(ActionResult::EnrollProgress { current, total });
 
                         if event == last_event && current == last_current {
@@ -971,10 +1073,34 @@ impl App {
     pub fn set_msg(&mut self, msg: &str, style: MessageStyle) {
         self.message = msg.to_string();
         self.message_style = style;
+
+        // Mirror meaningful messages into the Dashboard event feed.
+        // Skip idle chatter ("Ready", key-hint reminders) and duplicates.
+        if msg.is_empty() || msg == "Ready" || style == MessageStyle::Dim {
+            return;
+        }
+        if self.events.back().is_some_and(|e| e.text == msg) {
+            return;
+        }
+        if self.events.len() >= EVENT_BUFFER_CAP {
+            self.events.pop_front();
+        }
+        self.events.push_back(EventEntry {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            text: msg.to_string(),
+            style,
+        });
     }
 
     pub fn set_msg_dim(&mut self, msg: &str) {
         self.set_msg(msg, MessageStyle::Dim);
+    }
+
+    /// Footer-only message that never enters the event feed — for input
+    /// prompts and validation errors (they're guidance, not history).
+    pub fn set_msg_prompt(&mut self, msg: &str, style: MessageStyle) {
+        self.message = msg.to_string();
+        self.message_style = style;
     }
 
     // ── Help overlay ──────────────────────────────────────────
@@ -986,18 +1112,43 @@ impl App {
         };
     }
 
-    // ── PAM panel ─────────────────────────────────────────────
+    // ── Tab switching ─────────────────────────────────────────
 
-    pub fn enter_pam_mode(&mut self) {
-        self.mode = Mode::Pam;
-        if self.pam_cursor >= PAM_SERVICES.len() {
-            self.pam_cursor = 0;
+    /// Switch the active tab, running enter/leave side effects
+    /// (log-tail child lifecycle, key cache refresh, cursor clamps).
+    pub fn set_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
         }
-        self.set_msg(
-            "PAM services — [↑↓/jk] move  [i]nstall  [r]emove  [Esc] back",
-            MessageStyle::Dim,
-        );
+
+        // Leave side effects
+        if self.tab == Tab::Logs {
+            self.stop_log_stream();
+        }
+
+        self.tab = tab;
+        self.mode = Mode::Normal;
+
+        // Enter side effects
+        match tab {
+            Tab::Dashboard => {}
+            Tab::Keys => {
+                self.refresh_keys();
+                if self.key_cursor >= self.current_key_len().max(1) {
+                    self.key_cursor = 0;
+                }
+            }
+            Tab::Pam => {
+                if self.pam_cursor >= PAM_SERVICES.len() {
+                    self.pam_cursor = 0;
+                }
+            }
+            Tab::Logs => self.start_log_stream(),
+        }
+        self.set_msg_dim("Ready");
     }
+
+    // ── PAM panel ─────────────────────────────────────────────
 
     pub fn pam_cursor_up(&mut self) {
         if self.pam_cursor > 0 {
@@ -1029,43 +1180,46 @@ impl App {
         let svc = PAM_SERVICES.get(self.pam_cursor)?;
         Some(PamRequest {
             action: if install { "add" } else { "remove" },
-            service: svc.service,
+            services: vec![svc.service],
         })
+    }
+
+    /// 一键修复：按 daemon 开关派生目标里、当前缺失的服务。
+    pub fn request_pam_repair(&self) -> Option<PamRequest> {
+        let services =
+            crate::commands::pam::services_to_repair(self.unlock_sudo, self.unlock_polkit);
+        if services.is_empty() {
+            return None;
+        }
+        Some(PamRequest { action: "add", services })
     }
 
     // ── Logs panel ────────────────────────────────────────────
 
-    /// Spawn `journalctl -fu immurok-daemon` and stream its stdout into the
-    /// in-TUI log ring buffer via the existing action channel.
-    pub fn enter_logs_mode(&mut self) {
-        // If already open (e.g. user double-pressed `l`), do nothing.
+    /// Tail `~/.immurok/logs.txt` (the daemon's tracing output — the journal
+    /// only carries systemd start/stop lines) and stream its stdout into the
+    /// in-TUI log ring buffer via the existing action channel. `-F` follows
+    /// across truncation/rotation and waits for the file to appear.
+    fn start_log_stream(&mut self) {
         if self.log_child.is_some() {
-            self.mode = Mode::Logs;
             return;
         }
 
-        let mut child = match Command::new("journalctl")
-            .args([
-                "--user",
-                "-u",
-                "immurok-daemon",
-                "-n",
-                "200",
-                "-f",
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ])
+        let home = std::env::var("HOME").unwrap_or_default();
+        let log_path = std::path::PathBuf::from(&home)
+            .join(protocol::IMMUROK_DIR)
+            .join(protocol::LOG_FILE);
+
+        let mut child = match Command::new("tail")
+            .args(["-n", "200", "-F"])
+            .arg(&log_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
         {
             Ok(c) => c,
             Err(e) => {
-                self.set_msg(
-                    &format!("Failed to start journalctl: {}", e),
-                    MessageStyle::Red,
-                );
+                self.set_msg(&format!("Failed to start tail: {}", e), MessageStyle::Red);
                 return;
             }
         };
@@ -1075,17 +1229,13 @@ impl App {
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                self.set_msg("journalctl produced no stdout", MessageStyle::Red);
+                self.set_msg("tail produced no stdout", MessageStyle::Red);
                 return;
             }
         };
 
         self.log_lines.clear();
         self.log_scroll = 0;
-        self.mode = Mode::Logs;
-        self.set_msg_dim(
-            "Streaming daemon logs — [↑↓/jk] line  [PgUp/PgDn] page  [End] tail  [Esc] back",
-        );
 
         let tx = self.action_tx.clone();
         thread::spawn(move || {
@@ -1106,18 +1256,15 @@ impl App {
         self.log_child = Some(child);
     }
 
-    /// Kill the journalctl child (if any) and return to the Normal panel.
-    pub fn exit_logs_mode(&mut self) {
+    /// Kill the log-tail child (if any) and drop the buffer — re-entering
+    /// Logs starts fresh and avoids accumulating memory across sessions.
+    fn stop_log_stream(&mut self) {
         if let Some(mut child) = self.log_child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // Drop the buffer too — re-entering Logs starts fresh and avoids
-        // accumulating memory across sessions.
         self.log_lines.clear();
         self.log_scroll = 0;
-        self.mode = Mode::Normal;
-        self.set_msg_dim("Ready");
     }
 
     pub fn log_scroll_up(&mut self) {
@@ -1159,30 +1306,21 @@ impl App {
 
     pub fn after_pam_action(&mut self, req: &PamRequest, ok: bool) {
         let verb = if req.action == "add" { "installed" } else { "removed" };
+        let svc_list = req.services.join(", ");
         if ok {
             self.set_msg(
-                &format!("PAM {} for {} succeeded.", verb, req.service),
+                &format!("PAM {} done: {}", verb, svc_list),
                 MessageStyle::Green,
             );
         } else {
             self.set_msg(
-                &format!("PAM {} for {} failed (see terminal output above).", verb, req.service),
+                &format!("PAM {} for {} failed (see terminal output above).", verb, svc_list),
                 MessageStyle::Red,
             );
         }
     }
 
     // ── Keys panel actions ───────────────────────────────────
-
-    pub fn enter_keys_mode(&mut self) {
-        self.mode = Mode::Keys;
-        self.key_cursor = 0;
-        self.refresh_keys();
-        self.set_msg(
-            "Keys — [Tab] tab  [↑↓/jk] move  [g]en  [d]el  [o]tp  [c]opy  [r]efresh  [Esc] back",
-            MessageStyle::Dim,
-        );
-    }
 
     pub fn keys_next_tab(&mut self) {
         self.key_tab = self.key_tab.next();
@@ -1232,41 +1370,66 @@ impl App {
         self.set_msg(&line, MessageStyle::Green);
     }
 
-    /// Enter SSH key generate flow — collects the key name then issues
-    /// `KEY:GENERATE` once the user hits Enter.
-    pub fn enter_key_gen_input(&mut self) {
-        if self.key_tab != KeyTab::Ssh {
-            self.set_msg(
-                "Generate is SSH-only (use `immurok-cli key add` for OTP/API).",
-                MessageStyle::Yellow,
-            );
-            return;
-        }
+    /// Enter the add-key flow for the current category.
+    /// SSH: collects a name then issues `KEY:GENERATE` (on-device keypair).
+    /// OTP: collects name + base32 secret → `KEY:OTP_IMPORT`.
+    /// API: collects name + value → `KEY:API_IMPORT`.
+    pub fn enter_key_add(&mut self) {
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
             return;
         }
-        if self.ssh_keys.len() >= protocol::KEY_MAX_SSH as usize {
+        let (count, max) = match self.key_tab {
+            KeyTab::Ssh => (self.ssh_keys.len(), protocol::KEY_MAX_SSH),
+            KeyTab::Otp => (self.otp_keys.len(), protocol::KEY_MAX_OTP),
+            KeyTab::Api => (self.api_keys.len(), protocol::KEY_MAX_API),
+        };
+        if count >= max as usize {
             self.set_msg(
                 &format!(
-                    "SSH keystore full ({}/{}) — delete an entry first.",
-                    self.ssh_keys.len(),
-                    protocol::KEY_MAX_SSH
+                    "{} keystore full ({}/{}) — delete an entry first.",
+                    self.key_tab.label(),
+                    count,
+                    max
                 ),
                 MessageStyle::Red,
             );
             return;
         }
         self.input_buf.clear();
-        self.mode = Mode::KeyGenInput;
-        self.set_msg(
-            "Enter SSH key name (max 15 chars). [Enter] confirm  [Esc] cancel",
-            MessageStyle::Yellow,
-        );
+        self.key_add_flow = Some(KeyAddFlow {
+            cat: self.key_tab,
+            name: None,
+            service: None,
+        });
+        self.mode = Mode::KeyInput;
+        let hint = match self.key_tab {
+            KeyTab::Ssh => "Name the new SSH keypair (generated on-device).",
+            KeyTab::Otp => "Name the OTP entry (secret comes next).",
+            KeyTab::Api => "Name the API key (value comes next).",
+        };
+        self.set_msg_prompt(hint, MessageStyle::Yellow);
+    }
+
+    /// Max input length for the current KeyInput stage.
+    pub fn input_max(&self) -> usize {
+        match &self.key_add_flow {
+            Some(f) => match f.stage() {
+                // Firmware field widths minus the NUL terminator.
+                KeyInputStage::Name => match f.cat {
+                    KeyTab::Ssh => protocol::NAME_LEN_SSH - 1,
+                    KeyTab::Otp => protocol::NAME_LEN_OTP - 1,
+                    KeyTab::Api => protocol::NAME_LEN_API - 1,
+                },
+                KeyInputStage::Service => protocol::SERVICE_LEN_OTP - 1,
+                KeyInputStage::Secret => 256,
+            },
+            None => 15,
+        }
     }
 
     pub fn input_push_char(&mut self, c: char) {
-        if self.input_buf.len() < 15 && !c.is_control() {
+        if self.input_buf.chars().count() < self.input_max() && !c.is_control() {
             self.input_buf.push(c);
         }
     }
@@ -1277,19 +1440,235 @@ impl App {
 
     pub fn input_cancel(&mut self) {
         self.input_buf.clear();
-        self.mode = Mode::Keys;
+        self.key_add_flow = None;
+        self.mode = Mode::Normal;
         self.set_msg("Cancelled.", MessageStyle::Dim);
     }
 
-    pub fn input_submit_key_gen(&mut self) {
-        let name = self.input_buf.trim().to_string();
-        if name.is_empty() {
-            self.set_msg("Name cannot be empty.", MessageStyle::Red);
+    /// Enter pressed in KeyInput mode — advance the add flow one step.
+    pub fn input_submit_key(&mut self) {
+        let flow = match self.key_add_flow.clone() {
+            Some(f) => f,
+            None => {
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+        let text = self.input_buf.trim().to_string();
+
+        match flow.stage() {
+            // ── Stage 1: name ─────────────────────────────
+            KeyInputStage::Name => {
+                if text.is_empty() {
+                    self.set_msg_prompt("Name cannot be empty.", MessageStyle::Red);
+                    return;
+                }
+                if flow.cat == KeyTab::Ssh {
+                    // SSH needs no secret — generate right away.
+                    self.input_buf.clear();
+                    self.key_add_flow = None;
+                    self.mode = Mode::Normal;
+                    self.action_key_generate(text);
+                    return;
+                }
+                self.key_add_flow = Some(KeyAddFlow {
+                    name: Some(text),
+                    ..flow
+                });
+                self.input_buf.clear();
+                let hint = match flow.cat {
+                    KeyTab::Otp => "Service / issuer — Enter alone to skip.",
+                    KeyTab::Api => "Paste the API key value.",
+                    KeyTab::Ssh => unreachable!(),
+                };
+                self.set_msg_prompt(hint, MessageStyle::Yellow);
+            }
+
+            // ── Stage 2 (OTP only): service / issuer ──────
+            KeyInputStage::Service => {
+                // Empty is fine — the field is optional on-device.
+                self.key_add_flow = Some(KeyAddFlow {
+                    service: Some(text),
+                    ..flow
+                });
+                self.input_buf.clear();
+                self.set_msg_prompt("Paste the TOTP secret (base32).", MessageStyle::Yellow);
+            }
+
+            // ── Stage 3: secret / value ───────────────────
+            KeyInputStage::Secret => {
+                if text.is_empty() {
+                    self.set_msg_prompt("Secret cannot be empty.", MessageStyle::Red);
+                    return;
+                }
+                let secret: Vec<u8> = match flow.cat {
+                    KeyTab::Otp => {
+                        match crate::commands::keys::base32_decode(&text) {
+                            Some(b) if !b.is_empty() => {
+                                if b.len() > protocol::SECRET_LEN_OTP {
+                                    self.set_msg_prompt(
+                                        &format!(
+                                            "Secret too long: {} bytes decoded (limit {}).",
+                                            b.len(),
+                                            protocol::SECRET_LEN_OTP
+                                        ),
+                                        MessageStyle::Red,
+                                    );
+                                    return;
+                                }
+                                b
+                            }
+                            _ => {
+                                self.set_msg_prompt(
+                                    "Invalid base32 secret — check for typos.",
+                                    MessageStyle::Red,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    KeyTab::Api => {
+                        if text.len() > protocol::VALUE_LEN_API {
+                            self.set_msg_prompt(
+                                &format!(
+                                    "Value too long: {} bytes (limit {}).",
+                                    text.len(),
+                                    protocol::VALUE_LEN_API
+                                ),
+                                MessageStyle::Red,
+                            );
+                            return;
+                        }
+                        text.into_bytes()
+                    }
+                    KeyTab::Ssh => unreachable!(),
+                };
+                let name = flow.name.clone().unwrap_or_default();
+                let service = flow.service.clone().unwrap_or_default();
+                self.input_buf.clear();
+                self.key_add_flow = None;
+                self.mode = Mode::Normal;
+                self.action_key_add(flow.cat, name, service, secret);
+            }
+        }
+    }
+
+    /// Send the staged OTP/API add to the daemon (FP-gated on device).
+    fn action_key_add(&mut self, cat: KeyTab, name: String, service: String, secret: Vec<u8>) {
+        if self.busy {
             return;
         }
-        self.input_buf.clear();
-        self.mode = Mode::Keys;
-        self.action_key_generate(name);
+        self.busy = true;
+        self.set_msg(
+            &format!(
+                "Adding {} key '{}' — touch sensor to authorize…",
+                cat.label(),
+                name
+            ),
+            MessageStyle::Yellow,
+        );
+
+        let add_cat = match cat {
+            KeyTab::Otp => crate::commands::keys::KeyAddCat::Otp,
+            KeyTab::Api => crate::commands::keys::KeyAddCat::Api,
+            KeyTab::Ssh => unreachable!("SSH adds go through KEY:GENERATE"),
+        };
+        let cmd = crate::commands::keys::build_key_add_cmd(add_cat, &name, &service, &secret);
+        let label = cat.label();
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut client = DaemonClient::connect()?;
+                client.send(&cmd)
+            })();
+            match result {
+                Ok(rsp) if rsp.starts_with("OK") => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!("{} key '{}' added.", label, name),
+                        MessageStyle::Green,
+                    ));
+                }
+                Ok(rsp) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!("Add failed: {}", rsp),
+                        MessageStyle::Red,
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!("Add error: {}", e),
+                        MessageStyle::Red,
+                    ));
+                }
+            }
+            let _ = tx.send(ActionResult::Refresh);
+            let _ = tx.send(ActionResult::Done);
+        });
+    }
+
+    /// `s` in API tab — fetch and display the selected key's value via
+    /// `GET:api:<name>` (FP-gated by the daemon).
+    pub fn action_key_show_api(&mut self) {
+        if self.busy {
+            return;
+        }
+        if self.key_tab != KeyTab::Api {
+            self.set_msg(
+                "Show value is only available on the API tab.",
+                MessageStyle::Yellow,
+            );
+            return;
+        }
+        if !self.connected {
+            self.set_msg("Device not connected", MessageStyle::Red);
+            return;
+        }
+        let name = match self.current_key_name() {
+            Some(n) => n,
+            None => {
+                self.set_msg("No API key selected.", MessageStyle::Yellow);
+                return;
+            }
+        };
+
+        self.busy = true;
+        self.set_msg(
+            &format!("Fetching '{}' — touch sensor to authorize…", name),
+            MessageStyle::Yellow,
+        );
+
+        let cmd = format!("GET:api:{}", name);
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut client = DaemonClient::connect()?;
+                client.send(&cmd)
+            })();
+            match result {
+                Ok(rsp) => {
+                    let rsp = rsp.trim();
+                    if let Some(value) = rsp.strip_prefix("OK:") {
+                        // SecretMessage: footer only, never the event feed.
+                        let _ = tx.send(ActionResult::SecretMessage(format!(
+                            "API key '{}': {}",
+                            name, value
+                        )));
+                    } else {
+                        let _ = tx.send(ActionResult::Message(
+                            format!("Fetch failed: {}", rsp),
+                            MessageStyle::Red,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!("Fetch error: {}", e),
+                        MessageStyle::Red,
+                    ));
+                }
+            }
+            let _ = tx.send(ActionResult::Done);
+        });
     }
 
     fn action_key_generate(&mut self, name: String) {
@@ -1373,7 +1752,7 @@ impl App {
 
     pub fn cancel_key_delete(&mut self) {
         self.pending_delete = None;
-        self.mode = Mode::Keys;
+        self.mode = Mode::Normal;
         self.set_msg("Cancelled.", MessageStyle::Dim);
     }
 
@@ -1381,11 +1760,11 @@ impl App {
         let (tab, idx) = match self.pending_delete.take() {
             Some(v) => v,
             None => {
-                self.mode = Mode::Keys;
+                self.mode = Mode::Normal;
                 return;
             }
         };
-        self.mode = Mode::Keys;
+        self.mode = Mode::Normal;
         if self.busy {
             return;
         }
@@ -1474,10 +1853,12 @@ impl App {
                 Ok(rsp) => {
                     let rsp = rsp.trim();
                     if let Some(code) = rsp.strip_prefix("OK:") {
-                        let _ = tx.send(ActionResult::Message(
-                            format!("OTP code for '{}': {}", name, code),
-                            MessageStyle::Green,
-                        ));
+                        // SecretMessage: footer only — expired codes have no
+                        // business lingering in the event feed.
+                        let _ = tx.send(ActionResult::SecretMessage(format!(
+                            "OTP code for '{}': {}",
+                            name, code
+                        )));
                     } else {
                         let _ = tx.send(ActionResult::Message(
                             format!("OTP failed: {}", rsp),
@@ -1499,10 +1880,10 @@ impl App {
 
 /// Returned by [`App::request_pam_action`] so the event loop can leave
 /// alternate-screen mode before running pkexec.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PamRequest {
     pub action: &'static str, // "add" | "remove"
-    pub service: &'static str,
+    pub services: Vec<&'static str>,
 }
 
 /// Send a single command via a fresh daemon connection.
@@ -1512,9 +1893,3 @@ fn daemon_send(cmd: &str) -> Result<String, String> {
     client.send(cmd)
 }
 
-fn check_pam(service: &str) -> bool {
-    let path = format!("/etc/pam.d/{}", service);
-    std::fs::read_to_string(path)
-        .map(|c| c.contains("pam_immurok.so"))
-        .unwrap_or(false)
-}

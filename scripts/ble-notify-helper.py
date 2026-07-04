@@ -26,6 +26,31 @@ from dbus_fast import BusType
 from dbus_fast.aio import MessageBus
 
 
+async def start_notify_with_retry(iface, label, retries=5, delay=0.3):
+    """Enable GATT notifications, tolerating transient ATT errors.
+
+    BlueZ/the firmware can return ATT 0x0e ("Unlikely Error") when the CCCD
+    write races a just-restarted daemon re-subscribing on a device that stayed
+    connected (the HID-keyboard anchor keeps the LE link up across daemon
+    restarts). Retrying with a short delay clears the transient case.
+
+    Returns True on success, False if every attempt failed. Callers treat
+    False as best-effort and CONTINUE rather than letting an unhandled
+    exception crash the whole helper: a crash is read upstream as a device
+    disconnect and triggers a reconnect loop.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            await iface.call_start_notify()
+            return True
+        except Exception as e:
+            sys.stderr.write(f"StartNotify {label} attempt {attempt}/{retries}: {e}\n")
+            sys.stderr.flush()
+            if attempt < retries:
+                await asyncio.sleep(delay)
+    return False
+
+
 async def main():
     if len(sys.argv) < 4:
         print("Usage: ble-notify-helper.py <device_path> <cmd_path> <rsp_path> [ota_path] [extra_notify...]", file=sys.stderr)
@@ -65,7 +90,17 @@ async def main():
                 sys.stdout.flush()
 
     rsp_props.on_properties_changed(on_rsp_changed)
-    await rsp_iface.call_start_notify()
+    # RSP notifications carry FP-match/auth events — important, so retry hard.
+    # But NEVER let a transient ATT error (0x0e) propagate: an unhandled
+    # exception here kills the helper, which the daemon reads as a disconnect
+    # and turns into a reconnect loop. On exhaustion, continue best-effort —
+    # the link is up and the CCCD is usually already armed from a prior session.
+    if not await start_notify_with_retry(rsp_iface, "RSP"):
+        sys.stderr.write(
+            "RSP StartNotify failed after retries — continuing best-effort "
+            "(link alive; notifications likely already enabled)\n"
+        )
+        sys.stderr.flush()
 
     # OTA characteristic interface (optional)
     ota_iface = None

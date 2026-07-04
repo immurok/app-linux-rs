@@ -33,6 +33,9 @@ pub struct KeyNameEntry {
     pub index: u8,
     pub category: String, // "otp" or "api"
     pub name: String,
+    /// Issuer / service (OTP only; empty for API and pre-upgrade caches).
+    #[serde(default)]
+    pub service: String,
 }
 
 /// Per-category cache digest. Mirrors macOS 1.2.7+ (commit 542c8cb): firmware

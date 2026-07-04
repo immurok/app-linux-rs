@@ -80,6 +80,15 @@ pub fn run_list(category: &str) {
 pub fn run_add(category: &str) {
     let cat = parse_category(category);
 
+    if cat == "ssh" {
+        super::error_exit(
+            "SSH keys are generated on-device: use `immurok-cli key generate <name>` \
+             or `immurok-cli key import <name> <file>`.",
+        );
+    }
+
+    check_capacity_or_exit(cat);
+
     println!("Adding {} key (interactive).", cat.to_uppercase());
 
     // Read name
@@ -93,72 +102,111 @@ pub fn run_add(category: &str) {
         super::error_exit("Name cannot be empty.");
     }
 
-    // For OTP, read the secret
-    let secret = if cat == "otp" {
-        eprint!("TOTP secret (base32): ");
+    // OTP entries carry a separate issuer/service field on the device.
+    let service = if cat == "otp" {
+        eprint!("Service / issuer (optional): ");
         let mut s = String::new();
         std::io::stdin()
             .read_line(&mut s)
             .expect("Failed to read input");
-        let s = s.trim().to_string();
-        if s.is_empty() {
-            super::error_exit("Secret cannot be empty.");
-        }
-        Some(s)
-    } else if cat == "api" {
-        eprint!("API key value: ");
-        let mut s = String::new();
-        std::io::stdin()
-            .read_line(&mut s)
-            .expect("Failed to read input");
-        let s = s.trim().to_string();
-        if s.is_empty() {
-            super::error_exit("Value cannot be empty.");
-        }
-        Some(s)
+        s.trim().to_string()
     } else {
-        None
+        String::new()
     };
 
-    // Build write payload: name (16 bytes null-padded) + data
-    let mut payload = vec![0u8; 16];
-    let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(15);
-    payload[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
-    if let Some(ref s) = secret {
-        payload.extend_from_slice(s.as_bytes());
+    // Read the secret / value
+    let prompt = if cat == "otp" {
+        "TOTP secret (base32): "
+    } else {
+        "API key value: "
+    };
+    eprint!("{}", prompt);
+    let mut s = String::new();
+    std::io::stdin()
+        .read_line(&mut s)
+        .expect("Failed to read input");
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        super::error_exit("Secret cannot be empty.");
     }
 
-    let hex_payload = hex::encode(&payload);
+    let cmd = match cat {
+        "otp" => {
+            let secret = match base32_decode(&s) {
+                Some(b) if !b.is_empty() => b,
+                _ => super::error_exit("Invalid base32 secret."),
+            };
+            if secret.len() > immurok_common::protocol::SECRET_LEN_OTP {
+                super::error_exit(&format!(
+                    "Secret too long: {} bytes decoded (device limit {}).",
+                    secret.len(),
+                    immurok_common::protocol::SECRET_LEN_OTP
+                ));
+            }
+            build_key_add_cmd(KeyAddCat::Otp, name, &service, &secret)
+        }
+        "api" => {
+            if s.len() > immurok_common::protocol::VALUE_LEN_API {
+                super::error_exit(&format!(
+                    "Value too long: {} bytes (device limit {}).",
+                    s.len(),
+                    immurok_common::protocol::VALUE_LEN_API
+                ));
+            }
+            build_key_add_cmd(KeyAddCat::Api, name, "", s.as_bytes())
+        }
+        _ => unreachable!(),
+    };
 
     let mut client = match DaemonClient::connect() {
         Ok(c) => c,
         Err(e) => super::error_exit(&e),
     };
 
-    // Send KEY:WRITE via a raw protocol message
-    // The daemon doesn't have a KEY:WRITE socket command yet, so we note this
-    // is a placeholder for future implementation
-    let cat_byte: u8 = match cat {
-        "ssh" => 0,
-        "otp" => 1,
-        "api" => 2,
-        _ => unreachable!(),
-    };
-
-    // For now, we encode as a custom command that the daemon can extend
-    let cmd = format!("KEY:WRITE:{}:{}", cat_byte, hex_payload);
+    println!("Touch the sensor to authorize the write…");
     let rsp = client.send(&cmd).unwrap_or_else(|e| {
         super::error_exit(&format!("Failed to add key: {}", e));
     });
 
     if rsp.starts_with("OK") {
-        println!("\x1b[32mKey '{}' added.\x1b[0m", name);
+        println!("\x1b[32m{} key '{}' added.\x1b[0m", cat.to_uppercase(), name);
     } else {
         eprintln!("Add key failed: {}", rsp);
-        eprintln!("Note: key write requires daemon support (future implementation).");
     }
+}
+
+/// Category selector for [`build_key_add_cmd`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KeyAddCat {
+    Otp,
+    Api,
+}
+
+/// Build the daemon socket command that adds one OTP/API entry, mirroring
+/// the firmware entry layout (otp_entry_t = name[30]+service[30]+secret;
+/// api_entry_t = name[32]+value). Shared by the CLI interactive flow and
+/// the TUI Keys panel. `service` is OTP-only and ignored for API.
+pub fn build_key_add_cmd(cat: KeyAddCat, name: &str, service: &str, secret: &[u8]) -> String {
+    use immurok_common::protocol::{NAME_LEN_API, NAME_LEN_OTP, SERVICE_LEN_OTP};
+
+    fn pad_field(text: &str, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(len - 1);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        buf
+    }
+
+    let (mut payload, verb) = match cat {
+        KeyAddCat::Otp => {
+            let mut p = pad_field(name, NAME_LEN_OTP);
+            p.extend_from_slice(&pad_field(service, SERVICE_LEN_OTP));
+            (p, "OTP_IMPORT")
+        }
+        KeyAddCat::Api => (pad_field(name, NAME_LEN_API), "API_IMPORT"),
+    };
+    payload.extend_from_slice(secret);
+    format!("KEY:{}:{}", verb, hex::encode(&payload))
 }
 
 /// Delete a key.
@@ -667,7 +715,7 @@ fn parse_sec1_pem(pem_text: &str) -> (Vec<u8>, Vec<u8>) {
 /// `=` padding. Returns None on illegal characters. Lowercase is mapped to
 /// uppercase so common copy-paste from auth-app exports works without
 /// normalization.
-fn base32_decode(s: &str) -> Option<Vec<u8>> {
+pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
     let cleaned: String = s
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '=')
@@ -693,37 +741,50 @@ fn base32_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Combine an andOTP / otpauth `issuer` + `label` pair into a single display
-/// name fitting NAME_LEN_OTP-1 bytes. The device entry only has one name
-/// field; we follow the macOS convention of "service:account" when both
-/// are present (truncating account if needed).
-fn join_otp_name(issuer: &str, label: &str) -> String {
-    let max = immurok_common::protocol::NAME_LEN_OTP - 1; // leave one null
+/// Split an andOTP / otpauth `issuer` + `label` pair into the device entry's
+/// separate (service, account-name) fields, each truncated to its firmware
+/// field width on a char boundary. If the account is empty the service is
+/// promoted to the name so the entry stays identifiable.
+fn split_otp_fields(issuer: &str, label: &str) -> (String, String) {
     let issuer = issuer.trim();
     let label = label.trim();
 
-    let combined = if !issuer.is_empty() && !label.is_empty() {
-        format!("{}:{}", issuer, label)
-    } else if !issuer.is_empty() {
-        issuer.to_string()
+    let (service, account) = if !issuer.is_empty() {
+        (issuer.to_string(), label.to_string())
+    } else if let Some((svc, acc)) = label.split_once(':') {
+        (svc.trim().to_string(), acc.trim().to_string())
     } else {
-        label.to_string()
+        (String::new(), label.to_string())
     };
 
-    // Truncate on a char boundary so we never produce mid-UTF8 names.
-    if combined.len() <= max {
-        return combined;
+    let (service, account) = if account.is_empty() {
+        (String::new(), service)
+    } else {
+        (service, account)
+    };
+
+    (
+        truncate_utf8(&service, immurok_common::protocol::SERVICE_LEN_OTP - 1),
+        truncate_utf8(&account, immurok_common::protocol::NAME_LEN_OTP - 1),
+    )
+}
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 sequence.
+fn truncate_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
     let mut cut = max;
-    while cut > 0 && !combined.is_char_boundary(cut) {
+    while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    combined[..cut].to_string()
+    s[..cut].to_string()
 }
 
 /// One parsed OTP entry ready to ship to the daemon.
 struct OtpEntry {
     name: String,
+    service: String,
     secret: Vec<u8>,
 }
 
@@ -760,18 +821,12 @@ fn parse_andotp_json(data: &str) -> Option<(Vec<OtpEntry>, usize)> {
         };
         let issuer = v.get("issuer").and_then(|x| x.as_str()).unwrap_or("");
         let label = v.get("label").and_then(|x| x.as_str()).unwrap_or("");
-        let name = if !issuer.is_empty() {
-            join_otp_name(issuer, label)
-        } else if let Some((svc, acc)) = label.split_once(':') {
-            join_otp_name(svc, acc)
-        } else {
-            join_otp_name("", label)
-        };
+        let (service, name) = split_otp_fields(issuer, label);
         if name.is_empty() {
             skipped += 1;
             continue;
         }
-        entries.push(OtpEntry { name, secret });
+        entries.push(OtpEntry { name, service, secret });
     }
     Some((entries, skipped))
 }
@@ -862,23 +917,21 @@ fn parse_otpauth_uri(uri: &str) -> Option<OtpEntry> {
         return None;
     }
 
-    let name = if !issuer.is_empty() {
-        if let Some((svc, acc)) = path.split_once(':') {
+    let (service, name) = if !issuer.is_empty() {
+        if let Some((_, acc)) = path.split_once(':') {
             // both issuer query AND service-prefixed path → prefer issuer for svc.
-            join_otp_name(if !issuer.is_empty() { &issuer } else { svc }, acc)
+            split_otp_fields(&issuer, acc)
         } else {
-            join_otp_name(&issuer, &path)
+            split_otp_fields(&issuer, &path)
         }
-    } else if let Some((svc, acc)) = path.split_once(':') {
-        join_otp_name(svc, acc)
     } else {
-        join_otp_name("", &path)
+        split_otp_fields("", &path)
     };
 
     if name.is_empty() {
         return None;
     }
-    Some(OtpEntry { name, secret: secret_bytes })
+    Some(OtpEntry { name, service, secret: secret_bytes })
 }
 
 /// Tiny percent-decoder for otpauth URI components — we don't need any of
@@ -903,16 +956,21 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// Build the device payload for one OTP entry: name padded to NAME_LEN_OTP
-/// bytes (null-filled) + secret bytes. Sent as `KEY:OTP_IMPORT:<hex>` and
-/// the daemon stages + commits it via KEY_WRITE + KEY_COMMIT (FP gated on
-/// the first commit, cooldown rides the rest).
+/// Build the device payload for one OTP entry, mirroring otp_entry_t:
+/// name[30] + service[30] (both null-filled) + secret bytes. Sent as
+/// `KEY:OTP_IMPORT:<hex>` and the daemon stages + commits it via
+/// KEY_WRITE + KEY_COMMIT (FP gated on the first commit, cooldown rides
+/// the rest).
 fn build_otp_entry_payload(entry: &OtpEntry) -> Vec<u8> {
-    let name_len = immurok_common::protocol::NAME_LEN_OTP;
-    let mut buf = vec![0u8; name_len];
-    let bytes = entry.name.as_bytes();
-    let n = bytes.len().min(name_len - 1);
-    buf[..n].copy_from_slice(&bytes[..n]);
+    fn pad(text: &str, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(len - 1);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        buf
+    }
+    let mut buf = pad(&entry.name, immurok_common::protocol::NAME_LEN_OTP);
+    buf.extend_from_slice(&pad(&entry.service, immurok_common::protocol::SERVICE_LEN_OTP));
     buf.extend_from_slice(&entry.secret);
     buf
 }

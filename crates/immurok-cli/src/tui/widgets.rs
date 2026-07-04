@@ -1,9 +1,20 @@
 //! TUI rendering — ratatui widgets for the immurok panel.
+//!
+//! Layout (all tabs):
+//! ```text
+//!   immurok                     ● Connected · immurok · FW 1.6.1 · ▰▰▰▰▱ 71%
+//!   ❬1❭ Dashboard   ❬2❭ Keys   ❬3❭ PAM   ❬4❭ Logs
+//!  ┌─ tab content ─────────────────────────────────────────────────────────┐
+//!  │ …                                                                     │
+//!  └───────────────────────────────────────────────────────────────────────┘
+//!   ✓ Ready                                    ← message line
+//!   p pair · e enroll · … · q quit             ← context hotkeys
+//! ```
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
-use super::app::{App, KeyTab, MessageStyle, Mode, PAM_SERVICES, SOUND_PRESETS};
+use super::app::{App, KeyInputStage, KeyTab, MessageStyle, Mode, Tab, PAM_SERVICES};
 use immurok_common::protocol;
 
 const PRIMARY: Color = Color::Cyan;
@@ -13,139 +24,102 @@ const WARN: Color = Color::Yellow;
 const ERR: Color = Color::Red;
 const DIM: Color = Color::DarkGray;
 
+/// Minimum terminal width at which the Dashboard shows the Events column.
+const EVENTS_MIN_WIDTH: u16 = 84;
+
 /// Draw the full TUI frame.
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    match app.mode {
-        Mode::Keys | Mode::KeyGenInput | Mode::KeyDeleteConfirm => {
-            draw_keys(f, app, area);
-            return;
-        }
-        Mode::Pam => {
-            draw_main(f, app, area);
-            draw_pam_overlay(f, app, area);
-            return;
-        }
-        Mode::Help => {
-            draw_main(f, app, area);
-            draw_help_overlay(f, area);
-            return;
-        }
-        Mode::Logs => {
-            draw_logs(f, app, area);
-            return;
-        }
-        _ => draw_main(f, app, area),
-    }
-}
-
-fn draw_main(f: &mut Frame, app: &App, area: Rect) {
-    // Reserve an extra line for enrollment progress when in-flight.
-    let enroll_row = if app.enroll_active { 3 } else { 0 };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),              // Status panel
-            Constraint::Length(5),              // Fingerprints + settings + PAM
-            Constraint::Length(enroll_row),     // Enrollment progress (optional)
-            Constraint::Length(4),              // Hotkeys
-            Constraint::Min(1),                 // Message
+            Constraint::Length(1), // Header line
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(3),    // Content
+            Constraint::Length(1), // Message line
+            Constraint::Length(1), // Hotkey line
         ])
         .split(area);
 
-    draw_status(f, app, chunks[0]);
-    draw_settings(f, app, chunks[1]);
-    if app.enroll_active {
-        draw_enroll_progress(f, app, chunks[2]);
+    draw_header(f, app, chunks[0]);
+    draw_tabbar(f, app, chunks[1]);
+
+    match app.tab {
+        Tab::Dashboard => draw_dashboard(f, app, chunks[2]),
+        Tab::Keys => draw_keys(f, app, chunks[2]),
+        Tab::Pam => draw_pam(f, app, chunks[2]),
+        Tab::Logs => draw_logs(f, app, chunks[2]),
     }
-    draw_hotkeys(f, app, chunks[3]);
-    draw_message(f, app, chunks[4]);
+
+    draw_message(f, app, chunks[3]);
+    draw_hotkeys(f, app, chunks[4]);
+
+    if app.mode == Mode::Help {
+        draw_help_overlay(f, area);
+    }
 }
 
-// ── Status panel ─────────────────────────────────────────────
+// ── Header line ──────────────────────────────────────────────
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" immurok{}", if app.daemon_ok { "" } else { " · daemon offline" }),
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+    // Brand, left-aligned.
+    let brand = Paragraph::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "immurok",
             Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(PRIMARY));
+        ),
+    ]));
+    f.render_widget(brand, area);
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
+    // Status summary, right-aligned.
+    let mut spans: Vec<Span> = Vec::new();
     if !app.daemon_ok {
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  daemon not running — start with `systemctl --user start immurok-daemon`",
-                Style::default().fg(ERR),
-            )),
-        ];
-        f.render_widget(Paragraph::new(lines), inner);
-        return;
-    }
-
-    let conn_style = if app.connected {
-        Style::default().fg(OK).add_modifier(Modifier::BOLD)
+        spans.push(Span::styled(
+            "○ daemon offline",
+            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+        ));
+    } else if !app.connected {
+        spans.push(Span::styled("○ Disconnected", Style::default().fg(ERR)));
+        if app.paired {
+            spans.push(Span::styled("  ·  paired", Style::default().fg(DIM)));
+        } else {
+            spans.push(Span::styled("  ·  not paired", Style::default().fg(WARN)));
+        }
     } else {
-        Style::default().fg(ERR)
-    };
-    let conn_text = if app.connected {
-        "● Connected"
-    } else {
-        "○ Disconnected"
-    };
-
-    let name = if app.device_name.is_empty() {
-        "-"
-    } else {
-        &app.device_name
-    };
-    let fw = if app.fw_version.is_empty() {
-        "-"
-    } else {
-        app.fw_version.as_str()
-    };
-    let paired_style = if app.paired {
-        Style::default().fg(OK).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(WARN)
-    };
-    let paired_text = if app.paired { "Yes" } else { "No" };
-
-    // Battery bar
-    let (batt_str, batt_bar, batt_style) = battery_render(app);
-
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("  Device   "),
-            Span::styled(
-                format!("{:<22}", name),
+        spans.push(Span::styled(
+            "● Connected",
+            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+        ));
+        if !app.device_name.is_empty() {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                app.device_name.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Battery  "),
-            Span::styled(batt_bar, batt_style),
-            Span::raw("  "),
-            Span::styled(batt_str, batt_style),
-        ]),
-        Line::from(vec![
-            Span::raw("  Status   "),
-            Span::styled(format!("{:<22}", conn_text), conn_style),
-            Span::raw("Firmware "),
-            Span::raw(fw),
-        ]),
-        Line::from(vec![
-            Span::raw("  Paired   "),
-            Span::styled(format!("{:<22}", paired_text), paired_style),
-        ]),
-    ];
+            ));
+        }
+        if !app.paired {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+            spans.push(Span::styled("not paired", Style::default().fg(WARN)));
+        }
+        if !app.fw_version.is_empty() {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                format!("FW {}", app.fw_version),
+                Style::default().fg(DIM),
+            ));
+        }
+        let (batt_str, batt_bar, batt_style) = battery_render(app);
+        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled(batt_bar, batt_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(batt_str, batt_style));
+    }
+    spans.push(Span::raw(" "));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    let status = Paragraph::new(Line::from(spans)).alignment(Alignment::Right);
+    f.render_widget(status, area);
 }
 
 /// Returns (label, bar, style). Style turns red below 15%.
@@ -170,304 +144,367 @@ fn battery_render(app: &App) -> (String, String, Style) {
     } else {
         OK
     };
-    (format!("{}%", pct), bar, Style::default().fg(color).add_modifier(Modifier::BOLD))
+    (
+        format!("{}%", pct),
+        bar,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
-// ── Settings panel (fingerprints + toggles + PAM) ──────────
+// ── Tab bar ──────────────────────────────────────────────────
 
-fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabbar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    for tab in Tab::ALL {
+        let is_active = app.tab == tab;
+        let key_style = if is_active {
+            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let label_style = if is_active {
+            Style::default()
+                .fg(PRIMARY)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(DIM)
+        };
+        spans.push(Span::styled(format!("❬{}❭", tab.hotkey()), key_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(tab.title(), label_style));
+        spans.push(Span::raw("   "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Dashboard tab ────────────────────────────────────────────
+
+fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
+    if !app.daemon_ok {
+        let block = content_block(" Dashboard ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  daemon not running",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  start it with:  systemctl --user start immurok-daemon",
+                Style::default().fg(DIM),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    // Wide terminals get a right-hand Events column.
+    let show_events = area.width >= EVENTS_MIN_WIDTH;
+    let cols = if show_events {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(46), Constraint::Min(20)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20)])
+            .split(area)
+    };
+
+    draw_dashboard_left(f, app, cols[0]);
+    if show_events {
+        draw_events(f, app, cols[1]);
+    }
+}
+
+fn draw_dashboard_left(f: &mut Frame, app: &App, area: Rect) {
+    // Fingerprints block grows by 2 rows while enrolling (hint + gauge).
+    let fp_height = if app.enroll_active { 5 } else { 3 };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(fp_height), // Fingerprints
+            Constraint::Length(7),         // Unlock toggles
+            Constraint::Length(3),         // PAM summary
+            Constraint::Min(0),            // Filler
+        ])
+        .split(area);
+
+    draw_fingerprints(f, app, rows[0]);
+    draw_unlock(f, app, rows[1]);
+    draw_pam_summary(f, app, rows[2]);
+}
+
+fn draw_fingerprints(f: &mut Frame, app: &App, area: Rect) {
+    let title = if app.enroll_active {
+        format!(" Fingerprints · enrolling slot {} ", app.enroll_slot)
+    } else {
+        format!(
+            " Fingerprints · {}/{} ",
+            fp_count(app.fp_bitmap),
+            protocol::MAX_FINGERPRINT_SLOTS
+        )
+    };
+    let border = if app.enroll_active { WARN } else { PRIMARY };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(
-                " Slots & settings  ({}/{} enrolled)",
-                fp_count(app.fp_bitmap),
-                protocol::MAX_FINGERPRINT_SLOTS
-            ),
-            Style::default().fg(PRIMARY),
+            title,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(PRIMARY));
-
+        .border_style(Style::default().fg(border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Row 1: fingerprint slots
-    let mut fp_spans = vec![Span::raw("  Slots   ")];
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if app.enroll_active {
+            vec![
+                Constraint::Length(1), // slots
+                Constraint::Length(1), // hint
+                Constraint::Length(1), // gauge
+            ]
+        } else {
+            vec![Constraint::Length(1)]
+        })
+        .split(inner);
+
+    // Slot row
+    let mut spans: Vec<Span> = vec![Span::raw("  ")];
     for i in 0..protocol::MAX_FINGERPRINT_SLOTS {
         let has = app.fp_bitmap & (1 << i) != 0;
-        if has {
-            fp_spans.push(Span::styled(
-                format!("[{}●]", i),
+        let enrolling = app.enroll_active && i == app.enroll_slot;
+        if enrolling {
+            spans.push(Span::styled(
+                format!("◍ {}", i),
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ));
+        } else if has {
+            spans.push(Span::styled(
+                format!("⬤ {}", i),
                 Style::default().fg(OK).add_modifier(Modifier::BOLD),
             ));
         } else {
-            fp_spans.push(Span::styled(
-                format!("[{}○]", i),
-                Style::default().fg(DIM),
-            ));
+            spans.push(Span::styled(format!("○ {}", i), Style::default().fg(DIM)));
         }
-        fp_spans.push(Span::raw(" "));
+        spans.push(Span::raw("    "));
     }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-    // Row 2: feature toggles
-    let sound_label = if app.unlock_sound.is_empty() {
-        "silent".to_string()
+    // Enrollment hint + gauge
+    if app.enroll_active {
+        use crate::enroll_hint::{step_arrow, step_hint};
+
+        // FP-gate phase: the device wants an already-enrolled finger to
+        // authorize — showing capture-pose hints here would mislead.
+        if app.enroll_gate {
+            let hint = Paragraph::new(Line::from(vec![
+                Span::styled("  ⚿ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+                Span::raw("Verify with an enrolled finger"),
+            ]));
+            f.render_widget(hint, rows[1]);
+
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(WARN).bg(Color::Reset))
+                .ratio(0.0)
+                .label("awaiting authorization · Esc to cancel");
+            f.render_widget(gauge, rows[2]);
+            return;
+        }
+
+        let total = app.enroll_total.max(1);
+        let step = app.enroll_current.saturating_add(1).min(total);
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("  {} ", step_arrow(step)),
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(step_hint(step)),
+        ]));
+        f.render_widget(hint, rows[1]);
+
+        let ratio = (app.enroll_current.min(app.enroll_total) as f64) / (total as f64);
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(WARN).bg(Color::Reset))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(format!(
+                "{}/{} · Esc to cancel",
+                app.enroll_current, app.enroll_total
+            ));
+        f.render_widget(gauge, rows[2]);
+    }
+}
+
+fn draw_unlock(f: &mut Frame, app: &App, area: Rect) {
+    let block = content_block(" Unlock ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let (sound_label, sound_style) = if app.unlock_sound.is_empty() {
+        ("silent".to_string(), Style::default().fg(DIM))
     } else {
-        app.unlock_sound.clone()
+        (
+            format!("♪ {}", app.unlock_sound),
+            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        )
     };
 
-    let toggles_line = Line::from(vec![
-        Span::raw("  Auth   "),
-        on_off("sudo", app.unlock_sudo),
-        Span::raw("  "),
-        on_off("polkit", app.unlock_polkit),
-        Span::raw("  "),
-        on_off("screen", app.unlock_screen),
-        Span::raw("  "),
-        on_off("long-press lock", app.lock_screen),
-        Span::raw("  sound:"),
-        Span::styled(
-            format!(" {}", sound_label),
-            Style::default()
-                .fg(if app.unlock_sound.is_empty() { DIM } else { PRIMARY })
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    // Row 3: PAM status
-    let pam_line = Line::from(vec![
-        Span::raw("  PAM    "),
-        pam_chip("sudo", app.pam_sudo),
-        Span::raw("  "),
-        pam_chip("polkit", app.pam_polkit),
-        Span::raw("  "),
-        pam_chip("gdm", app.pam_screen),
-    ]);
-
-    let lines = vec![Line::from(fp_spans), toggles_line, pam_line];
+    let lines = vec![
+        toggle_row("s", "sudo", app.unlock_sudo),
+        toggle_row("o", "polkit", app.unlock_polkit),
+        toggle_row("k", "screen unlock", app.unlock_screen),
+        toggle_row("L", "long-press lock", app.lock_screen),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("n", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::raw(format!("{:<17}", "sound")),
+            Span::styled(sound_label, sound_style),
+        ]),
+    ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn on_off<'a>(label: &'a str, on: bool) -> Span<'a> {
-    let style = if on {
-        Style::default().fg(OK).add_modifier(Modifier::BOLD)
+fn toggle_row<'a>(key: &'a str, label: &'a str, on: bool) -> Line<'a> {
+    let state = if on {
+        Span::styled("● on", Style::default().fg(OK).add_modifier(Modifier::BOLD))
     } else {
-        Style::default().fg(DIM)
+        Span::styled("○ off", Style::default().fg(DIM))
     };
-    Span::styled(
-        format!("{}:{}", label, if on { "on" } else { "off" }),
-        style,
-    )
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(key, Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(format!("{:<17}", label)),
+        state,
+    ])
+}
+
+fn draw_pam_summary(f: &mut Frame, app: &App, area: Rect) {
+    let block = content_block(" PAM ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let line = Line::from(vec![
+        Span::raw("  "),
+        pam_chip("sudo", app.pam_sudo),
+        Span::raw("   "),
+        pam_chip("polkit", app.pam_polkit),
+        Span::raw("   "),
+        pam_chip("gdm", app.pam_screen),
+        Span::styled("      ❬3❭ manage", Style::default().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 fn pam_chip<'a>(label: &'a str, installed: bool) -> Span<'a> {
     let (sym, color) = if installed { ("✓", OK) } else { ("✗", DIM) };
-    Span::styled(
-        format!("{} {}", sym, label),
-        Style::default().fg(color),
-    )
+    Span::styled(format!("{} {}", sym, label), Style::default().fg(color))
 }
 
 fn fp_count(bitmap: u8) -> u32 {
     (bitmap & 0x1F).count_ones()
 }
 
-// ── Enrollment progress bar ─────────────────────────────────
+// ── Events feed (Dashboard right column) ─────────────────────
 
-fn draw_enroll_progress(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Enrolling slot {} ", app.enroll_slot),
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(WARN));
-
+fn draw_events(f: &mut Frame, app: &App, area: Rect) {
+    let block = content_block(" Events ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let total = app.enroll_total.max(1) as u16;
-    let cur = app.enroll_current.min(app.enroll_total) as u16;
-    let ratio = (cur as f64) / (total as f64);
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(WARN).bg(Color::Reset))
-        .ratio(ratio.clamp(0.0, 1.0))
-        .label(format!(
-            "{}/{}  ·  Esc to cancel",
-            app.enroll_current, app.enroll_total
-        ));
-    f.render_widget(gauge, inner);
-}
+    let visible = inner.height as usize;
+    let total = app.events.len();
+    let start = total.saturating_sub(visible);
 
-// ── Hotkeys ──────────────────────────────────────────────────
-
-fn draw_hotkeys(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(PRIMARY));
-
-    let key_style = Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD);
-
-    let lines = match app.mode {
-        Mode::Normal | Mode::Help | Mode::Pam => vec![
-            Line::from(vec![
-                Span::raw("  "),
-                hotkey("p", "air", key_style),
-                Span::raw("  "),
-                hotkey("u", "npair", key_style),
-                Span::raw("  "),
-                hotkey("e", "nroll", key_style),
-                Span::raw("  "),
-                hotkey("d", "elete", key_style),
-                Span::raw("  "),
-                hotkey("v", "erify", key_style),
-                Span::raw("  "),
-                hotkey("s", "udo", key_style),
-                Span::raw("  "),
-                hotkey("o", "polkit", key_style),
-                Span::raw("  "),
-                hotkey("k", "screen", key_style),
-                Span::raw("  "),
-                hotkey("L", "ock", key_style),
-                Span::raw("  "),
-                hotkey("n", "sound", key_style),
-            ]),
-            Line::from(vec![
-                Span::raw("  "),
-                hotkey("K", "eys", key_style),
-                Span::raw("  "),
-                hotkey("M", "PAM", key_style),
-                Span::raw("  "),
-                hotkey("i", "nfo", key_style),
-                Span::raw("  "),
-                hotkey("l", "ogs", key_style),
-                Span::raw("  "),
-                hotkey("?", "help", key_style),
-                Span::raw("  "),
-                hotkey("q", "uit", key_style),
-            ]),
-        ],
-        Mode::EnrollSelect => vec![Line::from(Span::styled(
-            format!(
-                "  Press [0-{}] to choose enroll slot · [Esc] cancel",
-                protocol::MAX_FINGERPRINT_SLOTS - 1
-            ),
-            Style::default().fg(WARN),
-        ))],
-        Mode::DeleteSelect => vec![Line::from(Span::styled(
-            format!(
-                "  Press [0-{}] to choose delete slot · [Esc] cancel",
-                protocol::MAX_FINGERPRINT_SLOTS - 1
-            ),
-            Style::default().fg(WARN),
-        ))],
-        // Keys / KeyGenInput / KeyDeleteConfirm are rendered by draw_keys;
-        // Logs has its own footer in draw_logs — neither path reaches here,
-        // but the arm is required for exhaustiveness.
-        Mode::Keys | Mode::KeyGenInput | Mode::KeyDeleteConfirm | Mode::Logs => Vec::new(),
+    let lines: Vec<Line<'_>> = if total == 0 {
+        vec![Line::from(Span::styled(
+            "  (no events yet)",
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        app.events
+            .iter()
+            .skip(start)
+            .map(|e| {
+                let (sym, color) = match e.style {
+                    MessageStyle::Green => ("✓", OK),
+                    MessageStyle::Red => ("✗", ERR),
+                    MessageStyle::Yellow => ("…", WARN),
+                    MessageStyle::Dim => ("·", DIM),
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {} ", e.time), Style::default().fg(DIM)),
+                    Span::styled(format!("{} ", sym), Style::default().fg(color)),
+                    Span::raw(truncate(&e.text, inner.width.saturating_sub(13) as usize)),
+                ])
+            })
+            .collect()
     };
-
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn hotkey<'a>(key: &'a str, rest: &'a str, key_style: Style) -> Span<'a> {
-    // Returns a *single* Span — caller chains them. We embed the key in
-    // brackets with style, but Span can't carry mixed styles. So we use
-    // styled-on-key trick by relying on caller composing multiple Spans.
-    // Here we just hand back the [k]rest combo as one styled span.
-    Span::styled(format!("[{}]{}", key, rest), key_style)
-}
-
-// ── Message area ─────────────────────────────────────────────
-
-fn draw_message(f: &mut Frame, app: &App, area: Rect) {
-    let style = match app.message_style {
-        MessageStyle::Dim => Style::default().fg(DIM),
-        MessageStyle::Green => Style::default().fg(OK).add_modifier(Modifier::BOLD),
-        MessageStyle::Red => Style::default().fg(ERR).add_modifier(Modifier::BOLD),
-        MessageStyle::Yellow => Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-    };
-    f.render_widget(
-        Paragraph::new(format!("  {}", app.message))
-            .style(style)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-// ── Keys panel ───────────────────────────────────────────────
+// ── Keys tab ─────────────────────────────────────────────────
 
 fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
+    let block = content_block(" Keys ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tabs / title
-            Constraint::Min(3),    // Key list
-            Constraint::Length(4), // Hotkeys / input
-            Constraint::Length(3), // Message
+            Constraint::Length(1), // category segments
+            Constraint::Length(1), // separator / column header
+            Constraint::Min(1),    // list
         ])
-        .split(area);
+        .split(inner);
 
-    // ── Tabs row ─────────────────────────────────────────────
-    let tab_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " immurok / keys ",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(PRIMARY));
-
+    // Category segments
     let active = Style::default()
         .fg(Color::Black)
         .bg(PRIMARY)
         .add_modifier(Modifier::BOLD);
     let inactive = Style::default().fg(DIM);
-
-    let mk_tab = |label: &str, count: usize, max: u8, is_active: bool| -> Span<'_> {
-        let txt = format!(" {} ({}/{}) ", label, count, max);
-        Span::styled(txt, if is_active { active } else { inactive })
+    let mk_seg = |label: &str, count: usize, max: u8, is_active: bool| -> Span<'_> {
+        Span::styled(
+            format!(" {} {}/{} ", label, count, max),
+            if is_active { active } else { inactive },
+        )
     };
-
-    let tabs_line = Line::from(vec![
+    let seg_line = Line::from(vec![
         Span::raw("  "),
-        mk_tab(
-            "1·SSH",
-            app.ssh_keys.len(),
-            protocol::KEY_MAX_SSH,
-            app.key_tab == KeyTab::Ssh,
-        ),
-        Span::raw(" "),
-        mk_tab(
-            "2·OTP",
-            app.otp_keys.len(),
-            protocol::KEY_MAX_OTP,
-            app.key_tab == KeyTab::Otp,
-        ),
-        Span::raw(" "),
-        mk_tab(
-            "3·API",
-            app.api_keys.len(),
-            protocol::KEY_MAX_API,
-            app.key_tab == KeyTab::Api,
-        ),
+        mk_seg("SSH", app.ssh_keys.len(), protocol::KEY_MAX_SSH, app.key_tab == KeyTab::Ssh),
+        Span::raw("  "),
+        mk_seg("OTP", app.otp_keys.len(), protocol::KEY_MAX_OTP, app.key_tab == KeyTab::Otp),
+        Span::raw("  "),
+        mk_seg("API", app.api_keys.len(), protocol::KEY_MAX_API, app.key_tab == KeyTab::Api),
+        Span::styled("   ‹h  Tab  l›", Style::default().fg(DIM)),
     ]);
-    f.render_widget(Paragraph::new(tabs_line).block(tab_block), chunks[0]);
+    f.render_widget(Paragraph::new(seg_line), rows[0]);
 
-    // ── Key list ─────────────────────────────────────────────
-    let list_block = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(PRIMARY));
+    // Contextual hint under the segments
+    let hint = match app.key_tab {
+        KeyTab::Ssh => "  a generate on-device keypair · c show authorized_keys line · import via CLI `key import`",
+        KeyTab::Otp => "  a add entry (name + base32 secret) · o fetch code (FP-gated) · bulk import via CLI `key import-otp`",
+        KeyTab::Api => "  a add entry (name + value) · s show value (FP-gated)",
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
+        rows[1],
+    );
 
-    let list_area = list_block.inner(chunks[1]);
-    f.render_widget(list_block, chunks[1]);
-
+    // List
+    let list_area = rows[2];
     let visible_rows = list_area.height as usize;
     let cur = app.key_cursor;
     let total = app.current_key_len();
 
-    let start = if total <= visible_rows {
-        0
-    } else if cur < visible_rows / 2 {
+    let start = if total <= visible_rows || cur < visible_rows / 2 {
         0
     } else if cur + visible_rows / 2 >= total {
         total.saturating_sub(visible_rows)
@@ -483,14 +520,11 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "  (no entries)"
         };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(DIM),
-        )));
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))));
     } else {
         for idx_in_list in start..end {
             let is_sel = idx_in_list == cur;
-            let marker = if is_sel { "▶ " } else { "  " };
+            let marker = if is_sel { " ▶ " } else { "   " };
             let row_style = if is_sel {
                 Style::default()
                     .fg(Color::Black)
@@ -508,20 +542,21 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
                         r.fingerprint.clone()
                     };
                     Line::from(Span::styled(
-                        format!(
-                            "{}[{:>2}] {:<18}  {}",
-                            marker,
-                            r.index,
-                            truncate(&r.name, 18),
-                            fp
-                        ),
+                        format!("{}[{:>2}] {:<18}  {}", marker, r.index, truncate(&r.name, 18), fp),
                         row_style,
                     ))
                 }
                 KeyTab::Otp => {
                     let r = &app.otp_keys[idx_in_list];
+                    let svc = if r.service.is_empty() { "-" } else { &r.service };
                     Line::from(Span::styled(
-                        format!("{}[{:>2}] {}", marker, r.index, r.name),
+                        format!(
+                            "{}[{:>2}] {:<30}  {}",
+                            marker,
+                            r.index,
+                            truncate(&r.name, 30),
+                            svc
+                        ),
                         row_style,
                     ))
                 }
@@ -537,169 +572,18 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(lines), list_area);
-
-    // ── Hotkeys / input ──────────────────────────────────────
-    let key_style = Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD);
-    let hot_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(PRIMARY));
-
-    let hot_text = match app.mode {
-        Mode::KeyGenInput => vec![
-            Line::from(vec![
-                Span::styled("  Name: ", Style::default().fg(WARN)),
-                Span::styled(&app.input_buf, Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    "_",
-                    Style::default().fg(PRIMARY).add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ]),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("[Enter]", key_style),
-                Span::raw(" confirm   "),
-                Span::styled("[Esc]", key_style),
-                Span::raw(" cancel   (max 15 chars)"),
-            ]),
-        ],
-        Mode::KeyDeleteConfirm => vec![
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("[y]", key_style),
-                Span::raw(" / "),
-                Span::styled("[Enter]", key_style),
-                Span::raw(" confirm    "),
-                Span::styled("[n]", key_style),
-                Span::raw(" / "),
-                Span::styled("[Esc]", key_style),
-                Span::raw(" cancel"),
-            ]),
-            Line::from(""),
-        ],
-        _ => vec![
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("[Tab/1-3]", key_style),
-                Span::raw(" tab  "),
-                Span::styled("[↑↓/jk]", key_style),
-                Span::raw(" move  "),
-                Span::styled("[g]", key_style),
-                Span::raw("en  "),
-                Span::styled("[d]", key_style),
-                Span::raw("el  "),
-                Span::styled("[o]", key_style),
-                Span::raw("tp  "),
-                Span::styled("[c]", key_style),
-                Span::raw("opy  "),
-                Span::styled("[r]", key_style),
-                Span::raw("efresh  "),
-                Span::styled("[Esc]", key_style),
-                Span::raw(" back"),
-            ]),
-            Line::from(Span::styled(
-                match app.key_tab {
-                    KeyTab::Ssh => "  [g] generate SSH keypair  ·  [c] show authorized_keys line",
-                    KeyTab::Otp => "  [o] fetch TOTP code (FP-gated)  ·  add OTP via `immurok-cli key add otp`",
-                    KeyTab::Api => "  add API key via `immurok-cli key add api`",
-                },
-                Style::default().fg(DIM),
-            )),
-        ],
-    };
-    f.render_widget(Paragraph::new(hot_text).block(hot_block), chunks[2]);
-
-    draw_message(f, app, chunks[3]);
 }
 
-// ── Help overlay ─────────────────────────────────────────────
+// ── PAM tab ──────────────────────────────────────────────────
 
-fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 80, area);
-    f.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Help ",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(PRIMARY));
-
-    let key = |k: &'static str| {
-        Span::styled(
-            format!("{:<10}", k),
-            Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD),
-        )
-    };
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Pairing & fingerprints",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("p"), Span::raw("Pair device (press button on device)")]),
-        Line::from(vec![key("u"), Span::raw("Unpair / factory reset")]),
-        Line::from(vec![key("e"), Span::raw("Enroll: pick slot 0-4")]),
-        Line::from(vec![key("E"), Span::raw("Enroll into first empty slot")]),
-        Line::from(vec![key("d"), Span::raw("Delete slot (pick 0-4)")]),
-        Line::from(vec![key("v"), Span::raw("Verify fingerprint")]),
-        Line::from(vec![key("Esc"), Span::raw("Cancel in-flight enrollment")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Settings",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("s"), Span::raw("Toggle sudo unlock")]),
-        Line::from(vec![key("o"), Span::raw("Toggle polkit unlock")]),
-        Line::from(vec![key("k"), Span::raw("Toggle screen unlock")]),
-        Line::from(vec![key("L"), Span::raw("Toggle long-press → lock screen")]),
-        Line::from(vec![key("n"), Span::raw("Cycle unlock sound preset")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Panels",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![key("K"), Span::raw("Keys (SSH / OTP / API)")]),
-        Line::from(vec![key("M"), Span::raw("PAM services install / remove")]),
-        Line::from(vec![key("i"), Span::raw("Device info one-liner")]),
-        Line::from(vec![key("l"), Span::raw("Tail daemon logs in-TUI (Esc to return)")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press ? or Esc to close.",
-            Style::default().fg(DIM),
-        )),
-    ];
-
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-// ── PAM overlay ──────────────────────────────────────────────
-
-fn draw_pam_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(60, 60, area);
-    f.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " PAM services ",
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(PRIMARY));
-
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(inner);
+fn draw_pam(f: &mut Frame, app: &App, area: Rect) {
+    let block = content_block(" PAM services ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "  pkexec will prompt for an admin password.",
+        "  install/remove needs admin auth — pkexec will prompt.",
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(""));
@@ -709,7 +593,7 @@ fn draw_pam_overlay(f: &mut Frame, app: &App, area: Rect) {
         let installed = app.pam_is_installed(i);
         let (sym, sym_color) = if installed { ("✓", OK) } else { ("✗", DIM) };
         let status = if installed { "installed" } else { "not installed" };
-        let marker = if is_sel { "▶ " } else { "  " };
+        let marker = if is_sel { " ▶ " } else { "   " };
         let row_style = if is_sel {
             Style::default()
                 .fg(Color::Black)
@@ -720,89 +604,49 @@ fn draw_pam_overlay(f: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::styled(marker, row_style),
-            Span::styled(
-                format!("{:<14}", svc.display),
-                row_style.add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{:<14}", svc.display), row_style.add_modifier(Modifier::BOLD)),
             Span::styled(format!("{} ", sym), Style::default().fg(sym_color)),
             Span::styled(
-                status.to_string(),
+                format!("{:<14}", status),
                 Style::default().fg(if installed { OK } else { DIM }),
             ),
             Span::styled(format!("  /etc/pam.d/{}", svc.service), Style::default().fg(DIM)),
         ]));
     }
 
-    let footer = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[i]", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
-        Span::raw("nstall  "),
-        Span::styled("[r]", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
-        Span::raw("emove  "),
-        Span::styled("[↑↓/jk]", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
-        Span::raw(" move  "),
-        Span::styled("[Esc]", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
-        Span::raw(" back"),
-    ]);
-
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
-    f.render_widget(Paragraph::new(footer), chunks[1]);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-// ── Logs panel ───────────────────────────────────────────────
+// ── Logs tab ─────────────────────────────────────────────────
 
 fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(3),    // Log body
-            Constraint::Length(3), // Hotkey footer
-        ])
-        .split(area);
-
-    // ── Header ────────────────────────────────────────────────
     let live = app.log_child.is_some();
-    let tail_indicator = if !live {
-        Span::styled("● stream closed", Style::default().fg(ERR))
+    let tail = if !live {
+        Span::styled("● stream closed ", Style::default().fg(ERR))
     } else if app.log_scroll == 0 {
         Span::styled(
-            "● live tail",
+            "● live ",
             Style::default().fg(OK).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
-            format!("⏸ scrolled back {} lines", app.log_scroll),
+            format!("⏸ -{} lines ", app.log_scroll),
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         )
     };
 
-    let header_block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " Daemon logs · immurok-daemon ",
+            " Logs · ~/.immurok/logs.txt ",
             Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
         ))
+        .title_top(Line::from(tail).right_aligned())
         .border_style(Style::default().fg(PRIMARY));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let header_line = Line::from(vec![
-        Span::raw("  "),
-        tail_indicator,
-        Span::styled(
-            format!("    {} lines buffered", app.log_lines.len()),
-            Style::default().fg(DIM),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(header_line).block(header_block), chunks[0]);
-
-    // ── Body ──────────────────────────────────────────────────
-    let body_block = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(PRIMARY));
-    let body_inner = body_block.inner(chunks[1]);
-    f.render_widget(body_block, chunks[1]);
-
-    let visible = body_inner.height as usize;
+    let visible = inner.height as usize;
     let total = app.log_lines.len();
     let end = total.saturating_sub(app.log_scroll);
     let start = end.saturating_sub(visible);
@@ -823,32 +667,11 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(lines), body_inner);
-
-    // ── Footer ────────────────────────────────────────────────
-    let footer_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(PRIMARY));
-
-    let key = Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD);
-    let footer = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[↑↓/jk]", key),
-        Span::raw(" line  "),
-        Span::styled("[PgUp/PgDn]", key),
-        Span::raw(" page  "),
-        Span::styled("[Home]", key),
-        Span::raw(" top  "),
-        Span::styled("[End]", key),
-        Span::raw(" follow tail  "),
-        Span::styled("[Esc/q]", key),
-        Span::raw(" back"),
-    ]);
-    f.render_widget(Paragraph::new(footer).block(footer_block), chunks[2]);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Color-code log lines: ERROR red, WARN yellow, INFO default.
-/// Matches the level tokens journalctl prints for tracing-subscriber output.
+/// Matches the level tokens in the daemon's tracing-subscriber output.
 fn log_line_style(line: &str) -> Style {
     // Cheap substring scan — fine at our line rate (≤200 lines/sec).
     if line.contains(" ERROR ")
@@ -866,7 +689,234 @@ fn log_line_style(line: &str) -> Style {
     }
 }
 
+// ── Message + hotkey footer ──────────────────────────────────
+
+fn draw_message(f: &mut Frame, app: &App, area: Rect) {
+    // KeyInput repurposes the message line as the text input.
+    if app.mode == Mode::KeyInput {
+        let label = match &app.key_add_flow {
+            Some(flow) => match flow.stage() {
+                KeyInputStage::Name => match flow.cat {
+                    KeyTab::Ssh => " New SSH key name: ",
+                    KeyTab::Otp => " Account name: ",
+                    KeyTab::Api => " New API key name: ",
+                },
+                KeyInputStage::Service => " Service / issuer (optional): ",
+                KeyInputStage::Secret => match flow.cat {
+                    KeyTab::Otp => " TOTP secret (base32): ",
+                    _ => " API key value: ",
+                },
+            },
+            None => " Input: ",
+        };
+        // Long secrets: keep the tail visible as the buffer outgrows the line.
+        let avail = (area.width as usize).saturating_sub(label.len() + 2);
+        let shown: String = {
+            let n = app.input_buf.chars().count();
+            if n > avail {
+                let skip = n - avail;
+                let mut s = String::from("…");
+                s.extend(app.input_buf.chars().skip(skip + 1));
+                s
+            } else {
+                app.input_buf.clone()
+            }
+        };
+        let input = Paragraph::new(Line::from(vec![
+            Span::styled(label, Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+            Span::styled(shown, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "▏",
+                Style::default().fg(PRIMARY).add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ]));
+        f.render_widget(input, area);
+        return;
+    }
+
+    let (sym, style) = match app.message_style {
+        MessageStyle::Dim => ("·", Style::default().fg(DIM)),
+        MessageStyle::Green => ("✓", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
+        MessageStyle::Red => ("✗", Style::default().fg(ERR).add_modifier(Modifier::BOLD)),
+        MessageStyle::Yellow => ("…", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+    };
+    f.render_widget(
+        Paragraph::new(format!(" {} {}", sym, app.message)).style(style),
+        area,
+    );
+}
+
+fn draw_hotkeys(f: &mut Frame, app: &App, area: Rect) {
+    // KeyInput occupies the message line with the text input, so surface
+    // validation errors here instead — they'd be invisible otherwise.
+    if app.mode == Mode::KeyInput && app.message_style == MessageStyle::Red {
+        let key_style = Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("Enter", key_style),
+            Span::styled(" confirm  ·  ", Style::default().fg(DIM)),
+            Span::styled("Esc", key_style),
+            Span::styled(" cancel   ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("✗ {}", app.message),
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let keys: &[(&str, &str)] = match app.mode {
+        Mode::DeleteSelect => &[("0-4", "delete slot"), ("Esc", "cancel")],
+        Mode::KeyInput => &[("Enter", "confirm"), ("Esc", "cancel")],
+        Mode::KeyDeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
+        Mode::Help | Mode::Normal => match app.tab {
+            Tab::Dashboard => &[
+                ("p", "pair"),
+                ("u", "unpair"),
+                ("e", "enroll"),
+                ("d", "delete"),
+                ("v", "verify"),
+                ("i", "info"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Tab::Keys => match app.key_tab {
+                KeyTab::Ssh => &[
+                    ("Tab", "category"),
+                    ("j/k", "move"),
+                    ("a", "generate"),
+                    ("d", "del"),
+                    ("c", "pubkey"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+                KeyTab::Otp => &[
+                    ("Tab", "category"),
+                    ("j/k", "move"),
+                    ("a", "add"),
+                    ("d", "del"),
+                    ("o", "code"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+                KeyTab::Api => &[
+                    ("Tab", "category"),
+                    ("j/k", "move"),
+                    ("a", "add"),
+                    ("d", "del"),
+                    ("s", "show value"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ],
+            },
+            Tab::Pam => &[
+                ("j/k", "move"),
+                ("i", "install"),
+                ("r", "remove"),
+                ("R", "repair"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Tab::Logs => &[
+                ("j/k", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Home", "top"),
+                ("End", "tail"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+        },
+    };
+
+    let key_style = Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    for (i, (k, label)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        }
+        if !k.is_empty() {
+            spans.push(Span::styled(*k, key_style));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(*label, Style::default().fg(DIM)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Help overlay ─────────────────────────────────────────────
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let popup = centered_rect(70, 85, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Help ",
+            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(PRIMARY));
+
+    let key = |k: &'static str| {
+        Span::styled(
+            format!("  {:<10}", k),
+            Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD),
+        )
+    };
+    let section = |t: &'static str| {
+        Line::from(Span::styled(
+            t,
+            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    let lines = vec![
+        section("Navigation"),
+        Line::from(vec![key("1-4"), Span::raw("Switch tab · Esc back to Dashboard · q quit")]),
+        Line::from(""),
+        section("Dashboard"),
+        Line::from(vec![key("p / u"), Span::raw("Pair (press device button) · unpair / factory reset")]),
+        Line::from(vec![key("e"), Span::raw("Enroll fingerprint (lowest empty slot)")]),
+        Line::from(vec![key("d / v"), Span::raw("Delete slot (pick 0-4) · verify fingerprint")]),
+        Line::from(vec![key("s o k L"), Span::raw("Toggle sudo / polkit / screen / long-press lock")]),
+        Line::from(vec![key("n / i"), Span::raw("Cycle unlock sound · device info")]),
+        Line::from(vec![key("Esc"), Span::raw("Cancel in-flight enrollment")]),
+        Line::from(""),
+        section("Keys"),
+        Line::from(vec![key("Tab / h l"), Span::raw("Switch SSH / OTP / API category · j k move")]),
+        Line::from(vec![key("a / d / r"), Span::raw("Add (SSH generates on-device) · delete · refresh")]),
+        Line::from(vec![key("c / o / s"), Span::raw("SSH pubkey · OTP code · API value (FP-gated)")]),
+        Line::from(""),
+        section("PAM"),
+        Line::from(vec![key("i / r / R"), Span::raw("Install · remove · repair all (pkexec prompts)")]),
+        Line::from(""),
+        section("Logs"),
+        Line::from(vec![key("j k"), Span::raw("Scroll · PgUp/PgDn page · Home top · End follow tail")]),
+        Line::from(""),
+        Line::from(Span::styled("Press ? or Esc to close.", Style::default().fg(DIM))),
+    ];
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 // ── helpers ─────────────────────────────────────────────────
+
+/// Standard bordered content block used by tab pages.
+fn content_block(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(PRIMARY))
+}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -897,18 +947,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-// ── unused but kept for reference: SOUND_PRESETS cycle hint ──
-// (silenced compile warning by using it in a helper)
-#[allow(dead_code)]
-fn sound_presets_hint() -> String {
-    let mut out = String::new();
-    for (i, s) in SOUND_PRESETS.iter().enumerate() {
-        if i > 0 {
-            out.push_str(" → ");
-        }
-        out.push_str(if s.is_empty() { "silent" } else { s });
-    }
-    out
 }

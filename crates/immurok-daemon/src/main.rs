@@ -17,7 +17,7 @@ use immurok_common::security;
 #[tokio::main]
 async fn main() {
     let home_dir = std::env::var("HOME").expect("HOME not set");
-    let log_path = PathBuf::from(&home_dir).join(protocol::IMMUROK_DIR).join("logs.txt");
+    let log_path = PathBuf::from(&home_dir).join(protocol::IMMUROK_DIR).join(protocol::LOG_FILE);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -49,6 +49,20 @@ async fn main() {
 
     let pairing = security::load_pairing().unwrap_or(None);
     let user_settings = settings::Settings::load(&immurok_dir.join(protocol::SETTINGS_FILE));
+
+    // 启动 PAM 自检：按已启用功能检查 /etc/pam.d，仅日志不修复（修复需 pkexec/TTY）。
+    {
+        use immurok_common::pam::pam_line_present;
+        let st = |svc: &str| if pam_line_present(svc) { "OK" } else { "MISSING" };
+        let sudo = if user_settings.unlock_sudo { st("sudo") } else { "off" };
+        let polkit = if user_settings.unlock_polkit { st("polkit-1") } else { "off" };
+        info!("PAM status: sudo={} polkit={}", sudo, polkit);
+        let missing = (user_settings.unlock_sudo && !pam_line_present("sudo"))
+            || (user_settings.unlock_polkit && !pam_line_present("polkit-1"));
+        if missing {
+            tracing::warn!("PAM config incomplete — run 'immurok-cli pam repair'");
+        }
+    }
 
     let (ble_cmd_tx, ble_cmd_rx) = mpsc::channel(32);
     let coord = coordinator::Coordinator::new(ble_cmd_tx, immurok_dir.clone());

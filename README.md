@@ -64,14 +64,12 @@ make check-deps   # Preflight: lists every missing system component at once + th
 make              # Equivalent to `make build pam` (build runs check-deps automatically first)
 ```
 
-> `make check-deps` checks cargo / C compiler / PAM dev headers (required to build — missing ones make `make` fail outright),
-> plus `dbus_fast` / PyGObject+Gtk4 / bluez (required at runtime — missing ones only warn; it still compiles, but the
-> daemon will lack BLE / auth-dialog features). `make` wires this as a prerequisite of `build`, so missing packages no
-> longer blow up cryptically halfway through compilation or while the daemon is running.
+> `check-deps` fails fast on missing build deps (cargo / C compiler / PAM headers) and warns about missing
+> runtime deps (`dbus_fast` / PyGObject+Gtk4 / bluez). `make` runs it automatically before building.
 
 Artifacts:
 - `target/release/immurok-daemon` — main daemon
-- `target/release/immurok-cli` — configuration / pairing CLI
+- `target/release/immurok-cli` — interactive TUI + configuration / pairing CLI
 - `target/release/imk` — agent command wrapper
 - `pam/pam_immurok.so` — PAM module
 
@@ -95,7 +93,7 @@ What this step does:
 | systemd polkit overrides | `/etc/systemd/system/polkit.service.d/immurok.conf` | Yes |
 | systemd user service | `~/.config/systemd/user/immurok-daemon.service` | No |
 
-> Not having GDM / no `/etc/pam.d/gdm-password` is common (KDE / Debian + SDDM). The Makefile tolerates this and skips that entry; if you want fingerprint unlock on the login screen, handle it yourself with something like `sudo immurok-pam-helper add sddm`.
+> No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the Makefile skips that entry. For login-screen fingerprint unlock on SDDM: `sudo immurok-pam-helper add sddm`.
 
 After `make install` completes, the daemon should already be running:
 
@@ -105,31 +103,56 @@ systemctl --user status immurok-daemon
 
 ## 4. First-time setup
 
-### 4.1 Pair the device
+### 4.1 The TUI (recommended)
+
+Everything below is also available from a single interactive terminal UI —
+the recommended way to manage immurok:
+
+```bash
+immurok-cli tui
+```
+
+Number keys switch pages, `?` shows the full key reference, `q` quits.
+
+| Page | Key | What you can do |
+|------|-----|-----------------|
+| Dashboard | `1` | pair/unpair (`p`/`u`), enroll (`e`, auto-picks the lowest empty slot), delete (`d`), verify (`v`), unlock toggles (`s`/`o`/`k`/`L`), unlock sound (`n`), recent-event feed |
+| Keys | `2` | SSH / OTP / API keystore: add (`a`), delete (`d`), fetch OTP code (`o`), show SSH pubkey (`c`), show API value (`s`) |
+| PAM | `3` | install / remove / repair the PAM hooks (`i`/`r`/`R`, pkexec prompts) |
+| Logs | `4` | live-tail daemon logs with scrollback |
+
+The one-shot CLI subcommands below do the same things — use them for scripting.
+
+### 4.2 Pair the device
 
 ```bash
 # Power on / hold the device button to enter pairing mode (LED slowly blinks blue)
-immurok-cli pair
+immurok-cli pair               # or: press `p` in the TUI
 # Confirm by pressing the device button within 30s
 ```
 
-### 4.2 Enroll a fingerprint
+### 4.3 Enroll a fingerprint
+
+In the TUI just press `e` — it enrolls into the lowest empty slot. Or via CLI:
 
 ```bash
 immurok-cli fp enroll 0        # slot 0
-# Touch the sensor 12 times as prompted
+# Touch the sensor 6 times, following the position hints
+# (if a fingerprint is already enrolled, verify with it first to authorize)
 immurok-cli fp list            # view enrolled slots
 ```
 
 5 slots are supported (0–4). To delete: `immurok-cli fp delete 0`.
 
-### 4.3 Enable features
+### 4.4 Enable features
+
+Toggle directly on the TUI Dashboard (`s`/`o`/`k`/`L`), or via CLI:
 
 ```bash
-immurok-cli set sudo true
-immurok-cli set polkit true
-immurok-cli set screen true        # screen unlock
-immurok-cli set lock true          # long-press device button to lock the screen (optional)
+immurok-cli set sudo on
+immurok-cli set polkit on
+immurok-cli set screen on          # screen unlock
+immurok-cli set lock on            # long-press device button to lock the screen (optional)
 immurok-cli settings               # view all settings
 ```
 
@@ -172,7 +195,7 @@ sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 ### sudo asks for a password instead of popping the fingerprint dialog
 
 - The daemon isn't running: `systemctl --user start immurok-daemon`
-- The device isn't connected: `immurok-cli status` should show `connected=true verified=true`
+- The device isn't connected: `immurok-cli status` should show `Status: Connected`
 - PAM doesn't have immurok: `sudo grep pam_immurok /etc/pam.d/sudo`; if empty, run `immurok-cli pam install sudo` (a wrapper around `sudo immurok-pam-helper add sudo`)
 
 ### The polkit dialog doesn't appear
@@ -191,10 +214,18 @@ sudo systemctl daemon-reload && sudo systemctl restart polkit
 
 ```bash
 bluetoothctl scan le         # should list "immurok IK-1"
-journalctl --user -u immurok-daemon | grep BLE
+grep BLE ~/.immurok/logs.txt # daemon writes its own log file, not the journal
 ```
 
-Device logs are in `~/.immurok/logs.txt`, **not** in the journal (the daemon writes its own file).
+### Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)
+
+BlueZ cached stale GATT handles from an old firmware layout. Forget and re-pair once:
+
+```bash
+bluetoothctl remove <MAC>   # then: immurok-cli pair
+```
+
+> Do **not** work around this with a global `[GATT] Cache = no` in `/etc/bluetooth/main.conf` — it breaks reconnection for *all* BLE peripherals (mice, headphones). Keep the default `Cache = always`.
 
 ### `dbus-fast` import fails on Debian / Ubuntu
 
@@ -209,7 +240,7 @@ Note that `ble-notify-helper.py` uses `#!/usr/bin/python3`, i.e. the system pyth
 
 ### GTK dialog doesn't grab focus under Wayland
 
-This is intentional — the dialog doesn't steal keyboard focus so it won't interrupt whatever command you're typing. It closes automatically once the fingerprint passes. If you can't click the Cancel button, switch focus to the dialog window (Alt+Tab).
+Intentional — it never steals keyboard focus and closes itself once the fingerprint passes. Alt+Tab to it if you need the Cancel button.
 
 ## 7. Uninstall
 

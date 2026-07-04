@@ -24,7 +24,8 @@ use crate::socket_client::DaemonClient;
 const CHUNK_SIZE: usize = 240;
 const IMAGE_B_SIZE: usize = 216 * 1024;
 const IMFW_MAGIC: u32 = 0x494D4657; // "IMFW"
-const IMFW_HEADER_SIZE: usize = 96;
+const IMFW_HEADER_SIZE_V1: usize = 96; // HMAC (legacy bootstrap)
+const IMFW_HEADER_SIZE_V2: usize = 128; // ECDSA (1.6.0+)
 
 pub fn run(path: &str) {
     let file_data = match std::fs::read(path) {
@@ -212,7 +213,7 @@ struct Imfw<'a> {
 }
 
 fn parse_imfw(data: &[u8]) -> Option<Imfw<'_>> {
-    if data.len() < IMFW_HEADER_SIZE {
+    if data.len() < IMFW_HEADER_SIZE_V1 {
         return None;
     }
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -226,9 +227,20 @@ fn parse_imfw(data: &[u8]) -> Option<Imfw<'_>> {
     let hw_id = u16::from_le_bytes([data[6], data[7]]);
     let plaintext_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
 
+    // Header size depends on the format version: v2 (ECDSA) is 128 bytes, v1
+    // (HMAC) is 96. The signature/payload start shifts accordingly.
+    let header_size = if format_version >= 2 {
+        IMFW_HEADER_SIZE_V2
+    } else {
+        IMFW_HEADER_SIZE_V1
+    };
+    if data.len() < header_size {
+        return None;
+    }
+
     Some(Imfw {
-        header: &data[..IMFW_HEADER_SIZE],
-        firmware: &data[IMFW_HEADER_SIZE..],
+        header: &data[..header_size],
+        firmware: &data[header_size..],
         format_version,
         hw_id,
         plaintext_size,

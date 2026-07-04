@@ -43,7 +43,7 @@ pub async fn handle_ota_session(
     coord: &Arc<Coordinator>,
     first_line: &str,
 ) {
-    info!("OTA 会话开始");
+    info!("OTA session started");
 
     let mut reader = BufReader::new(stream);
 
@@ -55,7 +55,7 @@ pub async fn handle_ota_session(
 
     // Check if first command was END
     if first_line.starts_with("OTA:END") {
-        info!("OTA 会话结束");
+        info!("OTA session ended");
         return;
     }
 
@@ -73,7 +73,7 @@ pub async fn handle_ota_session(
             Ok(Ok(0)) => break,    // EOF
             Ok(Err(_)) => break,   // Read error
             Err(_) => {
-                warn!("OTA 会话超时");
+                warn!("OTA session timeout");
                 break;
             }
             Ok(Ok(_)) => {}
@@ -95,7 +95,7 @@ pub async fn handle_ota_session(
         }
     }
 
-    info!("OTA 会话结束");
+    info!("OTA session ended");
 }
 
 /// Send a response line (with newline) to the socket client.
@@ -117,7 +117,7 @@ async fn process_ota_command(line: &str, coord: &Arc<Coordinator>) -> String {
 
     let sub = parts[1];
     if sub != "WRITE" {
-        info!("OTA 命令: {}", sub);
+        info!("OTA command: {}", sub);
     }
 
     match sub {
@@ -199,13 +199,13 @@ async fn handle_ota_erase(coord: &Arc<Coordinator>) -> String {
     }
 
     if resp[0] == 0x00 {
-        info!("OTA ERASE 成功");
+        info!("OTA ERASE ok");
         "OK".to_string()
     } else if resp[0] == immurok_common::protocol::RSP_ERR_LOW_BATTERY {
-        warn!("OTA ERASE 拒绝：低电量保护");
+        warn!("OTA ERASE rejected: low-battery protection");
         "ERROR:LOW_BATTERY:OTA refused (device <5%, charge to retry)".to_string()
     } else {
-        warn!("OTA ERASE 失败: 0x{:02x}", resp[0]);
+        warn!("OTA ERASE failed: 0x{:02x}", resp[0]);
         format!("ERROR:ERASE_FAILED:{:02x}", resp[0])
     }
 }
@@ -232,7 +232,8 @@ async fn handle_ota_header(parts: &[&str], coord: &Arc<Coordinator>) -> String {
         Err(_) => return "ERROR:INVALID_DATA".to_string(),
     };
 
-    if header_data.len() != 96 {
+    // 96 = v1 (HMAC, legacy bootstrap); 128 = v2 (ECDSA, 1.6.0+).
+    if header_data.len() != 96 && header_data.len() != 128 {
         return "ERROR:INVALID_HEADER_SIZE".to_string();
     }
 
@@ -252,10 +253,10 @@ async fn handle_ota_header(parts: &[&str], coord: &Arc<Coordinator>) -> String {
     }
 
     if resp[0] == 0x00 {
-        info!("OTA HEADER 已接受");
+        info!("OTA HEADER accepted");
         "OK".to_string()
     } else {
-        warn!("OTA HEADER 被拒绝: 0x{:02x}", resp[0]);
+        warn!("OTA HEADER rejected: 0x{:02x}", resp[0]);
         format!("ERROR:HEADER_REJECTED:{:02x}", resp[0])
     }
 }
@@ -373,14 +374,14 @@ async fn handle_ota_end(coord: &Arc<Coordinator>) -> String {
                 if resp[0] == 0xF2 {
                     return "ERROR:HMAC_MISMATCH".to_string();
                 }
-                info!("OTA END 响应: {}", hex::encode(&resp));
+                info!("OTA END response: {}", hex::encode(&resp));
             }
             // Success or no meaningful error
             "OK".to_string()
         }
         Err(_) => {
             // Device rebooted — connection dropped, this is expected success
-            info!("OTA END: 设备已重启 (连接断开)");
+            info!("OTA END: device rebooted (connection dropped)");
             "OK".to_string()
         }
     }

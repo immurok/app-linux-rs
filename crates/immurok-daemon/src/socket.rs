@@ -1080,47 +1080,44 @@ async fn handle_get_api(
         .await;
     coord.deny_pending_pam().await;
 
-    let payload = match read_result {
-        Ok((status, data)) if status == protocol::RSP_OK => data,
+    match read_result {
+        Ok((status, _)) if status == protocol::RSP_OK => {}
         Ok((status, _)) => return format!("ERROR:READ_FAILED:0x{:02x}\n", status),
         Err(e) => return format!("ERROR:READ_FAILED:{}\n", e),
-    };
-
-    // ble_send_fp_gated returns just (RSP_OK, vec![RSP_OK]) when the gate
-    // approves — that path does NOT carry the actual KEY_READ chunk data.
-    // We need to issue a second non-gated KEY_READ now that the cooldown
-    // is armed. (Mirrors the post-AUTH read pattern in macOS.)
-    if payload.len() <= 1 {
-        // Re-read post-gate. KEY_READ chunked response: [total][off][data...]
-        let mut full = Vec::new();
-        let mut offset: u8 = 0;
-        loop {
-            let r = coord
-                .ble_send(
-                    protocol::CMD_KEY_READ,
-                    vec![protocol::KEY_CAT_API, idx, offset],
-                )
-                .await;
-            let (status, p) = match r {
-                Ok(v) => v,
-                Err(e) => return format!("ERROR:READ_FAILED:{}\n", e),
-            };
-            if status != protocol::RSP_OK || p.len() < 2 {
-                return format!("ERROR:READ_FAILED:0x{:02x}\n", status);
-            }
-            let total = p[0] as usize;
-            // p[1] = chunk offset echo; p[2..] = data
-            let chunk = &p[2..];
-            full.extend_from_slice(chunk);
-            if full.len() >= total {
-                full.truncate(total);
-                break;
-            }
-            offset = full.len() as u8;
-        }
-        return decode_api_secret(&full, name);
     }
-    decode_api_secret(&payload, name)
+
+    // Whether the gate just approved (placeholder payload) or the cooldown
+    // let the command through immediately (payload = first chunk frame),
+    // neither carries the assembled entry — run the chunked read loop from
+    // offset 0 now that the cooldown is armed. KEY_READ chunked response:
+    // [total][off][data...].
+    let mut full = Vec::new();
+    let mut offset: u8 = 0;
+    loop {
+        let r = coord
+            .ble_send(
+                protocol::CMD_KEY_READ,
+                vec![protocol::KEY_CAT_API, idx, offset],
+            )
+            .await;
+        let (status, p) = match r {
+            Ok(v) => v,
+            Err(e) => return format!("ERROR:READ_FAILED:{}\n", e),
+        };
+        if status != protocol::RSP_OK || p.len() < 2 {
+            return format!("ERROR:READ_FAILED:0x{:02x}\n", status);
+        }
+        let total = p[0] as usize;
+        // p[1] = chunk offset echo; p[2..] = data
+        let chunk = &p[2..];
+        full.extend_from_slice(chunk);
+        if full.len() >= total {
+            full.truncate(total);
+            break;
+        }
+        offset = full.len() as u8;
+    }
+    decode_api_secret(&full, name)
 }
 
 fn decode_api_secret(entry: &[u8], name: &str) -> String {
@@ -1154,12 +1151,30 @@ async fn handle_get_otp(
     if !coord.try_set_pending_pam(pending_tx).await {
         return "ERROR:BUSY\n".to_string();
     }
-
-    // KEY_OTP_GET payload: [idx]; response: [OK][6-digit ASCII code]
-    let result = coord
-        .ble_send_fp_gated(protocol::CMD_KEY_OTP_GET, vec![idx])
-        .await;
+    let result = otp_get_inner(coord, idx).await;
     coord.deny_pending_pam().await;
+    result
+}
+
+/// Build the KEY_OTP_GET payload: [idx:1B][unix_time:4B LE]. The firmware
+/// has no clock — TOTP time comes from the host on every request (the FP
+/// gate adds its own elapsed-time correction on-device).
+fn otp_get_payload(idx: u8) -> Vec<u8> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    let mut p = vec![idx];
+    p.extend_from_slice(&now.to_le_bytes());
+    p
+}
+
+/// FP-gated TOTP fetch for one OTP slot. Shared by `GET:otp:<name>` and
+/// `KEY:OTP:<idx>`.
+async fn otp_get_inner(coord: &Arc<Coordinator>, idx: u8) -> String {
+    let result = coord
+        .ble_send_fp_gated(protocol::CMD_KEY_OTP_GET, otp_get_payload(idx))
+        .await;
 
     match result {
         Ok((status, payload)) if status == protocol::RSP_OK => {
@@ -1169,7 +1184,7 @@ async fn handle_get_otp(
                 &payload[..]
             } else {
                 let r = coord
-                    .ble_send(protocol::CMD_KEY_OTP_GET, vec![idx])
+                    .ble_send(protocol::CMD_KEY_OTP_GET, otp_get_payload(idx))
                     .await;
                 let p = match r {
                     Ok((s, p)) if s == protocol::RSP_OK && p.len() >= 6 => p,
@@ -1185,17 +1200,14 @@ async fn handle_get_otp(
     }
 }
 
+/// Format a TOTP response payload. The firmware always emits exactly six
+/// ASCII digits — anything else means a framing bug upstream, and silently
+/// dropping bytes would show the user a *wrong* code, so reject instead.
 fn format_otp_response(code_bytes: &[u8]) -> String {
-    let take = code_bytes.len().min(6);
-    let trimmed: Vec<u8> = code_bytes[..take]
-        .iter()
-        .copied()
-        .filter(|b| b.is_ascii_digit())
-        .collect();
-    if trimmed.is_empty() {
-        return "ERROR:OTP_INVALID\n".to_string();
+    if code_bytes.len() < 6 || !code_bytes[..6].iter().all(|b| b.is_ascii_digit()) {
+        return format!("ERROR:OTP_INVALID:{}\n", hex::encode(code_bytes));
     }
-    let s = String::from_utf8_lossy(&trimmed).to_string();
+    let s = String::from_utf8_lossy(&code_bytes[..6]).to_string();
     format!("OK:{}\n", s)
 }
 
@@ -1364,17 +1376,21 @@ async fn handle_key_command(line: &str, coord: &Arc<Coordinator>) -> String {
             )
             .await
         }
-        // OTP single-entry import. CLI `key import-otp` chunks each parsed
-        // andOTP/CSV entry into one of these calls. Data = name[30] +
-        // base32-decoded secret bytes (variable length).
+        // OTP single-entry import. Data mirrors otp_entry_t: name[30] +
+        // service[30] + base32-decoded secret bytes (1..=32). A payload
+        // missing the service field would land the secret in the wrong
+        // struct slot, so the bounds are enforced here.
         "OTP_IMPORT" if parts.len() >= 3 => {
             let hex_data = parts[2];
+            let min = protocol::NAME_LEN_OTP + protocol::SERVICE_LEN_OTP;
+            let max = min + protocol::SECRET_LEN_OTP;
             let key_data = match hex::decode(hex_data) {
-                Ok(b) if b.len() > protocol::NAME_LEN_OTP => b,
+                Ok(b) if b.len() > min && b.len() <= max => b,
                 Ok(b) => {
                     return format!(
-                        "ERROR:INVALID_DATA_LEN:expected >{} bytes (name+secret), got {}",
-                        protocol::NAME_LEN_OTP,
+                        "ERROR:INVALID_DATA_LEN:expected {}..={} bytes (name+service+secret), got {}",
+                        min + 1,
+                        max,
                         b.len()
                     )
                 }
@@ -1386,6 +1402,47 @@ async fn handle_key_command(line: &str, coord: &Arc<Coordinator>) -> String {
                 &key_data,
                 "OTP",
                 protocol::KEY_MAX_OTP,
+            )
+            .await
+        }
+        // FP-gated TOTP fetch by slot index (CLI `key otp <idx>`).
+        "OTP" if parts.len() >= 3 => {
+            let idx: u8 = match parts[2].parse() {
+                Ok(i) => i,
+                Err(_) => return "ERROR:INVALID_INDEX".to_string(),
+            };
+            let (pending_tx, _pending_rx) = tokio::sync::oneshot::channel::<bool>();
+            if !coord.try_set_pending_pam(pending_tx).await {
+                return "ERROR:BUSY".to_string();
+            }
+            let resp = otp_get_inner(coord, idx).await;
+            coord.deny_pending_pam().await;
+            resp.trim_end().to_string()
+        }
+        // API single-entry import. Data mirrors api_entry_t: name[32] +
+        // value bytes (1..=128). Same staged write + FP-gated commit path.
+        "API_IMPORT" if parts.len() >= 3 => {
+            let hex_data = parts[2];
+            let min = protocol::NAME_LEN_API;
+            let max = min + protocol::VALUE_LEN_API;
+            let key_data = match hex::decode(hex_data) {
+                Ok(b) if b.len() > min && b.len() <= max => b,
+                Ok(b) => {
+                    return format!(
+                        "ERROR:INVALID_DATA_LEN:expected {}..={} bytes (name+value), got {}",
+                        min + 1,
+                        max,
+                        b.len()
+                    )
+                }
+                Err(e) => return format!("ERROR:INVALID_HEX:{}", e),
+            };
+            handle_key_import_inner(
+                coord,
+                protocol::KEY_CAT_API,
+                &key_data,
+                "API",
+                protocol::KEY_MAX_API,
             )
             .await
         }

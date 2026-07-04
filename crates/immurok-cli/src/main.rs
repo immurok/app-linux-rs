@@ -1,6 +1,7 @@
 //! immurok-cli — command-line management tool for the immurok daemon.
 
 mod commands;
+mod enroll_hint;
 mod socket_client;
 mod tui;
 
@@ -60,20 +61,29 @@ fn main() {
         Commands::Ota { path } => commands::ota::run(&path),
 
         Commands::Pam(pam) => match pam {
-            PamCommands::Install { service } => run_pam_helper("add", &service),
-            PamCommands::Remove { service } => run_pam_helper("remove", &service),
+            PamCommands::Install { service } => commands::pam::run_helper("add", &[&service]),
+            PamCommands::Remove { service } => commands::pam::run_helper("remove", &[&service]),
+            PamCommands::Check => commands::pam::run_check(),
+            PamCommands::Repair => commands::pam::run_repair(),
         },
 
         Commands::Logs => {
-            let status = std::process::Command::new("journalctl")
-                .args(["--user", "-u", "immurok-daemon", "-f", "--no-pager"])
+            // The daemon's tracing output goes to ~/.immurok/logs.txt —
+            // the journal only carries systemd start/stop lines.
+            let home = std::env::var("HOME").unwrap_or_default();
+            let log_path = std::path::PathBuf::from(&home)
+                .join(immurok_common::protocol::IMMUROK_DIR)
+                .join(immurok_common::protocol::LOG_FILE);
+            let status = std::process::Command::new("tail")
+                .args(["-n", "200", "-F"])
+                .arg(&log_path)
                 .status();
             match status {
                 Ok(s) if !s.success() => {
-                    eprintln!("journalctl exited with: {}", s);
+                    eprintln!("tail exited with: {}", s);
                 }
                 Err(e) => {
-                    eprintln!("Failed to run journalctl: {}", e);
+                    eprintln!("Failed to run tail: {}", e);
                 }
                 _ => {}
             }
@@ -86,75 +96,4 @@ fn main() {
             }
         }
     }
-}
-
-/// Run the PAM helper via pkexec.
-fn run_pam_helper(action: &str, service: &str) {
-    // Find immurok-pam-helper
-    let helper = find_pam_helper();
-    let helper = match helper {
-        Some(h) => h,
-        None => {
-            eprintln!("Error: immurok-pam-helper not found in PATH or next to this binary.");
-            std::process::exit(1);
-        }
-    };
-
-    println!("Running: pkexec {} {} {}", helper, action, service);
-
-    let status = std::process::Command::new("pkexec")
-        .args([&helper, action, service])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            println!(
-                "\x1b[32mPAM {} for '{}' successful.\x1b[0m",
-                if action == "add" {
-                    "installation"
-                } else {
-                    "removal"
-                },
-                service
-            );
-        }
-        Ok(s) => {
-            eprintln!(
-                "\x1b[31mPAM helper failed (exit code: {})\x1b[0m",
-                s.code().unwrap_or(-1)
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Failed to run pkexec: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn find_pam_helper() -> Option<String> {
-    // Try next to our own binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("immurok-pam-helper");
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    // Try PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("immurok-pam-helper")
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
-        }
-    }
-
-    None
 }

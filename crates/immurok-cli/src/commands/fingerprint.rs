@@ -1,35 +1,7 @@
 //! `immurok-cli fp` — fingerprint management subcommands.
 
+use crate::enroll_hint::step_hint;
 use crate::socket_client::DaemonClient;
-
-/// 12-step guided enrollment hint. Mirrors macOS 6480c4a's
-/// `enrollTitleKeyForStep` mapping, in plain text for the CLI.
-/// `step` is the *next* frame the user should press for (1..=12); the
-/// daemon's `current` field is the count of frames already captured, so
-/// callers pass `current + 1`.
-///
-/// Step layout (matches firmware 12-frame template):
-///   1     正中（第一次按压）
-///   2..4  保持正中
-///   5     向左偏（开始切换角度）
-///   6..7  保持左偏
-///   8     向右偏
-///   9..10 保持右偏
-///   11    向指尖方向偏
-///   12    向手腕方向偏
-fn enroll_step_hint(step: u8) -> &'static str {
-    match step {
-        1 => "指肚正中按压",
-        2..=4 => "保持正中按压",
-        5 => "稍向左偏 5–10°",
-        6..=7 => "保持左偏",
-        8 => "稍向右偏 5–10°",
-        9..=10 => "保持右偏",
-        11 => "稍向指尖方向偏",
-        12 => "稍向手腕方向偏",
-        _ => "保持稳定",
-    }
-}
 
 /// List enrolled fingerprints.
 pub fn run_list() {
@@ -71,12 +43,32 @@ pub fn run_enroll(slot: u8) {
         ));
     }
 
+    // With fingerprints already enrolled the firmware FP-gates ENROLL_START:
+    // an *enrolled* finger must authorize before capture begins. Announce
+    // that before the blocking FP:ENROLL round-trip so the user knows what
+    // the device is waiting for.
+    let has_fingerprints = DaemonClient::connect()
+        .and_then(|mut c| c.send("FP:LIST"))
+        .ok()
+        .and_then(|rsp| {
+            let parts: Vec<&str> = rsp.split(':').collect();
+            if parts.first() == Some(&"OK") {
+                parts.get(1).and_then(|s| s.parse::<u8>().ok())
+            } else {
+                None
+            }
+        })
+        .is_some_and(|bitmap| bitmap != 0);
+    if has_fingerprints {
+        println!("Verify with an enrolled finger to authorize enrollment…");
+    }
+
     let mut client = match DaemonClient::connect() {
         Ok(c) => c,
         Err(e) => super::error_exit(&e),
     };
 
-    // Start enrollment
+    // Start enrollment (returns once the FP gate has been passed)
     let cmd = format!("FP:ENROLL:{}", slot);
     let rsp = client.send(&cmd).unwrap_or_else(|e| {
         super::error_exit(&format!("Failed to start enrollment: {}", e));
@@ -87,12 +79,12 @@ pub fn run_enroll(slot: u8) {
     }
 
     println!(
-        "开始录入指纹槽位 {}（共 12 帧，按提示调整按压角度）",
+        "Enrolling fingerprint slot {} (6 captures — adjust finger position as prompted)",
         slot
     );
-    println!("  下一步：{}", enroll_step_hint(1));
+    println!("  Next: {}", step_hint(1));
 
-    // Poll for enrollment progress (12 captures × 30s max each = 360s)
+    // Poll for enrollment progress (6 captures × 30s max each = 180s)
     let max_polls = 2400; // ~360 seconds at 150ms intervals
     let mut last_event = 255u8;
     let mut last_current = 255u8;
@@ -100,7 +92,9 @@ pub fn run_enroll(slot: u8) {
     for _ in 0..max_polls {
         std::thread::sleep(std::time::Duration::from_millis(150));
 
-        let status_rsp = match client.send("FP:STATUS") {
+        // Fresh connection per poll — the daemon serves exactly one
+        // request per connection.
+        let status_rsp = match DaemonClient::connect().and_then(|mut c| c.send("FP:STATUS")) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -119,7 +113,7 @@ pub fn run_enroll(slot: u8) {
             Err(_) => continue,
         };
         let current: u8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let total: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(12);
+        let total: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
 
         if event == last_event && current == last_current {
             continue;
@@ -136,32 +130,32 @@ pub fn run_enroll(slot: u8) {
 
         match event {
             0x00 => println!(
-                "  请按压传感器 — 下一步：{}",
-                enroll_step_hint(next_step)
+                "  Press the sensor — next: {}",
+                step_hint(next_step)
             ),
             0x01 => {
                 if current < total {
                     println!(
-                        "  已捕获 [{}/{}]，请抬起手指 — 下一步：{}",
+                        "  Captured [{}/{}] — lift your finger. Next: {}",
                         current,
                         total,
-                        enroll_step_hint(next_step)
+                        step_hint(next_step)
                     );
                 } else {
-                    println!("  已捕获 [{}/{}]", current, total);
+                    println!("  Captured [{}/{}]", current, total);
                 }
             }
-            0x02 => println!("  正在处理..."),
+            0x02 => println!("  Processing..."),
             0x03 => {} // CAPTURED 消息已经告诉用户抬起
             0x04 => {
-                println!("\x1b[32m指纹录入完成！\x1b[0m");
+                println!("\x1b[32mFingerprint enrolled!\x1b[0m");
                 return;
             }
             0xFF => {
-                eprintln!("\x1b[31m指纹录入失败。\x1b[0m");
+                eprintln!("\x1b[31mEnrollment failed.\x1b[0m");
                 std::process::exit(1);
             }
-            _ => println!("  状态: 0x{:02x}", event),
+            _ => println!("  Status: 0x{:02x}", event),
         }
     }
 

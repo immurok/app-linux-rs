@@ -49,8 +49,11 @@ pub fn run() {
         println!("Status:     {}", status_rsp);
     }
 
-    // PAIR:STATUS
-    let pair_rsp = client.send("PAIR:STATUS").unwrap_or_default();
+    // PAIR:STATUS — needs a fresh connection: the daemon serves exactly one
+    // request per connection, so reusing `client` reads EOF (always "No").
+    let pair_rsp = DaemonClient::connect()
+        .and_then(|mut c| c.send("PAIR:STATUS"))
+        .unwrap_or_default();
     let pair_parts: Vec<&str> = pair_rsp.split(':').collect();
     let paired = pair_parts.get(1) == Some(&"PAIRED");
     println!(
