@@ -24,7 +24,6 @@
 //! | SET:UNLOCK_POLKIT   | `SET:UNLOCK_POLKIT:1` / `:0`       |
 //! | SET:UNLOCK_SCREEN   | `SET:UNLOCK_SCREEN:1` / `:0`       |
 //! | SET:LOCK_SCREEN     | `SET:LOCK_SCREEN:1` / `:0`         |
-//! | SET:UNLOCK_SOUND    | `SET:UNLOCK_SOUND:NAME` / empty    |
 //! | GET:SETTINGS        | `GET:SETTINGS`                     |
 //! | GET:INFO            | `GET:INFO`                         |
 //! | OTA:START           | `OTA:START:size:version`           |
@@ -97,7 +96,6 @@ pub enum Request {
     SetUnlockPolkit(bool),
     SetUnlockScreen(bool),
     SetLockScreen(bool),
-    SetUnlockSound(String),
     GetSettings,
     GetInfo,
     OtaStart { size: u32, version: String },
@@ -266,12 +264,6 @@ pub fn parse_request(line: &str) -> Result<Request, ParseError> {
                 "LOCK_SCREEN" => {
                     let v = parse_bool(&parts, 2, "SET:LOCK_SCREEN", "value")?;
                     Ok(Request::SetLockScreen(v))
-                }
-                "UNLOCK_SOUND" => {
-                    // Sound name may be empty (silent) — accept whatever
-                    // follows the colon, no further validation here.
-                    let v = parts.get(2).copied().unwrap_or("").to_string();
-                    Ok(Request::SetUnlockSound(v))
                 }
                 other => Err(ParseError::UnknownCommand(format!("SET:{other}"))),
             }

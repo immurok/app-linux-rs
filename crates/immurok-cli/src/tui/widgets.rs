@@ -50,6 +50,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Tab::Keys => draw_keys(f, app, chunks[2]),
         Tab::Pam => draw_pam(f, app, chunks[2]),
         Tab::Logs => draw_logs(f, app, chunks[2]),
+        Tab::Firmware => draw_firmware(f, app, chunks[2]),
     }
 
     draw_message(f, app, chunks[3]);
@@ -228,8 +229,9 @@ fn draw_dashboard_left(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(fp_height), // Fingerprints
-            Constraint::Length(7),         // Unlock toggles
+            Constraint::Length(6),         // Unlock toggles
             Constraint::Length(3),         // PAM summary
+            Constraint::Length(1),         // Firmware hint (may be blank)
             Constraint::Min(0),            // Filler
         ])
         .split(area);
@@ -237,6 +239,28 @@ fn draw_dashboard_left(f: &mut Frame, app: &App, area: Rect) {
     draw_fingerprints(f, app, rows[0]);
     draw_unlock(f, app, rows[1]);
     draw_pam_summary(f, app, rows[2]);
+    draw_fw_hint(f, app, rows[3]);
+}
+
+/// One-line firmware nudge on the Dashboard (design doc §3): outdated
+/// signing era beats update-available when both apply.
+fn draw_fw_hint(f: &mut Frame, app: &App, area: Rect) {
+    let line = if app.fw_outdated() {
+        Some(Line::from(Span::styled(
+            " ⚠ Firmware outdated (old signing era) — press U to update",
+            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+        )))
+    } else {
+        app.fw_update_available.as_ref().map(|v| {
+            Line::from(Span::styled(
+                format!(" ⬆ Firmware update available: v{} (press U)", v),
+                Style::default().fg(WARN),
+            ))
+        })
+    };
+    if let Some(line) = line {
+        f.render_widget(Paragraph::new(line), area);
+    }
 }
 
 fn draw_fingerprints(f: &mut Frame, app: &App, area: Rect) {
@@ -344,27 +368,11 @@ fn draw_unlock(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let (sound_label, sound_style) = if app.unlock_sound.is_empty() {
-        ("silent".to_string(), Style::default().fg(DIM))
-    } else {
-        (
-            format!("♪ {}", app.unlock_sound),
-            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-        )
-    };
-
     let lines = vec![
         toggle_row("s", "sudo", app.unlock_sudo),
         toggle_row("o", "polkit", app.unlock_polkit),
         toggle_row("k", "screen unlock", app.unlock_screen),
         toggle_row("L", "long-press lock", app.lock_screen),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("n", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::raw(format!("{:<17}", "sound")),
-            Span::styled(sound_label, sound_style),
-        ]),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -689,6 +697,155 @@ fn log_line_style(line: &str) -> Style {
     }
 }
 
+// ── Firmware page ────────────────────────────────────────────
+
+fn draw_firmware(f: &mut Frame, app: &App, area: Rect) {
+    use super::app::FwState;
+
+    let block = content_block(" Firmware Update ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // versions line
+            Constraint::Length(1), // plan / status line
+            Constraint::Length(1), // notes / detail line
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // gauge / action hint
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let device = if app.fw_version.is_empty() { "-" } else { &app.fw_version };
+    let latest = app
+        .fw_prepared
+        .as_ref()
+        .map(|p| p.target_version.as_str())
+        .or(app.fw_update_available.as_deref())
+        .unwrap_or("-");
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Device: ", Style::default().fg(DIM)),
+            Span::raw(device.to_string()),
+            Span::styled("   Latest: ", Style::default().fg(DIM)),
+            Span::raw(latest.to_string()),
+        ])),
+        rows[0],
+    );
+
+    match &app.fw_state {
+        FwState::Idle | FwState::Checking => {
+            f.render_widget(
+                Paragraph::new(Span::styled(" Checking for updates…", Style::default().fg(DIM))),
+                rows[1],
+            );
+        }
+        FwState::UpToDate => {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " ✓ Firmware is up to date.",
+                    Style::default().fg(OK),
+                )),
+                rows[1],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " r check again · Esc back",
+                    Style::default().fg(DIM),
+                )),
+                rows[4],
+            );
+        }
+        FwState::Ready => {
+            if let Some(prep) = &app.fw_prepared {
+                let plan = if prep.resumed {
+                    " Plan: resume interrupted update".to_string()
+                } else if prep.hops.len() == 2 {
+                    format!(
+                        " Plan: 2 hops (bridge {} → {})",
+                        prep.hops[0].version, prep.hops[1].version
+                    )
+                } else {
+                    " Plan: direct (1 hop)".to_string()
+                };
+                f.render_widget(Paragraph::new(Span::raw(plan)), rows[1]);
+                if let Some(notes) = &prep.notes {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            format!(" Notes: {}", notes),
+                            Style::default().fg(DIM),
+                        )),
+                        rows[2],
+                    );
+                }
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" Enter", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
+                        Span::styled(" start update · ", Style::default().fg(DIM)),
+                        Span::styled("Esc", Style::default().fg(HOTKEY).add_modifier(Modifier::BOLD)),
+                        Span::styled(" back", Style::default().fg(DIM)),
+                    ])),
+                    rows[4],
+                );
+            }
+        }
+        FwState::Updating { stage, fraction, hop, hops } => {
+            let label = if *hops > 1 {
+                format!(" hop {}/{}: {}", hop, hops, stage)
+            } else {
+                format!(" {}", stage)
+            };
+            f.render_widget(Paragraph::new(Span::raw(label)), rows[1]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " Do not power off the device.",
+                    Style::default().fg(WARN),
+                )),
+                rows[2],
+            );
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(PRIMARY))
+                .ratio(fraction.clamp(0.0, 1.0))
+                .label(format!("{:.0}%", fraction * 100.0));
+            f.render_widget(gauge, rows[4]);
+        }
+        FwState::Success(v) => {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" ✓ Update complete — device is now on {}.", v),
+                    Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                )),
+                rows[1],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " r check again · Esc back",
+                    Style::default().fg(DIM),
+                )),
+                rows[4],
+            );
+        }
+        FwState::Failed(e) => {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" ✗ {}", e),
+                    Style::default().fg(ERR),
+                )),
+                rows[1],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " r retry check · Esc back",
+                    Style::default().fg(DIM),
+                )),
+                rows[4],
+            );
+        }
+    }
+}
+
 // ── Message + hotkey footer ──────────────────────────────────
 
 fn draw_message(f: &mut Frame, app: &App, area: Rect) {
@@ -829,6 +986,12 @@ fn draw_hotkeys(f: &mut Frame, app: &App, area: Rect) {
                 ("?", "help"),
                 ("q", "quit"),
             ],
+            Tab::Firmware => &[
+                ("Enter", "update"),
+                ("r", "re-check"),
+                ("Esc", "back"),
+                ("q", "quit"),
+            ],
         },
     };
 
@@ -883,7 +1046,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("e"), Span::raw("Enroll fingerprint (lowest empty slot)")]),
         Line::from(vec![key("d / v"), Span::raw("Delete slot (pick 0-4) · verify fingerprint")]),
         Line::from(vec![key("s o k L"), Span::raw("Toggle sudo / polkit / screen / long-press lock")]),
-        Line::from(vec![key("n / i"), Span::raw("Cycle unlock sound · device info")]),
+        Line::from(vec![key("i"), Span::raw("Show device info")]),
         Line::from(vec![key("Esc"), Span::raw("Cancel in-flight enrollment")]),
         Line::from(""),
         section("Keys"),

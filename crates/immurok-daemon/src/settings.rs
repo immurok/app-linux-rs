@@ -14,13 +14,6 @@ pub struct Settings {
     /// Long-press device button → lock screen via loginctl. Opt-in.
     #[serde(default)]
     pub lock_screen: bool,
-    /// Sound to play on screen unlock. Empty = silent. Otherwise a freedesktop
-    /// sound theme name resolved to `/usr/share/sounds/freedesktop/stereo/<name>.oga`
-    /// and played via `paplay`. Common values: "service-login", "complete",
-    /// "bell", "message". Mirrors macOS unlockSound (commit f114466) — covers
-    /// the ~2s black-screen window between fingerprint and password injection.
-    #[serde(default)]
-    pub unlock_sound: String,
 }
 
 fn default_true() -> bool {
@@ -34,7 +27,6 @@ impl Default for Settings {
             unlock_polkit: true,
             unlock_screen: true,
             lock_screen: false,
-            unlock_sound: String::new(),
         }
     }
 }
@@ -52,7 +44,7 @@ impl Settings {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &json)?;
         std::fs::rename(&tmp, path)?;

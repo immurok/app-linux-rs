@@ -62,6 +62,8 @@ impl KeyCategory {
         }
     }
 
+    // Pre-existing public API, kept for compatibility (not std::str::FromStr).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "ssh" => Some(Self::Ssh),

@@ -207,8 +207,8 @@ mod tests {
     #[test]
     fn test_build_ssh_public_key_blob_structure() {
         let mut pubkey = [0u8; 64];
-        for i in 0..64 {
-            pubkey[i] = i as u8;
+        for (i, b) in pubkey.iter_mut().enumerate() {
+            *b = i as u8;
         }
         let blob = build_ssh_public_key_blob(&pubkey).unwrap();
 
@@ -242,8 +242,8 @@ mod tests {
     fn test_convert_endianness_64() {
         let mut le = [0u8; 64];
         // x = 0x00010203...1F (little-endian)
-        for i in 0..32 {
-            le[i] = i as u8;
+        for (i, b) in le[..32].iter_mut().enumerate() {
+            *b = i as u8;
         }
         // y = 0x20212223...3F (little-endian)
         for i in 0..32 {

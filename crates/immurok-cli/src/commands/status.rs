@@ -45,6 +45,20 @@ pub fn run() {
             "Firmware:   {}",
             if version.is_empty() { "-" } else { version }
         );
+        if !version.is_empty() {
+            use immurok_common::fwupdate::version::{normalize_semver, FirmwareVersion};
+            let norm = normalize_semver(version);
+            if let (Some(v), Some(min)) = (
+                FirmwareVersion::parse(&norm),
+                FirmwareVersion::parse(crate::fwupdate::MANDATORY_MIN_VERSION),
+            ) {
+                if v < min {
+                    println!(
+                        "\x1b[33mWarning: firmware outdated (old signing era) — run `immurok-cli fw update`\x1b[0m"
+                    );
+                }
+            }
+        }
     } else {
         println!("Status:     {}", status_rsp);
     }

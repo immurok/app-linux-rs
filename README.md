@@ -18,7 +18,7 @@ The immurok Linux client, verified on **Arch / Fedora 38+ / Debian 12+ (incl. Ub
 
 ```bash
 sudo pacman -S --needed rust gcc pkgconf dbus pam bluez bluez-utils \
-  gtk4 libadwaita python-gobject polkit libcanberra
+  gtk4 libadwaita python-gobject polkit
 
 # python-dbus-fast is in the AUR
 yay -S python-dbus-fast
@@ -32,7 +32,7 @@ pip install --user dbus-fast
 sudo dnf install rust cargo gcc pkgconf-pkg-config dbus-devel pam-devel \
   bluez bluez-libs \
   gtk4 libadwaita python3-gobject \
-  python3-dbus-fast polkit libcanberra-gtk3
+  python3-dbus-fast polkit
 ```
 
 ### Debian 12+ / Ubuntu 22.04+
@@ -40,7 +40,7 @@ sudo dnf install rust cargo gcc pkgconf-pkg-config dbus-devel pam-devel \
 ```bash
 sudo apt install gcc pkg-config libdbus-1-dev libpam0g-dev bluez \
   libgtk-4-1 libadwaita-1-0 python3-gi \
-  policykit-1 libcanberra-gtk-module
+  policykit-1
 
 # Rust: the apt version is usually too old, prefer rustup
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -116,10 +116,11 @@ Number keys switch pages, `?` shows the full key reference, `q` quits.
 
 | Page | Key | What you can do |
 |------|-----|-----------------|
-| Dashboard | `1` | pair/unpair (`p`/`u`), enroll (`e`, auto-picks the lowest empty slot), delete (`d`), verify (`v`), unlock toggles (`s`/`o`/`k`/`L`), unlock sound (`n`), recent-event feed |
+| Dashboard | `1` | pair/unpair (`p`/`u`), enroll (`e`, auto-picks the lowest empty slot), delete (`d`), verify (`v`), unlock toggles (`s`/`o`/`k`/`L`), recent-event feed |
 | Keys | `2` | SSH / OTP / API keystore: add (`a`), delete (`d`), fetch OTP code (`o`), show SSH pubkey (`c`), show API value (`s`) |
 | PAM | `3` | install / remove / repair the PAM hooks (`i`/`r`/`R`, pkexec prompts) |
 | Logs | `4` | live-tail daemon logs with scrollback |
+| Firmware | `5` or `U` | check for updates and install with a progress bar (see [4.5](#45-firmware-updates)) |
 
 The one-shot CLI subcommands below do the same things — use them for scripting.
 
@@ -155,6 +156,37 @@ immurok-cli set screen on          # screen unlock
 immurok-cli set lock on            # long-press device button to lock the screen (optional)
 immurok-cli settings               # view all settings
 ```
+
+### 4.5 Firmware updates
+
+Check and install official firmware from immurok.com:
+
+```bash
+immurok-cli fw check            # compare device firmware with the latest release
+immurok-cli fw update           # download, verify and install (asks for confirmation)
+immurok-cli fw update -y        # non-interactive
+immurok-cli fw status           # last check result + interrupted-update resume state
+```
+
+Notes:
+
+- Devices below 1.6.0 (old signing era) upgrade in two hops via a bridge
+  package — handled automatically, including resume after an interruption.
+- Requires ≥30% battery. Downloads are cached under `~/.immurok/fwupdate/`.
+- The TUI (tab 5, or press `U` on the Dashboard) offers the same flow with
+  a progress bar. `immurok-cli ota <file.imfw>` remains available for
+  manually built packages.
+
+### 4.6 Daemon management
+
+```bash
+immurok-cli daemon restart      # systemctl --user restart + wait for the socket
+```
+
+Before the device is paired, only `fw`/`ota` (firmware update),
+`daemon restart`, `pair`, `status` and `logs` are available — everything
+else exits with a hint to pair first. The TUI opens normally but gates
+device-facing actions the same way.
 
 ## 5. Verify
 

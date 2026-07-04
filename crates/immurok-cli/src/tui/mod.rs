@@ -24,6 +24,7 @@ pub fn run() -> io::Result<()> {
 
     let mut app = App::new();
     app.refresh();
+    app.spawn_fw_silent_check();
 
     let tick_rate = Duration::from_millis(200);
     let poll_interval = Duration::from_secs(2);
@@ -36,20 +37,35 @@ pub fn run() -> io::Result<()> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                // Ctrl-C → quit
+                let fw_updating = app.fw_updating();
+                // Ctrl-C → quit (blocked during a firmware push)
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    if fw_updating {
+                        app.set_msg("Firmware update in progress — please wait.", app::MessageStyle::Yellow);
+                        continue;
+                    }
                     break;
                 }
 
                 match app.mode {
                     app::Mode::Normal => match key.code {
                         // ── Global keys ──────────────────────
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => {
+                            if fw_updating {
+                                app.set_msg(
+                                    "Firmware update in progress — please wait.",
+                                    app::MessageStyle::Yellow,
+                                );
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Char('?') => app.toggle_help(),
                         KeyCode::Char('1') => app.set_tab(Tab::Dashboard),
                         KeyCode::Char('2') => app.set_tab(Tab::Keys),
                         KeyCode::Char('3') => app.set_tab(Tab::Pam),
                         KeyCode::Char('4') => app.set_tab(Tab::Logs),
+                        KeyCode::Char('5') => app.fw_enter(),
 
                         // ── Per-tab keys ─────────────────────
                         code => match app.tab {
@@ -65,8 +81,8 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::Char('o') => app.action_toggle_polkit(),
                                 KeyCode::Char('k') => app.action_toggle_screen(),
                                 KeyCode::Char('L') => app.action_toggle_lock(),
-                                KeyCode::Char('n') => app.action_cycle_sound(),
                                 KeyCode::Char('i') => app.action_info(),
+                                KeyCode::Char('U') => app.fw_enter(),
                                 KeyCode::Esc => {
                                     // Cancel in-flight enrollment if any
                                     if app.enroll_active {
@@ -108,19 +124,25 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::Up | KeyCode::Char('k') => app.pam_cursor_up(),
                                 KeyCode::Down | KeyCode::Char('j') => app.pam_cursor_down(),
                                 KeyCode::Char('i') => {
-                                    pam_request = app.request_pam_action(true);
+                                    if app.guard_paired() {
+                                        pam_request = app.request_pam_action(true);
+                                    }
                                 }
                                 KeyCode::Char('r') => {
-                                    pam_request = app.request_pam_action(false);
+                                    if app.guard_paired() {
+                                        pam_request = app.request_pam_action(false);
+                                    }
                                 }
                                 KeyCode::Char('R') => {
-                                    if let Some(req) = app.request_pam_repair() {
-                                        pam_request = Some(req);
-                                    } else {
-                                        app.set_msg(
-                                            "PAM already configured — nothing to repair.",
-                                            app::MessageStyle::Green,
-                                        );
+                                    if app.guard_paired() {
+                                        if let Some(req) = app.request_pam_repair() {
+                                            pam_request = Some(req);
+                                        } else {
+                                            app.set_msg(
+                                                "PAM already configured — nothing to repair.",
+                                                app::MessageStyle::Green,
+                                            );
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -134,6 +156,17 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::PageDown => app.log_page_down(),
                                 KeyCode::Home => app.log_jump_top(),
                                 KeyCode::End => app.log_jump_bottom(),
+                                _ => {}
+                            },
+
+                            Tab::Firmware => match code {
+                                KeyCode::Esc => {
+                                    if !fw_updating {
+                                        app.set_tab(Tab::Dashboard);
+                                    }
+                                }
+                                KeyCode::Char('r') => app.fw_recheck(),
+                                KeyCode::Enter => app.fw_start_update(),
                                 _ => {}
                             },
                         },

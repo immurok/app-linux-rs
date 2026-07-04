@@ -168,7 +168,7 @@ fn verify_peer_credentials(stream: &UnixStream) -> Result<(), String> {
     if cred.uid != 0 && cred.uid != my_uid {
         // Check if peer is polkitd — PAM modules run inside polkitd's process
         let is_polkitd = unsafe {
-            let pw = libc::getpwnam(b"polkitd\0".as_ptr() as *const libc::c_char);
+            let pw = libc::getpwnam(c"polkitd".as_ptr());
             !pw.is_null() && (*pw).pw_uid == cred.uid
         };
         if !is_polkitd {
@@ -286,7 +286,6 @@ async fn dispatch_request(
         Request::SetUnlockPolkit(v) => handle_set_setting(coord, "unlock_polkit", v).await,
         Request::SetUnlockScreen(v) => handle_set_setting(coord, "unlock_screen", v).await,
         Request::SetLockScreen(v) => handle_set_setting(coord, "lock_screen", v).await,
-        Request::SetUnlockSound(name) => handle_set_unlock_sound(coord, &name).await,
         Request::GetSettings => handle_get_settings(coord).await,
         Request::GetInfo => handle_get_info(coord).await,
         // OTA commands handled in session wrapper, but in case of stray ones:
@@ -473,6 +472,8 @@ async fn handle_auth(
 enum AuthResult {
     Approved,
     Denied,
+    // Reserved for a future explicit timeout path; currently folded into Denied.
+    #[allow(dead_code)]
     Timeout,
 }
 
@@ -645,10 +646,11 @@ async fn handle_fp_enroll(coord: &Arc<Coordinator>, slot: u8, stream: &mut UnixS
     };
 
     match result {
+        // Ok(_) already covers every success case, including
+        // RSP_ERR_FP_NOT_MATCH, so a dedicated guard arm for it is
+        // unreachable (clippy::unreachable_patterns) — removed, no
+        // behavior change.
         Ok(_) => Response::Ok("ENROLL_STARTED".into()),
-        Ok((status, _)) if status == protocol::RSP_ERR_FP_NOT_MATCH => {
-            Response::Error("ENROLL_FAILED:FP_DENIED".into())
-        }
         Err(e) => Response::Error(format!("ENROLL_FAILED:{}", e)),
     }
 }
@@ -662,6 +664,7 @@ async fn handle_fp_enroll(coord: &Arc<Coordinator>, slot: u8, stream: &mut UnixS
 ///  - ENROLL_START already returned, firmware is in 12-step capture: BLE
 ///    worker is back in its main loop, ENROLL_CANCEL goes through the
 ///    queue normally.
+///
 /// Fire both — notify is no-op when no gate is active, ENROLL_CANCEL is
 /// idempotent on the firmware side.
 async fn handle_fp_enroll_cancel(coord: &Arc<Coordinator>) -> Response {
@@ -1232,33 +1235,14 @@ async fn handle_set_setting(coord: &Arc<Coordinator>, key: &str, value: bool) ->
     Response::Ok(String::new())
 }
 
-async fn handle_set_unlock_sound(coord: &Arc<Coordinator>, name: &str) -> Response {
-    {
-        let mut settings = coord.settings.write().await;
-        settings.unlock_sound = name.to_string();
-        if let Err(e) = settings.save(&coord.settings_path()) {
-            warn!("Failed to save settings: {}", e);
-            return Response::Error(format!("SAVE_FAILED:{}", e));
-        }
-    }
-    info!(
-        "Setting unlock_sound={}",
-        if name.is_empty() { "(silent)" } else { name }
-    );
-    Response::Ok(String::new())
-}
-
 async fn handle_get_settings(coord: &Arc<Coordinator>) -> Response {
     let s = coord.settings.read().await;
-    // sound= field carries the literal name; clients render an empty value
-    // as "silent". Equals/colons are not valid in freedesktop sound names.
     let msg = format!(
-        "sudo={}:polkit={}:screen={}:lock={}:sound={}",
+        "sudo={}:polkit={}:screen={}:lock={}",
         if s.unlock_sudo { "1" } else { "0" },
         if s.unlock_polkit { "1" } else { "0" },
         if s.unlock_screen { "1" } else { "0" },
         if s.lock_screen { "1" } else { "0" },
-        s.unlock_sound,
     );
     Response::Ok(msg)
 }

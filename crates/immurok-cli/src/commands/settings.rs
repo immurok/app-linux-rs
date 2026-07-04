@@ -27,19 +27,8 @@ pub fn run_show() {
                 "polkit" => "polkit auth",
                 "screen" => "screen unlock",
                 "lock" => "long-press lock",
-                "sound" => "unlock sound",
                 _ => k,
             };
-            // Sound is a string, not boolean — render literally; empty = silent.
-            if k == "sound" {
-                let display = if v.is_empty() {
-                    "\x1b[90m(silent)\x1b[0m".to_string()
-                } else {
-                    format!("\x1b[36m{}\x1b[0m", v)
-                };
-                println!("  {:<16} {}", label, display);
-                continue;
-            }
             let state = if v == "1" {
                 "\x1b[32mON\x1b[0m"
             } else {
@@ -96,38 +85,6 @@ pub fn run_set(key: &str, value: &str) {
         println!("\x1b[32m{} set to {}.\x1b[0m", key, state);
     } else {
         eprintln!("\x1b[31mFailed to set {}: {}\x1b[0m", key, rsp);
-        std::process::exit(1);
-    }
-}
-
-/// Set the unlock-sound name (string, not boolean). Empty / "off" / "none" /
-/// "silent" all map to silent (empty string sent to daemon).
-pub fn run_sound(value: &str) {
-    let v = value.trim();
-    let normalized = if matches!(v.to_ascii_lowercase().as_str(), "" | "off" | "none" | "silent") {
-        ""
-    } else {
-        v
-    };
-
-    let mut client = match DaemonClient::connect() {
-        Ok(c) => c,
-        Err(e) => super::error_exit(&e),
-    };
-
-    let cmd = format!("SET:UNLOCK_SOUND:{}", normalized);
-    let rsp = client.send(&cmd).unwrap_or_else(|e| {
-        super::error_exit(&format!("Failed to set sound: {}", e));
-    });
-
-    if rsp.starts_with("OK") {
-        if normalized.is_empty() {
-            println!("\x1b[32munlock sound disabled (silent).\x1b[0m");
-        } else {
-            println!("\x1b[32munlock sound set to '{}'.\x1b[0m", normalized);
-        }
-    } else {
-        eprintln!("\x1b[31mFailed to set sound: {}\x1b[0m", rsp);
         std::process::exit(1);
     }
 }

@@ -2,12 +2,13 @@
 
 mod commands;
 mod enroll_hint;
+mod fwupdate;
 mod socket_client;
 mod tui;
 
 use clap::Parser;
 
-use commands::{Commands, FpCommands, KeyCommands, PamCommands, SetCommands};
+use commands::{Commands, DaemonCommands, FpCommands, FwCommands, KeyCommands, PamCommands, SetCommands};
 
 /// immurok-cli — manage immurok fingerprint authentication
 #[derive(Parser)]
@@ -19,6 +20,12 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Pre-pair gate: most operations are meaningless until the device is
+    // paired (design doc docs/plans/2026-07-04-linux-daemon-restart-pair-gate-design.md §2).
+    if commands::requires_pairing(&cli.command) {
+        commands::ensure_paired();
+    }
 
     match cli.command {
         Commands::Status => commands::status::run(),
@@ -53,10 +60,19 @@ fn main() {
             SetCommands::Polkit { value } => commands::settings::run_set("polkit", &value),
             SetCommands::Screen { value } => commands::settings::run_set("screen", &value),
             SetCommands::Lock { value } => commands::settings::run_set("lock", &value),
-            SetCommands::Sound { value } => commands::settings::run_sound(&value),
         },
 
         Commands::Settings => commands::settings::run_show(),
+
+        Commands::Daemon(d) => match d {
+            DaemonCommands::Restart => commands::daemon::run_restart(),
+        },
+
+        Commands::Fw(fw) => match fw {
+            FwCommands::Check { force } => commands::fw::run_check(force),
+            FwCommands::Update { yes } => commands::fw::run_update(yes),
+            FwCommands::Status => commands::fw::run_status(),
+        },
 
         Commands::Ota { path } => commands::ota::run(&path),
 

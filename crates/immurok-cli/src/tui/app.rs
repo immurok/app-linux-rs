@@ -21,10 +21,11 @@ pub enum Tab {
     Keys,
     Pam,
     Logs,
+    Firmware,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Keys, Tab::Pam, Tab::Logs];
+    pub const ALL: [Tab; 5] = [Tab::Dashboard, Tab::Keys, Tab::Pam, Tab::Logs, Tab::Firmware];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -32,6 +33,7 @@ impl Tab {
             Tab::Keys => "Keys",
             Tab::Pam => "PAM",
             Tab::Logs => "Logs",
+            Tab::Firmware => "Firmware",
         }
     }
 
@@ -41,6 +43,7 @@ impl Tab {
             Tab::Keys => '2',
             Tab::Pam => '3',
             Tab::Logs => '4',
+            Tab::Firmware => '5',
         }
     }
 }
@@ -56,6 +59,19 @@ pub enum Mode {
     KeyDeleteConfirm,
     /// Full-screen help overlay (read-only).
     Help,
+}
+
+/// Firmware page state machine (mirrors macOS FirmwareUpdateService.state).
+#[derive(Debug, Clone)]
+pub enum FwState {
+    Idle,
+    Checking,
+    UpToDate,
+    /// prepare() succeeded — details live in App::fw_prepared.
+    Ready,
+    Updating { stage: String, fraction: f64, hop: usize, hops: usize },
+    Success(String),
+    Failed(String),
 }
 
 /// Staged add-key input flow (Mode::KeyInput).
@@ -174,9 +190,6 @@ pub const PAM_SERVICES: &[PamService] = &[
     PamService { display: "screen (gdm)", service: "gdm-password" },
 ];
 
-/// Sound preset cycled by [n]. Empty value = silent.
-pub const SOUND_PRESETS: &[&str] = &["", "service-login", "complete", "bell", "message"];
-
 /// TUI application state.
 pub struct App {
     // Device state
@@ -188,12 +201,17 @@ pub struct App {
     pub fp_bitmap: u8,
     pub daemon_ok: bool,
 
+    // Firmware update state
+    /// Set by the startup silent check / prepare when an update exists.
+    pub fw_update_available: Option<String>,
+    pub fw_state: FwState,
+    pub fw_prepared: Option<crate::fwupdate::PreparedUpdate>,
+
     // Settings
     pub unlock_sudo: bool,
     pub unlock_polkit: bool,
     pub unlock_screen: bool,
     pub lock_screen: bool,
-    pub unlock_sound: String,
     pub pam_sudo: bool,
     pub pam_polkit: bool,
     pub pam_screen: bool,
@@ -269,6 +287,14 @@ pub enum ActionResult {
     LogLine(String),
     /// log-tail pipe closed (process exited or readers hit EOF).
     LogEnded,
+    /// Startup silent check result: Some(version) if an update is available.
+    FwSilentCheck(Option<String>),
+    /// fw prepare finished (firmware page entered / re-checked).
+    FwPrepared(Box<Result<Option<crate::fwupdate::PreparedUpdate>, String>>),
+    /// Live firmware push progress.
+    FwProgress { stage: String, fraction: f64, hop: usize, hops: usize },
+    /// Firmware update finished: Ok(target version) / Err(message).
+    FwFinished(Result<String, String>),
     Done,
 }
 
@@ -283,11 +309,13 @@ impl App {
             paired: false,
             fp_bitmap: 0,
             daemon_ok: false,
+            fw_update_available: None,
+            fw_state: FwState::Idle,
+            fw_prepared: None,
             unlock_sudo: true,
             unlock_polkit: true,
             unlock_screen: true,
             lock_screen: false,
-            unlock_sound: String::new(),
             pam_sudo: false,
             pam_polkit: false,
             pam_screen: false,
@@ -360,6 +388,37 @@ impl App {
                     self.enroll_active = false;
                     self.enroll_gate = false;
                 }
+                ActionResult::FwSilentCheck(v) => {
+                    self.fw_update_available = v;
+                }
+                ActionResult::FwPrepared(r) => match *r {
+                    Ok(Some(prep)) => {
+                        self.fw_update_available = Some(prep.target_version.clone());
+                        self.fw_prepared = Some(prep);
+                        self.fw_state = FwState::Ready;
+                    }
+                    Ok(None) => {
+                        self.fw_update_available = None;
+                        self.fw_state = FwState::UpToDate;
+                    }
+                    Err(e) => {
+                        self.fw_state = FwState::Failed(e);
+                    }
+                },
+                ActionResult::FwProgress { stage, fraction, hop, hops } => {
+                    self.fw_state = FwState::Updating { stage, fraction, hop, hops };
+                }
+                ActionResult::FwFinished(r) => {
+                    self.busy = false;
+                    match r {
+                        Ok(v) => {
+                            self.fw_state = FwState::Success(v);
+                            self.fw_update_available = None;
+                            needs_refresh = true;
+                        }
+                        Err(e) => self.fw_state = FwState::Failed(e),
+                    }
+                }
             }
         }
         needs_refresh
@@ -416,7 +475,6 @@ impl App {
                             "polkit" => self.unlock_polkit = v == "1",
                             "screen" => self.unlock_screen = v == "1",
                             "lock" => self.lock_screen = v == "1",
-                            "sound" => self.unlock_sound = v.to_string(),
                             _ => {}
                         }
                     }
@@ -524,6 +582,9 @@ impl App {
     /// not exposed in the TUI — `immurok-cli fp enroll <slot>` still takes
     /// an explicit slot if ever needed.
     pub fn auto_enroll(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
             return;
@@ -540,6 +601,9 @@ impl App {
     }
 
     pub fn enter_delete_select(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
             return;
@@ -611,6 +675,9 @@ impl App {
     }
 
     pub fn action_unpair(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.busy {
             return;
         }
@@ -706,7 +773,7 @@ impl App {
                             // COMPLETE notification may have been missed;
                             // fall back to bitmap check every ~3s
                             bitmap_polls += 1;
-                            if bitmap_polls % 20 == 0 {
+                            if bitmap_polls.is_multiple_of(20) {
                                 if let Ok(list_rsp) = daemon_send("FP:LIST") {
                                     let lp: Vec<&str> = list_rsp.split(':').collect();
                                     if lp.first() == Some(&"OK") && lp.len() > 1 {
@@ -856,15 +923,14 @@ impl App {
     }
 
     pub fn action_verify(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.busy {
             return;
         }
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
-            return;
-        }
-        if !self.paired {
-            self.set_msg("Device not paired", MessageStyle::Red);
             return;
         }
 
@@ -909,73 +975,31 @@ impl App {
     }
 
     pub fn action_toggle_sudo(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         self.toggle_setting("sudo", "UNLOCK_SUDO", self.unlock_sudo);
     }
 
     pub fn action_toggle_polkit(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         self.toggle_setting("polkit", "UNLOCK_POLKIT", self.unlock_polkit);
     }
 
     pub fn action_toggle_screen(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         self.toggle_setting("screen", "UNLOCK_SCREEN", self.unlock_screen);
     }
 
     pub fn action_toggle_lock(&mut self) {
-        self.toggle_setting("lock", "LOCK_SCREEN", self.lock_screen);
-    }
-
-    /// Cycle [n] through SOUND_PRESETS.
-    pub fn action_cycle_sound(&mut self) {
-        if self.busy {
+        if !self.guard_paired() {
             return;
         }
-        let cur_pos = SOUND_PRESETS
-            .iter()
-            .position(|s| *s == self.unlock_sound.as_str())
-            .unwrap_or(0);
-        let next = SOUND_PRESETS[(cur_pos + 1) % SOUND_PRESETS.len()].to_string();
-        self.busy = true;
-
-        let display = if next.is_empty() {
-            "silent".to_string()
-        } else {
-            next.clone()
-        };
-        self.set_msg(
-            &format!("Setting unlock sound → {}…", display),
-            MessageStyle::Yellow,
-        );
-
-        let cmd = format!("SET:UNLOCK_SOUND:{}", next);
-        let tx = self.action_tx.clone();
-        thread::spawn(move || {
-            let result = (|| -> Result<String, String> {
-                let mut client = DaemonClient::connect()?;
-                client.send(&cmd)
-            })();
-            match result {
-                Ok(rsp) if rsp.starts_with("OK") => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("Unlock sound: {}", display),
-                        MessageStyle::Green,
-                    ));
-                }
-                Ok(rsp) => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("Sound update failed: {}", rsp),
-                        MessageStyle::Red,
-                    ));
-                }
-                Err(e) => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("Sound update error: {}", e),
-                        MessageStyle::Red,
-                    ));
-                }
-            }
-            let _ = tx.send(ActionResult::Refresh);
-            let _ = tx.send(ActionResult::Done);
-        });
+        self.toggle_setting("lock", "LOCK_SCREEN", self.lock_screen);
     }
 
     fn toggle_setting(&mut self, name: &str, cmd_key: &str, current: bool) {
@@ -1032,6 +1056,9 @@ impl App {
     }
 
     pub fn action_info(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         let result = (|| -> Result<String, String> {
             let mut client = DaemonClient::connect()?;
             client.send("GET:INFO")
@@ -1103,6 +1130,21 @@ impl App {
         self.message_style = style;
     }
 
+    /// Pre-pair gate for device-facing TUI actions (mirrors the CLI's
+    /// requires_pairing table). Returns false and shows a hint when the
+    /// device is not paired yet.
+    ///
+    /// Intentionally checked BEFORE connected/busy in every gated action:
+    /// pairing is the prerequisite path, so an unpaired user always gets
+    /// the "pair first" hint regardless of connection state.
+    pub fn guard_paired(&mut self) -> bool {
+        if self.paired {
+            return true;
+        }
+        self.set_msg("Pair the device first (press p).", MessageStyle::Yellow);
+        false
+    }
+
     // ── Help overlay ──────────────────────────────────────────
 
     pub fn toggle_help(&mut self) {
@@ -1144,6 +1186,7 @@ impl App {
                 }
             }
             Tab::Logs => self.start_log_stream(),
+            Tab::Firmware => {}
         }
         self.set_msg_dim("Ready");
     }
@@ -1348,6 +1391,9 @@ impl App {
     /// `c` in SSH tab — render the selected key's authorized_keys line into the
     /// message area so the user can read it.
     pub fn action_key_show_pubkey(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.key_tab != KeyTab::Ssh {
             self.set_msg("Public key view is SSH-only.", MessageStyle::Yellow);
             return;
@@ -1375,6 +1421,9 @@ impl App {
     /// OTP: collects name + base32 secret → `KEY:OTP_IMPORT`.
     /// API: collects name + value → `KEY:API_IMPORT`.
     pub fn enter_key_add(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if !self.connected {
             self.set_msg("Device not connected", MessageStyle::Red);
             return;
@@ -1609,6 +1658,9 @@ impl App {
     /// `s` in API tab — fetch and display the selected key's value via
     /// `GET:api:<name>` (FP-gated by the daemon).
     pub fn action_key_show_api(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.busy {
             return;
         }
@@ -1722,6 +1774,9 @@ impl App {
 
     /// Begin delete-confirm flow on the selected key.
     pub fn enter_key_delete_confirm(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.busy {
             return;
         }
@@ -1814,6 +1869,9 @@ impl App {
     /// Request a fresh TOTP code for the selected OTP key. Routes through
     /// `GET:otp:<name>` which is FP-gated by the daemon.
     pub fn action_key_otp(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
         if self.busy {
             return;
         }
@@ -1875,6 +1933,161 @@ impl App {
             }
             let _ = tx.send(ActionResult::Done);
         });
+    }
+
+    /// Startup silent check (24h-throttled; design doc §3). Never blocks the
+    /// UI and never surfaces errors — failures just mean no hint.
+    pub fn spawn_fw_silent_check(&self) {
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = (|| -> Option<String> {
+                let store = crate::fwupdate::store::FwStore::open_default().ok()?;
+                let m = crate::fwupdate::fetch_manifest_cached(
+                    &store,
+                    false,
+                    crate::fwupdate::unix_now(),
+                )
+                .ok()?;
+                let st = crate::fwupdate::query_device_status().ok()?;
+                if !st.connected {
+                    return None;
+                }
+                let device = immurok_common::fwupdate::version::normalize_semver(&st.version);
+                use immurok_common::fwupdate::planner::{self, UpdatePlan};
+                match planner::plan(&device, &m.latest.version, m.latest.min_direct.as_deref()) {
+                    UpdatePlan::UpToDate | UpdatePlan::Unknown => None,
+                    _ => Some(m.latest.version.clone()),
+                }
+            })();
+            let _ = tx.send(ActionResult::FwSilentCheck(result));
+        });
+    }
+
+    pub fn fw_updating(&self) -> bool {
+        matches!(self.fw_state, FwState::Updating { .. })
+    }
+
+    /// Enter the Firmware page; kick off a check unless one is already
+    /// running or its result is still current.
+    pub fn fw_enter(&mut self) {
+        self.set_tab(Tab::Firmware);
+        if matches!(
+            self.fw_state,
+            FwState::Idle | FwState::Success(_) | FwState::Failed(_)
+        ) {
+            self.fw_recheck();
+        }
+    }
+
+    /// Force a fresh check (bypasses the 24h throttle — mirrors the macOS
+    /// window's onAppear force check).
+    pub fn fw_recheck(&mut self) {
+        if matches!(self.fw_state, FwState::Updating { .. } | FwState::Checking) {
+            return;
+        }
+        self.fw_state = FwState::Checking;
+        self.fw_prepared = None;
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let r = crate::fwupdate::store::FwStore::open_default()
+                .and_then(|store| crate::fwupdate::prepare(&store, true))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ActionResult::FwPrepared(Box::new(r)));
+        });
+    }
+
+    /// Start the push (Enter on a Ready page). Exit keys are blocked while
+    /// this runs — see the key loop in tui/mod.rs.
+    pub fn fw_start_update(&mut self) {
+        if !matches!(self.fw_state, FwState::Ready) {
+            return;
+        }
+        let Some(prep) = self.fw_prepared.clone() else { return };
+        let hops = prep.hops.len();
+        self.fw_state = FwState::Updating {
+            stage: "starting".into(),
+            fraction: 0.0,
+            hop: 1,
+            hops,
+        };
+        self.busy = true;
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let target = prep.target_version.clone();
+            let result = crate::fwupdate::store::FwStore::open_default()
+                .and_then(|store| {
+                    // Within-hop fraction reached so far. `Stage` events must
+                    // never regress it (they'd otherwise snap the bar back to
+                    // the hop baseline after Transfer already reached ~1.0) —
+                    // "retry" is the one genuine exception, since the push
+                    // really does restart from ERASE. Reset when the hop index
+                    // advances, or hop N+1's early Stage events would inherit
+                    // hop N's 1.0 and briefly show the next hop as complete.
+                    let mut last_frac: f64 = 0.0;
+                    let mut last_hop = usize::MAX;
+                    let mut progress = |ev: crate::fwupdate::ProgressEvent| {
+                        use crate::fwupdate::ProgressEvent as PE;
+                        let ev_hop = match ev {
+                            PE::Stage { hop, .. }
+                            | PE::Transfer { hop, .. }
+                            | PE::Reconnect { hop, .. } => hop,
+                        };
+                        if ev_hop != last_hop {
+                            last_hop = ev_hop;
+                            last_frac = 0.0;
+                        }
+                        // Merged two-hop progress: base + p * weight (design §3).
+                        let (stage, frac, hop, hops) = match ev {
+                            PE::Stage { hop, hops, name } => {
+                                if name == "retry" {
+                                    last_frac = 0.0;
+                                }
+                                (
+                                    crate::fwupdate::stage_label(name).to_string(),
+                                    last_frac,
+                                    hop,
+                                    hops,
+                                )
+                            }
+                            PE::Transfer { hop, hops, fraction } => {
+                                last_frac = fraction;
+                                ("writing firmware".to_string(), fraction, hop, hops)
+                            }
+                            PE::Reconnect { hop, hops } => {
+                                last_frac = 1.0;
+                                (
+                                    "waiting for device reboot".to_string(),
+                                    1.0,
+                                    hop,
+                                    hops,
+                                )
+                            }
+                        };
+                        let fraction = (hop as f64 + frac) / hops as f64;
+                        let hop = hop + 1;
+                        let _ = tx.send(ActionResult::FwProgress { stage, fraction, hop, hops });
+                    };
+                    crate::fwupdate::execute(&store, &prep, &mut progress)
+                })
+                .map(|_| target)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ActionResult::FwFinished(result));
+        });
+    }
+
+    /// Old signing era (< 1.6.0) — dashboard/status soft warning.
+    pub fn fw_outdated(&self) -> bool {
+        use immurok_common::fwupdate::version::{normalize_semver, FirmwareVersion};
+        if !self.connected || self.fw_version.is_empty() {
+            return false;
+        }
+        match (
+            FirmwareVersion::parse(&normalize_semver(&self.fw_version)),
+            FirmwareVersion::parse(crate::fwupdate::MANDATORY_MIN_VERSION),
+        ) {
+            (Some(v), Some(min)) => v < min,
+            _ => false,
+        }
     }
 }
 

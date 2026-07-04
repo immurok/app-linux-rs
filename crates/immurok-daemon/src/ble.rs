@@ -508,7 +508,7 @@ async fn connect_and_serve(
     let extra_notify: Vec<String> = gatt_paths.all_chars.iter()
         .filter(|(p, f)| {
             p != &gatt_paths.rsp_path
-                && f.as_ref().map_or(false, |flags| flags.iter().any(|f| f == "notify"))
+                && f.as_ref().is_some_and(|flags| flags.iter().any(|f| f == "notify"))
         })
         .map(|(p, _)| p.clone())
         .collect();
@@ -572,8 +572,8 @@ async fn connect_and_serve(
                 if let Some(hex_data) = trimmed.strip_prefix("NOTIFY:") {
                     // Async RSP notification → notify channel
                     if let Ok(data) = hex::decode(hex_data) {
-                        if !data.is_empty() {
-                            if notify_tx.send(data).await.is_err() { break; }
+                        if !data.is_empty() && notify_tx.send(data).await.is_err() {
+                            break;
                         }
                     }
                 } else if trimmed == "DISCONNECT" {
@@ -1426,6 +1426,7 @@ async fn do_pair(
 /// PAIR_INIT was accepted with WAIT_BUTTON. Wait for one of:
 ///   - [0x34, 0x00 / 0x02] terminal button event → fail (timeout / cancelled)
 ///   - [0x30][pubkey:33B] arriving via pending_response → success (ECDH done)
+///
 /// Firmware gives 30s for the button press + ~2s for ECDH, so the wrapping
 /// timeout is BLE_PAIR_BUTTON_TIMEOUT_SECS (35s).
 async fn wait_pair_button(

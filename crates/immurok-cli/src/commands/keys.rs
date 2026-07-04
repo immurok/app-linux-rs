@@ -1118,8 +1118,7 @@ pub fn run_otp(index: u8) {
         super::error_exit(&format!("Failed to get OTP: {}", e));
     });
 
-    if rsp.starts_with("OK:") {
-        let code = &rsp[3..];
+    if let Some(code) = rsp.strip_prefix("OK:") {
         println!("{}", code);
     } else {
         eprintln!("OTP failed: {}", rsp);

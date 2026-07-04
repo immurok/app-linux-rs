@@ -49,6 +49,8 @@ pub enum BleCommand {
         data: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    // Not yet wired to a caller; part of the planned worker control surface.
+    #[allow(dead_code)]
     Disconnect,
 }
 
@@ -71,31 +73,10 @@ struct PreAuth {
 /// pre-auth, since pre-auth has no command context.
 const UNLOCK_FOLLOWUP_SERVICES: &[&str] = &["polkit-1", "login", "gdm-password"];
 
-/// Play a freedesktop sound theme entry by name. Tries `canberra-gtk-play`
-/// first (lighter, follows XDG sound theme), then falls back to `paplay`
-/// with the explicit OGA path. Failure is silent — audible cue is a nice-
-/// to-have, not load-bearing.
-async fn play_unlock_sound(name: &str) {
-    if tokio::process::Command::new("canberra-gtk-play")
-        .arg("-i")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-    {
-        return;
-    }
-    let path = format!("/usr/share/sounds/freedesktop/stereo/{}.oga", name);
-    let _ = tokio::process::Command::new("paplay")
-        .arg(&path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-
 #[derive(Debug, Clone)]
 pub struct FpMatchEvent {
+    // Carried for future per-page diagnostics; not read yet.
+    #[allow(dead_code)]
     pub page_id: u16,
 }
 
@@ -297,15 +278,6 @@ impl Coordinator {
     }
 
     async fn unlock_screen(&self) {
-        // Audible cue BEFORE loginctl: there's a ~2s black-screen window
-        // between fingerprint and the password being injected, and it's
-        // helpful to know the daemon registered the touch even if the
-        // screen hasn't redrawn yet. Mirrors macOS unlockSound (f114466).
-        let sound = self.settings.read().await.unlock_sound.clone();
-        if !sound.is_empty() {
-            play_unlock_sound(&sound).await;
-        }
-
         let result = tokio::process::Command::new("loginctl")
             .arg("unlock-session")
             .output()
@@ -459,6 +431,8 @@ impl Coordinator {
             .join(immurok_common::protocol::SETTINGS_FILE)
     }
 
+    // Kept for symmetry with settings_path / external tooling; unused internally.
+    #[allow(dead_code)]
     pub fn pairing_path(&self) -> std::path::PathBuf {
         self.immurok_dir
             .join(immurok_common::protocol::PAIRING_FILE)

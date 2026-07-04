@@ -1,6 +1,8 @@
 //! CLI subcommand definitions and shared helpers.
 
+pub mod daemon;
 pub mod fingerprint;
+pub mod fw;
 pub mod info;
 pub mod keys;
 pub mod ota;
@@ -40,6 +42,14 @@ pub enum Commands {
 
     /// Show all settings
     Settings,
+
+    /// Background daemon service management
+    #[command(subcommand)]
+    Daemon(DaemonCommands),
+
+    /// Firmware update from immurok.com (check / install)
+    #[command(subcommand)]
+    Fw(FwCommands),
 
     /// OTA firmware upgrade
     Ota {
@@ -151,12 +161,6 @@ pub enum SetCommands {
         /// on or off
         value: String,
     },
-    /// Sound played on screen unlock (empty / "off" / "none" = silent).
-    /// Common names: service-login, complete, bell, message
-    Sound {
-        /// freedesktop sound name, or empty/off/none for silent
-        value: String,
-    },
 }
 
 /// PAM subcommands.
@@ -178,6 +182,32 @@ pub enum PamCommands {
     Repair,
 }
 
+/// Firmware update subcommands.
+#[derive(Subcommand)]
+pub enum FwCommands {
+    /// Check for firmware updates
+    Check {
+        /// Bypass the 24h check throttle
+        #[arg(long)]
+        force: bool,
+    },
+    /// Download and install the latest firmware
+    Update {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Show last check result and pending resume state
+    Status,
+}
+
+/// Daemon service subcommands.
+#[derive(Subcommand)]
+pub enum DaemonCommands {
+    /// Restart the daemon (systemctl --user restart immurok-daemon)
+    Restart,
+}
+
 // ── Shared helpers ───────────────────────────────────────────
 
 /// Parse "on"/"off" to "1"/"0". Returns None for invalid input.
@@ -193,4 +223,79 @@ pub fn parse_on_off(s: &str) -> Option<&'static str> {
 pub fn error_exit(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
     std::process::exit(1);
+}
+
+/// Pre-pair gate (design doc §2): before the device is paired, only
+/// firmware update (fw/ota), daemon restart, pair itself, and read-only
+/// diagnostics (status/logs/tui entry) are meaningful. Everything else is
+/// rejected with a hint. Exhaustive match: adding a new Commands variant
+/// forces an explicit decision here.
+pub fn requires_pairing(cmd: &Commands) -> bool {
+    match cmd {
+        // Whitelist — usable before pairing
+        Commands::Status
+        | Commands::Pair
+        | Commands::Logs
+        | Commands::Tui
+        | Commands::Ota { .. }
+        | Commands::Fw(_)
+        | Commands::Daemon(_) => false,
+
+        // Gated — device-facing / config operations need a paired device
+        Commands::Info
+        | Commands::Unpair
+        | Commands::Fp(_)
+        | Commands::Key(_)
+        | Commands::Set(_)
+        | Commands::Settings
+        | Commands::Pam(_) => true,
+    }
+}
+
+/// Query PAIR:STATUS on a fresh connection; exit with a hint if unpaired.
+/// A daemon connection failure is reported as-is (NOT as "unpaired").
+pub fn ensure_paired() {
+    let rsp = match crate::socket_client::DaemonClient::connect()
+        .and_then(|mut c| c.send("PAIR:STATUS"))
+    {
+        Ok(r) => r,
+        Err(e) => error_exit(&e),
+    };
+    // Response format: "OK:PAIRED" / "OK:UNPAIRED" (Response::Ok serialization,
+    // see immurok-common/src/socket_proto.rs)
+    let paired = rsp.split(':').nth(1) == Some("PAIRED");
+    if !paired {
+        error_exit(
+            "Device not paired. Run 'immurok-cli pair' first. \
+             (Before pairing only fw/ota, daemon restart, status and logs are available.)",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_gate_classification() {
+        // Whitelist — usable before pairing (design doc §2)
+        assert!(!requires_pairing(&Commands::Status));
+        assert!(!requires_pairing(&Commands::Pair));
+        assert!(!requires_pairing(&Commands::Logs));
+        assert!(!requires_pairing(&Commands::Tui));
+        assert!(!requires_pairing(&Commands::Ota { path: "x.imfw".into() }));
+        assert!(!requires_pairing(&Commands::Fw(FwCommands::Check { force: false })));
+        assert!(!requires_pairing(&Commands::Fw(FwCommands::Update { yes: false })));
+        assert!(!requires_pairing(&Commands::Fw(FwCommands::Status)));
+        assert!(!requires_pairing(&Commands::Daemon(DaemonCommands::Restart)));
+
+        // Gated — rejected until paired
+        assert!(requires_pairing(&Commands::Info));
+        assert!(requires_pairing(&Commands::Unpair));
+        assert!(requires_pairing(&Commands::Fp(FpCommands::List)));
+        assert!(requires_pairing(&Commands::Key(KeyCommands::List { category: "ssh".into() })));
+        assert!(requires_pairing(&Commands::Set(SetCommands::Sudo { value: "on".into() })));
+        assert!(requires_pairing(&Commands::Settings));
+        assert!(requires_pairing(&Commands::Pam(PamCommands::Check)));
+    }
 }

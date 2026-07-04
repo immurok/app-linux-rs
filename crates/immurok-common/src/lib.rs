@@ -1,3 +1,4 @@
+pub mod fwupdate;
 pub mod pam;
 pub mod protocol;
 pub mod security;
