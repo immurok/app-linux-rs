@@ -304,3 +304,7 @@ Works out of the box. Screen unlock listens to the `org.gnome.ScreenSaver` D-Bus
 ### Sway / Hyprland and other wlroots compositors
 
 GTK4 dialogs launch fine. Screen lock depends on your lockscreen (swaylock / hyprlock); these generally don't emit D-Bus signals, so fingerprint screen-unlock may not work — just fall back to the password stack.
+
+## License
+
+[Apache License 2.0](LICENSE) — including the PAM module in `pam/`. Device firmware is licensed separately under BSL 1.1.

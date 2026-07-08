@@ -2,6 +2,7 @@
 name = "immurok-common"
 version = "0.3.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
 p256 = { version = "0.13", features = ["ecdh"] }
