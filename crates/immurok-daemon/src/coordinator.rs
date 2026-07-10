@@ -143,6 +143,12 @@ pub struct Coordinator {
     // resume can take tens of seconds.
     pub resume_notify: Notify,
 
+    // Set while logind is between PrepareForSleep(true) and (false). The BLE
+    // wait loop must not fire active Device.Connect() in this window — a
+    // pending LE create-connection left across the suspend boundary races the
+    // kernel's hci resume re-init and can wedge the controller firmware.
+    pub is_suspending: AtomicBool,
+
     // Paths
     pub immurok_dir: std::path::PathBuf,
 }
@@ -175,6 +181,7 @@ impl Coordinator {
             auth_dialog_cancel: Notify::new(),
             gate_cancel: Notify::new(),
             resume_notify: Notify::new(),
+            is_suspending: AtomicBool::new(false),
             immurok_dir,
         })
     }

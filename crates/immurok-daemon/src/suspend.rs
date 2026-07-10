@@ -3,9 +3,14 @@
 //! Subscribes to `org.freedesktop.login1.Manager.PrepareForSleep(bool start)`
 //! on the system bus. The signal fires twice around every suspend cycle:
 //!
-//!   true  — about to sleep (we don't act; BlueZ tears down BLE itself and
-//!           the helper subprocess will emit DISCONNECT, kicking the BLE
-//!           main loop into wait_for_device_connected on resume).
+//!   true  — about to sleep. We set `coordinator.is_suspending` so the BLE
+//!           wait loop stops firing active connects, and cancel any pending
+//!           `Device.Connect()` (BlueZ keeps the LE create-connection alive
+//!           internally even after our client-side timeout drops the D-Bus
+//!           call). Carrying that pending connect across the suspend
+//!           boundary races the kernel's hci resume re-init (LL-privacy
+//!           enable, opcode 0x202d) and has wedged Intel BT firmware hard
+//!           enough that only a module reload revives it.
 //!   false — just resumed.
 //!
 //! On resume we trigger `coordinator.resume_notify`, which the BLE wait
@@ -72,9 +77,26 @@ async fn monitor_inner(coordinator: &Arc<Coordinator>) -> Result<(), String> {
             Err(_) => continue, // not our signal shape
         };
         if going_to_sleep {
-            info!("System preparing to sleep");
+            info!("System preparing to sleep — pausing reconnect, cancelling pending connect");
+            coordinator
+                .is_suspending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Bounded: logind only gives inhibitor-delay time (~5s) before
+            // it suspends anyway; a wedged D-Bus call must not hold this up.
+            if tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::ble::cancel_pending_connect(),
+            )
+            .await
+            .is_err()
+            {
+                warn!("Pending-connect cancel timed out before sleep");
+            }
         } else {
             info!("System resumed — kicking BLE reconnect");
+            coordinator
+                .is_suspending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             coordinator.resume_notify.notify_one();
         }
     }

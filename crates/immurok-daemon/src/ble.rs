@@ -255,46 +255,57 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
         }
     };
 
-    // Active-connect fallback. Previously this only *polled* Connected state,
-    // which recovers only if SOMETHING else reconnects the device. But BlueZ
-    // does not reliably auto-reconnect BLE LE devices, and the resume kick
-    // below only covers suspend/resume — so a plain out-of-range → back-in-
-    // range drop (no suspend) had no active reconnection path and the daemon
-    // could wait forever. Here we periodically fire an active Device.Connect()
-    // ourselves. check_immurok_connected() first is the cheap fast path when
-    // the link is already up (e.g. BlueZ HID auto-reconnect did fire).
-    let poll_wait = async {
+    // Active-connect driver. Merges the periodic poll and the logind resume
+    // kick into one loop so they share cadence state:
+    //  - suspend window (coordinator.is_suspending set): no connects at all —
+    //    a pending LE create-connection carried across the sleep boundary
+    //    races the kernel's hci resume re-init and can wedge the controller
+    //    firmware (seen as opcode 0x202d EBUSY → permanent D2-entry timeout);
+    //  - just resumed: the device is expected back imminently, so burst every
+    //    BLE_RESUME_BURST_INTERVAL_SECS for BLE_RESUME_BURST_ATTEMPTS tries;
+    //  - device absent: decay 8→16→…→BLE_ACTIVE_RECONNECT_MAX_SECS instead of
+    //    hammering BlueZ forever; any resume kick resets to the fast base.
+    // check_immurok_connected() first is the cheap fast path when the link is
+    // already up (e.g. BlueZ HID auto-reconnect did fire).
+    let connect_driver = async {
+        let mut idle_secs = BLE_ACTIVE_RECONNECT_INTERVAL_SECS;
+        let mut burst_left: u32 = 0;
         loop {
+            while coordinator.is_suspending.load(Ordering::Relaxed) {
+                coordinator.resume_notify.notified().await;
+                info!("Resume kick — switching to reconnect burst");
+                burst_left = BLE_RESUME_BURST_ATTEMPTS;
+                idle_secs = BLE_ACTIVE_RECONNECT_INTERVAL_SECS;
+            }
             if check_immurok_connected().await {
                 return;
             }
             if try_active_connect().await {
-                info!("Device connected (active-connect fallback)");
+                info!("Device connected (active connect)");
                 return;
             }
-            tokio::time::sleep(Duration::from_secs(BLE_ACTIVE_RECONNECT_INTERVAL_SECS)).await;
-        }
-    };
-
-    // Resume kick: logind told us the system just resumed → fire an active
-    // connect. Loop because a single resume may need multiple attempts if
-    // the device hasn't started advertising yet (we just unsuspended too).
-    let resume_wait = async {
-        loop {
-            coordinator.resume_notify.notified().await;
-            info!("Resume hook — attempting active Device.Connect()");
-            if try_active_connect().await {
-                info!("Active connect succeeded after resume");
-                return;
+            let wait_secs = if burst_left > 0 {
+                burst_left -= 1;
+                BLE_RESUME_BURST_INTERVAL_SECS
+            } else {
+                let w = idle_secs;
+                idle_secs = (idle_secs * 2).min(BLE_ACTIVE_RECONNECT_MAX_SECS);
+                w
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(wait_secs)) => {}
+                _ = coordinator.resume_notify.notified() => {
+                    info!("Resume kick — switching to reconnect burst");
+                    burst_left = BLE_RESUME_BURST_ATTEMPTS;
+                    idle_secs = BLE_ACTIVE_RECONNECT_INTERVAL_SECS;
+                }
             }
-            warn!("Active connect failed after resume — will retry on next event/poll/resume");
         }
     };
 
     tokio::select! {
         _ = event_wait => {},
-        _ = poll_wait => {},
-        _ = resume_wait => {},
+        _ = connect_driver => {},
     }
 }
 
@@ -343,15 +354,55 @@ async fn try_active_connect() -> bool {
             }
             Ok(Err(e)) => {
                 warn!("Device.Connect failed: {}", e);
+                // "In Progress" means BlueZ still holds an LE create-connection
+                // from an earlier attempt whose future we dropped. Disconnect()
+                // is the documented way to cancel a pending Connect — without
+                // it the controller sits in the connect/scan state forever.
+                cancel_connect_on(&device).await;
                 return false;
             }
             Err(_) => {
                 warn!("Device.Connect timed out (12s) — device likely not advertising yet");
+                // Our client-side timeout dropped the D-Bus call, but BlueZ
+                // keeps trying internally; cancel so nothing lingers.
+                cancel_connect_on(&device).await;
                 return false;
             }
         }
     }
     false
+}
+
+/// Cancel a pending/stuck LE create-connection on one device. Per BlueZ
+/// Device1 semantics, Disconnect() also aborts a Connect() that has not
+/// completed yet. Bounded so a wedged bluetoothd can't hang the caller.
+async fn cancel_connect_on(device: &bluer::Device) {
+    if device.is_connected().await.unwrap_or(false) {
+        return; // real link came up meanwhile — don't tear it down
+    }
+    match tokio::time::timeout(Duration::from_secs(2), device.disconnect()).await {
+        Ok(Ok(())) => debug!("Cancelled pending connect on {}", device.address()),
+        Ok(Err(e)) => debug!("Pending-connect cancel: {}", e),
+        Err(_) => warn!("Pending-connect cancel timed out"),
+    }
+}
+
+/// Cancel any pending Device.Connect() on the paired immurok device without
+/// touching an established link. Called from the sleep monitor right before
+/// suspend so no LE create-connection is carried across the sleep boundary.
+pub async fn cancel_pending_connect() {
+    let Ok(session) = bluer::Session::new().await else { return };
+    let Ok(adapter) = session.default_adapter().await else { return };
+    let Ok(addrs) = adapter.device_addresses().await else { return };
+    for addr in addrs {
+        let Ok(device) = adapter.device(addr) else { continue };
+        if !device.is_paired().await.unwrap_or(false) { continue; }
+        let name_match = device.name().await.ok().flatten()
+            .map(|n| n.to_lowercase().starts_with(DEVICE_NAME_PREFIX))
+            .unwrap_or(false);
+        if !name_match { continue; }
+        cancel_connect_on(&device).await;
+    }
 }
 
 /// Check if any immurok device is connected with services resolved (HID keyboard ready).

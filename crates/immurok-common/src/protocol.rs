@@ -138,6 +138,19 @@ pub const BLE_SESSION_STABLE_SECS: u64 = 10;
 // comes. try_active_connect() itself blocks up to BLE_CONNECTING_TIMEOUT_SECS,
 // so the effective cadence when the peer is gone is this interval + that timeout.
 pub const BLE_ACTIVE_RECONNECT_INTERVAL_SECS: u64 = 8;
+// When the device stays absent, the active-connect cadence decays
+// 8→16→32→ceiling instead of hammering BlueZ every 8s forever. A perpetual
+// pending LE create-connection keeps the controller in the connect/scan
+// state, which has been observed to race the kernel's own hci resume path
+// (LL-privacy re-enable, opcode 0x202d → EBUSY) and wedge Intel BT firmware
+// across a suspend-then-hibernate transition. Any resume kick or BlueZ
+// device event resets the cadence to the fast base.
+pub const BLE_ACTIVE_RECONNECT_MAX_SECS: u64 = 60;
+// Right after resume the device is expected back imminently (user just
+// opened the lid, key is likely in range), so burst at this interval for
+// BLE_RESUME_BURST_ATTEMPTS tries before falling back to the normal cadence.
+pub const BLE_RESUME_BURST_INTERVAL_SECS: u64 = 2;
+pub const BLE_RESUME_BURST_ATTEMPTS: u32 = 15;
 pub const BLE_FP_GATE_TIMEOUT_SECS: u64 = 30;
 pub const BLE_AUTH_TIMEOUT_SECS: u64 = 30;
 // 30s 等按钮 + 2×2s ECC + 余量
