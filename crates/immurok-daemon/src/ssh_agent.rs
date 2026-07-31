@@ -290,10 +290,32 @@ async fn handle_sign_request(
     tokio::pin!(gate_fut);
     let deadline = tokio::time::sleep(Duration::from_secs(50));
     tokio::pin!(deadline);
+    // Watch the client socket for disconnect: if ssh (and thus git) is killed
+    // mid-sign — typically the user pressing Ctrl+C in the terminal — the
+    // connection closes. Without this, the FP gate would stay open (device LED
+    // on) for the full 50s deadline. On disconnect we cancel the gate via
+    // gate_cancel (NOT a queued GATE_CANCEL, which would block behind the
+    // parked BLE worker) and return. Mirrors the PAM path in socket.rs.
+    let mut disconnect_buf = [0u8; 1];
     let sign_result = loop {
         tokio::select! {
             r = &mut gate_fut => break Ok(r),
             _ = &mut deadline => break Err(()),
+            rd = stream.read(&mut disconnect_buf) => {
+                match rd {
+                    Ok(0) | Err(_) => {
+                        info!("SSH agent: client disconnected during sign (Ctrl+C?) — cancelling FP gate");
+                        coord.gate_cancel.notify_one();
+                        if let Some(sp) = spinner.take() {
+                            sp.finish(None);
+                        }
+                        return;
+                    }
+                    // No pipelined data is expected mid-sign; ignore and keep
+                    // awaiting the gate result.
+                    Ok(_) => {}
+                }
+            }
             ev = gate_events.recv() => {
                 match ev {
                     Ok(crate::coordinator::FpGateEvent::Mismatch { remaining }) => {

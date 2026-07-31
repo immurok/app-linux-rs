@@ -14,6 +14,10 @@ pub struct Settings {
     /// Long-press device button → lock screen via loginctl. Opt-in.
     #[serde(default)]
     pub lock_screen: bool,
+    /// Route interactive SSH through the fingerprint device key via a managed
+    /// block in ~/.ssh/config. Opt-in.
+    #[serde(default)]
+    pub ssh_takeover: bool,
 }
 
 fn default_true() -> bool {
@@ -27,6 +31,7 @@ impl Default for Settings {
             unlock_polkit: true,
             unlock_screen: true,
             lock_screen: false,
+            ssh_takeover: false,
         }
     }
 }

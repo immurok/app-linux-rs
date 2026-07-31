@@ -212,6 +212,7 @@ pub struct App {
     pub unlock_polkit: bool,
     pub unlock_screen: bool,
     pub lock_screen: bool,
+    pub ssh_takeover: bool,
     pub pam_sudo: bool,
     pub pam_polkit: bool,
     pub pam_screen: bool,
@@ -316,6 +317,7 @@ impl App {
             unlock_polkit: true,
             unlock_screen: true,
             lock_screen: false,
+            ssh_takeover: false,
             pam_sudo: false,
             pam_polkit: false,
             pam_screen: false,
@@ -475,6 +477,7 @@ impl App {
                             "polkit" => self.unlock_polkit = v == "1",
                             "screen" => self.unlock_screen = v == "1",
                             "lock" => self.lock_screen = v == "1",
+                            "ssh" => self.ssh_takeover = v == "1",
                             _ => {}
                         }
                     }
@@ -1002,7 +1005,37 @@ impl App {
         self.toggle_setting("lock", "LOCK_SCREEN", self.lock_screen);
     }
 
+    pub fn action_toggle_ssh(&mut self) {
+        if !self.guard_paired() {
+            return;
+        }
+        // No confirmation step — toggle immediately like the other switches.
+        // The consequence is shown as a non-blocking notice on the result
+        // line. No dialog is opened, so the 2s refresh loop cannot flip
+        // self.ssh_takeover underneath a pending confirm (the race the
+        // removed confirm flow guarded against no longer exists).
+        let note = if !self.ssh_takeover {
+            "routing all SSH through the device key; on-disk keys stay as fallback"
+        } else {
+            "reverting SSH to your system keys/agent"
+        };
+        self.toggle_setting_with_note("ssh", "SSH_TAKEOVER", self.ssh_takeover, Some(note));
+    }
+
     fn toggle_setting(&mut self, name: &str, cmd_key: &str, current: bool) {
+        self.toggle_setting_with_note(name, cmd_key, current, None);
+    }
+
+    /// Send a `SET:<cmd_key>` toggle. `note`, when present, is appended to the
+    /// success message as a non-blocking consequence hint (used by the SSH
+    /// takeover switch, which has no confirm dialog).
+    fn toggle_setting_with_note(
+        &mut self,
+        name: &str,
+        cmd_key: &str,
+        current: bool,
+        note: Option<&str>,
+    ) {
         if self.busy {
             return;
         }
@@ -1011,6 +1044,7 @@ impl App {
         let new_val = if current { "0" } else { "1" };
         let cmd = format!("SET:{}:{}", cmd_key, new_val);
         let name = name.to_string();
+        let note = note.map(|s| s.to_string());
         let enabling = !current;
 
         self.set_msg(
@@ -1032,10 +1066,11 @@ impl App {
             let state = if enabling { "ON" } else { "OFF" };
             match result {
                 Ok(rsp) if rsp.starts_with("OK") => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("{} → {}", name, state),
-                        MessageStyle::Green,
-                    ));
+                    let msg = match &note {
+                        Some(n) => format!("{} → {} — {}", name, state, n),
+                        None => format!("{} → {}", name, state),
+                    };
+                    let _ = tx.send(ActionResult::Message(msg, MessageStyle::Green));
                 }
                 Ok(rsp) => {
                     let _ = tx.send(ActionResult::Message(

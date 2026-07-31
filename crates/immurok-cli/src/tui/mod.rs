@@ -81,6 +81,7 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::Char('o') => app.action_toggle_polkit(),
                                 KeyCode::Char('k') => app.action_toggle_screen(),
                                 KeyCode::Char('L') => app.action_toggle_lock(),
+                                KeyCode::Char('h') => app.action_toggle_ssh(),
                                 KeyCode::Char('i') => app.action_info(),
                                 KeyCode::Char('U') => app.fw_enter(),
                                 KeyCode::Esc => {

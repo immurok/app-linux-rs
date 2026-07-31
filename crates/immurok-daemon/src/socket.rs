@@ -286,6 +286,7 @@ async fn dispatch_request(
         Request::SetUnlockPolkit(v) => handle_set_setting(coord, "unlock_polkit", v).await,
         Request::SetUnlockScreen(v) => handle_set_setting(coord, "unlock_screen", v).await,
         Request::SetLockScreen(v) => handle_set_setting(coord, "lock_screen", v).await,
+        Request::SetSshTakeover(v) => handle_set_setting(coord, "ssh_takeover", v).await,
         Request::GetSettings => handle_get_settings(coord).await,
         Request::GetInfo => handle_get_info(coord).await,
         // OTA commands handled in session wrapper, but in case of stray ones:
@@ -440,19 +441,24 @@ async fn handle_auth(
                 AuthResult::Denied
             }
         }
-        // Path C: PAM socket closed (user cancelled)
+        // Path C: PAM socket closed (user cancelled, e.g. Ctrl+C in sudo)
         r = stream.read(&mut disconnect_buf) => {
+            // Bail the in-flight AuthRequest via the Notify — the single BLE
+            // worker is parked in do_auth_request waiting for the touch, so a
+            // GATE_CANCEL queued through ble_send() would sit behind it and
+            // never reach the device (the LED would keep blinking until the
+            // AUTH timeout). auth_dialog_cancel wakes the parked wait, which
+            // writes GATE_CANCEL straight to the device to stop the LED now.
             match r {
                 Ok(0) | Err(_) => {
                     info!("AUTH cancelled: PAM socket closed");
-                    // Send GATE_CANCEL to stop device LED
-                    let _ = coord.ble_send(protocol::CMD_GATE_CANCEL, vec![]).await;
+                    coord.auth_dialog_cancel.notify_one();
                     AuthResult::Denied
                 }
                 Ok(_) => {
                     // Unexpected data — treat as cancel
                     info!("AUTH cancelled: unexpected data on PAM socket");
-                    let _ = coord.ble_send(protocol::CMD_GATE_CANCEL, vec![]).await;
+                    coord.auth_dialog_cancel.notify_one();
                     AuthResult::Denied
                 }
             }
@@ -1224,6 +1230,15 @@ async fn handle_set_setting(coord: &Arc<Coordinator>, key: &str, value: bool) ->
             "unlock_polkit" => settings.unlock_polkit = value,
             "unlock_screen" => settings.unlock_screen = value,
             "lock_screen" => settings.lock_screen = value,
+            "ssh_takeover" => {
+                // Apply the ~/.ssh/config effect first; only persist if it
+                // succeeds, so settings and config never diverge.
+                if let Err(e) = crate::ssh_config::apply(value) {
+                    warn!("Failed to apply ssh_takeover: {}", e);
+                    return Response::Error(format!("SAVE_FAILED:{}", e));
+                }
+                settings.ssh_takeover = value;
+            }
             _ => return Response::Error("UNKNOWN_KEY".into()),
         }
         if let Err(e) = settings.save(&coord.settings_path()) {
@@ -1238,11 +1253,12 @@ async fn handle_set_setting(coord: &Arc<Coordinator>, key: &str, value: bool) ->
 async fn handle_get_settings(coord: &Arc<Coordinator>) -> Response {
     let s = coord.settings.read().await;
     let msg = format!(
-        "sudo={}:polkit={}:screen={}:lock={}",
+        "sudo={}:polkit={}:screen={}:lock={}:ssh={}",
         if s.unlock_sudo { "1" } else { "0" },
         if s.unlock_polkit { "1" } else { "0" },
         if s.unlock_screen { "1" } else { "0" },
         if s.lock_screen { "1" } else { "0" },
+        if s.ssh_takeover { "1" } else { "0" },
     );
     Response::Ok(msg)
 }

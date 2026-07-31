@@ -29,10 +29,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, GLib, Gtk, Pango
 
 
-def _truncate(text: str, limit: int = 80) -> str:
+def _truncate(text: str, limit: int = 300) -> str:
     """Normalize to one line and truncate overlong commands so the pill does not overflow the window"""
     text = text.replace("\n", " ").replace("\r", " ").strip()
     if len(text) > limit:
@@ -54,7 +54,7 @@ class AuthDialog(Adw.Application):
 
     def do_activate(self) -> None:
         win = Adw.Window(application=self, title="immurok")
-        win.set_default_size(420 if self.agent_mode else 340, -1)
+        win.set_default_size(560 if self.agent_mode else 340, -1)
         win.set_resizable(False)
         win.connect("close-request", lambda _: self._on_cancel())
 
@@ -65,7 +65,9 @@ class AuthDialog(Adw.Application):
         content.set_margin_bottom(12)
         content.set_margin_start(28)
         content.set_margin_end(28)
-        content.set_halign(Gtk.Align.CENTER)
+        # FILL (not CENTER) so the agent-mode command card can use the full
+        # window width; icon/labels still render centered within it.
+        content.set_halign(Gtk.Align.FILL)
 
         # Icon: use a key in agent mode, fingerprint in normal mode
         icon_name = "dialog-password-symbolic" if self.agent_mode else "fingerprint-symbolic"
@@ -96,16 +98,24 @@ class AuthDialog(Adw.Application):
         body.set_max_width_chars(40)
         content.append(body)
 
-        # In agent mode: command pill (card-styled box with monospace label)
+        # In agent mode: command pill (card-styled box with monospace label).
+        # Wraps up to 5 lines so long commands stay readable; only past that
+        # does the last line ellipsize (on top of the 300-char hard truncate).
         if self.agent_mode and self.command:
             frame = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             frame.add_css_class("card")
-            frame.set_halign(Gtk.Align.CENTER)
+            frame.set_halign(Gtk.Align.FILL)
+            frame.set_hexpand(True)
 
             inner = Gtk.Label(label=_truncate(self.command))
             inner.set_selectable(True)
-            inner.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
-            inner.set_max_width_chars(48)
+            inner.set_wrap(True)
+            inner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            inner.set_lines(5)
+            inner.set_ellipsize(Pango.EllipsizeMode.END)
+            inner.set_max_width_chars(60)
+            inner.set_xalign(0.0)
+            inner.set_hexpand(True)
             inner.add_css_class("monospace")
             inner.set_margin_top(8)
             inner.set_margin_bottom(8)

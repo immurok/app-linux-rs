@@ -45,7 +45,11 @@ install: all
 	install -Dm755 scripts/immurok-pam-helper $(LOCAL_BIN)/immurok-pam-helper
 	install -Dm755 scripts/ble-notify-helper.py $(LOCAL_BIN)/ble-notify-helper.py
 	@# ── PAM module ──
-	sudo install -Dm755 pam/pam_immurok.so $(PAM_DIR)/pam_immurok.so
+	@# Install via a temp file + atomic rename, never overwrite in place:
+	@# the sudo running this has the OLD pam_immurok.so mmap'd, and an in-place
+	@# overwrite corrupts its code pages → SIGSEGV in dlclose at pam_end.
+	sudo install -Dm755 pam/pam_immurok.so $(PAM_DIR)/pam_immurok.so.new
+	sudo mv -f $(PAM_DIR)/pam_immurok.so.new $(PAM_DIR)/pam_immurok.so
 	@# ── PAM service configs (add pam_immurok.so if not already present) ──
 	-sudo $(LOCAL_BIN)/immurok-pam-helper add sudo 2>/dev/null
 	-sudo $(LOCAL_BIN)/immurok-pam-helper add polkit-1 2>/dev/null

@@ -6,6 +6,7 @@ mod screen;
 mod settings;
 mod socket;
 mod ssh_agent;
+mod ssh_config;
 mod suspend;
 
 use std::path::PathBuf;
@@ -66,11 +67,18 @@ async fn main() {
 
     let (ble_cmd_tx, ble_cmd_rx) = mpsc::channel(32);
     let coord = coordinator::Coordinator::new(ble_cmd_tx, immurok_dir.clone());
+    let ssh_takeover_intent = user_settings.ssh_takeover;
     {
         let mut p = coord.pairing.write().await;
         *p = pairing;
         let mut s = coord.settings.write().await;
         *s = user_settings;
+    }
+
+    // Reconcile ~/.ssh/config with the persisted ssh_takeover intent — a
+    // hand-edited config must not drift from the stored setting.
+    if let Err(e) = ssh_config::apply(ssh_takeover_intent) {
+        tracing::warn!("ssh_takeover reconcile failed: {}", e);
     }
 
     let pam_sock = runtime_immurok.join(protocol::PAM_SOCKET_NAME);

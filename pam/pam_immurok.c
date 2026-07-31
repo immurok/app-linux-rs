@@ -20,6 +20,8 @@
 #include <errno.h>
 #include <syslog.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/signalfd.h>
 
 #define PAM_SM_AUTH
 #define PAM_SM_ACCOUNT
@@ -28,6 +30,8 @@
 
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
+
+#include "fp_policy.h"
 
 #define SOCKET_DIR_FMT "/run/user/%d/immurok"
 #define SOCKET_NAME "pam.sock"
@@ -132,10 +136,10 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
         return PAM_AUTH_ERR;
     }
 
-    /* Animate spinner while waiting for response.
-     * Also monitor the controlling terminal — any keypress (or Ctrl+C
-     * causing EINTR) cancels the wait so the user can fall back to
-     * password authentication. */
+    /* Animate spinner while waiting for response. Also monitor the
+     * controlling terminal for any keypress (fall back to password) and a
+     * signalfd for SIGINT (Ctrl+C — same "cancel FP, fall to password"
+     * behaviour). */
     FILE *tty = open_tty();
     int tty_rd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
     int frame = 0;
@@ -144,6 +148,22 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
     int nfds = sock + 1;
     if (tty_rd >= 0 && tty_rd >= nfds)
         nfds = tty_rd + 1;
+
+    /* Catch Ctrl+C via signalfd rather than a sigaction() handler. A handler
+     * would be a function pointer INTO this module; libpam dlclose()s the
+     * module in pam_end(), and a lingering reference into the unmapped module
+     * crashes the host (observed: SIGSEGV in dlclose). signalfd installs no
+     * such pointer — SIGINT is delivered to a file descriptor we poll and
+     * close before returning. Block SIGINT so it is queued to the fd instead
+     * of run through the host's disposition; signalfd receives it even if the
+     * host (e.g. sudo) already had SIGINT blocked. Mask is restored on exit. */
+    sigset_t sigint_set, old_mask;
+    sigemptyset(&sigint_set);
+    sigaddset(&sigint_set, SIGINT);
+    int have_mask = (sigprocmask(SIG_BLOCK, &sigint_set, &old_mask) == 0);
+    int sfd = signalfd(-1, &sigint_set, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sfd >= 0 && sfd >= nfds)
+        nfds = sfd + 1;
 
     while (1) {
         /* Check timeout */
@@ -159,18 +179,32 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
         /* Show spinner */
         spinner_write(tty, frame++, "Please verify your fingerprint...");
 
-        /* Poll socket (and optionally tty) with 80ms timeout */
+        /* Poll socket, tty and signalfd with an 80ms timeout */
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
         if (tty_rd >= 0)
             FD_SET(tty_rd, &fds);
+        if (sfd >= 0)
+            FD_SET(sfd, &fds);
         tv.tv_sec = 0;
         tv.tv_usec = 80000; /* 80ms per frame */
 
         int ready = select(nfds, &fds, NULL, NULL, &tv);
         if (ready < 0) {
-            /* EINTR from Ctrl+C (SIGINT) — treat as cancel */
+            /* Interrupted syscall — treat as cancel (fall back to password) */
+            if (tty) {
+                fprintf(tty, ANSI_ERASE_LINE);
+            }
+            break;
+        }
+        if (ready > 0 && sfd >= 0 && FD_ISSET(sfd, &fds)) {
+            /* Ctrl+C (SIGINT) — cancel the fingerprint wait and fall through
+             * to the password prompt (pam_unix). Drain the fd. Closing the
+             * socket below lets the daemon send GATE_CANCEL to stop the LED. */
+            struct signalfd_siginfo si;
+            (void)read(sfd, &si, sizeof(si));
+            pam_syslog(pamh, LOG_INFO, "FP wait cancelled (Ctrl+C) for %s", user);
             if (tty) {
                 fprintf(tty, ANSI_ERASE_LINE);
             }
@@ -198,6 +232,12 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
         /* ready == 0: timeout, continue animation */
     }
 
+    /* Tear down the signalfd and restore the host's original signal mask.
+     * No handler was installed, so nothing points into this module after we
+     * return — safe for libpam to dlclose() us in pam_end(). */
+    if (sfd >= 0) close(sfd);
+    if (have_mask) sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
     if (tty) fclose(tty);
     if (tty_rd >= 0) close(tty_rd);
     close(sock);
@@ -214,6 +254,19 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     if (pam_get_item(pamh, PAM_SERVICE, (const void **)&service) != PAM_SUCCESS || service == NULL)
         service = "unknown";
+
+    /* Screen-unlock services (gdm-password) have no controlling /dev/tty, so
+     * the keypress-cancel fallback below is dead and blocking here would stall
+     * a typed password for the full timeout / 3 denied scans. Fingerprint
+     * unlock for these is handled out-of-band by the daemon (loginctl
+     * unlock-session on a proactive FP match), so return PAM_IGNORE and let
+     * pam_unix handle the password. Not sudo/polkit-1 — see fp_policy.h. */
+    if (immurok_should_skip_fp(service)) {
+        pam_syslog(pamh, LOG_INFO,
+                   "Service %s handled via daemon (loginctl) — PAM_IGNORE, deferring to password",
+                   service);
+        return PAM_IGNORE;
+    }
 
     int timeout_sec = parse_timeout(argc, argv);
     pam_syslog(pamh, LOG_INFO, "Auth request: user=%s service=%s timeout=%d",

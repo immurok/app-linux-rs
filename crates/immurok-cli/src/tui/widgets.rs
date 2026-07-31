@@ -229,7 +229,7 @@ fn draw_dashboard_left(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(fp_height), // Fingerprints
-            Constraint::Length(6),         // Unlock toggles
+            Constraint::Length(7),         // Unlock toggles
             Constraint::Length(3),         // PAM summary
             Constraint::Length(1),         // Firmware hint (may be blank)
             Constraint::Min(0),            // Filler
@@ -373,6 +373,7 @@ fn draw_unlock(f: &mut Frame, app: &App, area: Rect) {
         toggle_row("o", "polkit", app.unlock_polkit),
         toggle_row("k", "screen unlock", app.unlock_screen),
         toggle_row("L", "long-press lock", app.lock_screen),
+        toggle_row("h", "ssh", app.ssh_takeover),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1045,7 +1046,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("p / u"), Span::raw("Pair (press device button) · unpair / factory reset")]),
         Line::from(vec![key("e"), Span::raw("Enroll fingerprint (lowest empty slot)")]),
         Line::from(vec![key("d / v"), Span::raw("Delete slot (pick 0-4) · verify fingerprint")]),
-        Line::from(vec![key("s o k L"), Span::raw("Toggle sudo / polkit / screen / long-press lock")]),
+        Line::from(vec![key("s o k L h"), Span::raw("Toggle sudo / polkit / screen / long-press lock / ssh")]),
         Line::from(vec![key("i"), Span::raw("Show device info")]),
         Line::from(vec![key("Esc"), Span::raw("Cancel in-flight enrollment")]),
         Line::from(""),

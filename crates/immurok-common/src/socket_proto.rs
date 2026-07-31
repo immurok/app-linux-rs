@@ -24,6 +24,7 @@
 //! | SET:UNLOCK_POLKIT   | `SET:UNLOCK_POLKIT:1` / `:0`       |
 //! | SET:UNLOCK_SCREEN   | `SET:UNLOCK_SCREEN:1` / `:0`       |
 //! | SET:LOCK_SCREEN     | `SET:LOCK_SCREEN:1` / `:0`         |
+//! | SET:SSH_TAKEOVER    | `SET:SSH_TAKEOVER:1` / `:0`        |
 //! | GET:SETTINGS        | `GET:SETTINGS`                     |
 //! | GET:INFO            | `GET:INFO`                         |
 //! | OTA:START           | `OTA:START:size:version`           |
@@ -96,6 +97,7 @@ pub enum Request {
     SetUnlockPolkit(bool),
     SetUnlockScreen(bool),
     SetLockScreen(bool),
+    SetSshTakeover(bool),
     GetSettings,
     GetInfo,
     OtaStart { size: u32, version: String },
@@ -264,6 +266,10 @@ pub fn parse_request(line: &str) -> Result<Request, ParseError> {
                 "LOCK_SCREEN" => {
                     let v = parse_bool(&parts, 2, "SET:LOCK_SCREEN", "value")?;
                     Ok(Request::SetLockScreen(v))
+                }
+                "SSH_TAKEOVER" => {
+                    let v = parse_bool(&parts, 2, "SET:SSH_TAKEOVER", "value")?;
+                    Ok(Request::SetSshTakeover(v))
                 }
                 other => Err(ParseError::UnknownCommand(format!("SET:{other}"))),
             }
@@ -482,6 +488,18 @@ mod tests {
         assert_eq!(
             parse_request("SET:UNLOCK_SCREEN:0").unwrap(),
             Request::SetUnlockScreen(false)
+        );
+    }
+
+    #[test]
+    fn parse_set_ssh_takeover() {
+        assert_eq!(
+            parse_request("SET:SSH_TAKEOVER:1").unwrap(),
+            Request::SetSshTakeover(true)
+        );
+        assert_eq!(
+            parse_request("SET:SSH_TAKEOVER:0").unwrap(),
+            Request::SetSshTakeover(false)
         );
     }
 
