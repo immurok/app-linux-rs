@@ -28,6 +28,10 @@ pub const CMD_PAIR_BUTTON: u8 = 0x34;
 pub const CMD_FACTORY_RESET: u8 = 0x36;
 pub const CMD_GATE_CANCEL: u8 = 0x37;
 pub const CMD_CHALLENGE: u8 = 0x38;
+// Dual-host slot commands (firmware 1.6.12+). See
+// app-linux-rs/docs/dual-host-port.md §2.
+pub const CMD_SLOT_STATUS: u8 = 0x39;
+pub const CMD_SLOT_CLEAR: u8 = 0x3C;
 pub const CMD_KEY_COUNT: u8 = 0x60;
 pub const CMD_KEY_READ: u8 = 0x61;
 pub const CMD_KEY_WRITE: u8 = 0x62;
@@ -53,6 +57,15 @@ pub const RSP_ERROR: u8 = 0xFF;
 pub const RSP_PAIR_WAIT_BUTTON: u8 = 0xF0;
 pub const RSP_PAIR_NEEDS_RESET: u8 = 0xF1;
 
+// SEC_ERR_NOT_PAIRED (firmware immurok_security.h:31). Emitted by the
+// pre-pair whitelist in hidkbd.c:4920 for every command that is not one of
+// the six allowed while the ACTIVE SLOT is unpaired. It means "the slot I am
+// presenting right now is empty, so I will not talk to you" — NOT "your
+// command failed". Under dual-host the device can be sitting on the other
+// slot while this host holds a perfectly valid key for its own slot, so this
+// status must never be read as a command-specific failure.
+pub const RSP_ERR_NOT_PAIRED: u8 = 0xF2;
+
 // Firmware 1.3.1+ refuses long-write commands (KEY_WRITE / KEY_COMMIT /
 // KEY_DELETE / KEY_GENERATE / OTA) when battery < 5% — half-erased EEPROM
 // from a brown-out would corrupt the keystore or leave OTA Image B in a
@@ -65,6 +78,9 @@ pub const RSP_ERR_LOW_BATTERY: u8 = 0xF4;
 pub const PAIR_BUTTON_TIMEOUT: u8 = 0x00;
 pub const PAIR_BUTTON_CONFIRMED: u8 = 0x01;
 pub const PAIR_BUTTON_CANCELLED: u8 = 0x02;
+// Second-host enrollment only: the fingerprint half of the gate passed,
+// the device is now waiting for the button press. Pure progress signal.
+pub const PAIR_BUTTON_FP_OK: u8 = 0x03;
 
 // Notification types (Device → App)
 pub const NOTIFY_FP_MATCH_SIGNED: u8 = 0x21;
@@ -168,6 +184,19 @@ pub const PRE_AUTH_DURATION_SECS: u64 = 3;
 pub const LOCK_SUPPRESS_WINDOW_SECS: u64 = 3;
 pub const FP_GATE_MAX_FAILURES: u8 = 3;
 pub const MAX_FINGERPRINT_SLOTS: u8 = 5;
+
+// Host slot numbering on the wire (1-based, matches firmware
+// IMMUROK_SLOT_1 / IMMUROK_SLOT_2).
+pub const SLOT_1: u8 = 1;
+pub const SLOT_2: u8 = 2;
+
+// Firmware FP_USER_MAX is 6: slots 0-4 authenticate, slot 5 is the
+// dedicated host-switch finger that never participates in authentication
+// (touching it while unlocking must not swap hosts). MAX_FINGERPRINT_SLOTS
+// above stays 5 — it means "authentication slots" and is what PAM and the
+// auth paths key off.
+pub const SWITCH_FINGER_SLOT: u8 = 5;
+pub const TOTAL_FINGERPRINT_SLOTS: u8 = 6;
 
 // Security
 pub const COMPRESSED_PUBKEY_LEN: usize = 33;

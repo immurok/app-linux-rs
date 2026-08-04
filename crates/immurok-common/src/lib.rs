@@ -1,3 +1,4 @@
+pub mod dual_host;
 pub mod fwupdate;
 pub mod pam;
 pub mod protocol;

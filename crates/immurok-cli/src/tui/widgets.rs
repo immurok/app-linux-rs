@@ -224,22 +224,28 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
 fn draw_dashboard_left(f: &mut Frame, app: &App, area: Rect) {
     // Fingerprints block grows by 2 rows while enrolling (hint + gauge).
     let fp_height = if app.enroll_active { 5 } else { 3 };
+    // Hosts block only exists on dual-host firmware.
+    let hosts_height = if app.dual_host { 4 } else { 0 };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(fp_height), // Fingerprints
-            Constraint::Length(7),         // Unlock toggles
-            Constraint::Length(3),         // PAM summary
-            Constraint::Length(1),         // Firmware hint (may be blank)
-            Constraint::Min(0),            // Filler
+            Constraint::Length(fp_height),    // Fingerprints
+            Constraint::Length(hosts_height), // Hosts (dual-host only)
+            Constraint::Length(7),            // Unlock toggles
+            Constraint::Length(3),            // PAM summary
+            Constraint::Length(1),            // Firmware hint (may be blank)
+            Constraint::Min(0),               // Filler
         ])
         .split(area);
 
     draw_fingerprints(f, app, rows[0]);
-    draw_unlock(f, app, rows[1]);
-    draw_pam_summary(f, app, rows[2]);
-    draw_fw_hint(f, app, rows[3]);
+    if app.dual_host {
+        draw_hosts(f, app, rows[1]);
+    }
+    draw_unlock(f, app, rows[2]);
+    draw_pam_summary(f, app, rows[3]);
+    draw_fw_hint(f, app, rows[4]);
 }
 
 /// One-line firmware nudge on the Dashboard (design doc §3): outdated
@@ -263,13 +269,80 @@ fn draw_fw_hint(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_hosts(f: &mut Frame, app: &App, area: Rect) {
+    // The device sitting anywhere other than this computer's slot is the
+    // state where the firmware starts refusing fingerprint, key and unpair
+    // commands, so it has to be visible — but in the title, not in the rows.
+    let device_elsewhere = app.slot_active != 0 && Some(app.slot_active) != app.slot_mine;
+    let (title, title_color) = if device_elsewhere {
+        (
+            format!(" Hosts · H · device on {} ", app.slot_active),
+            WARN,
+        )
+    } else {
+        (" Hosts · H ".to_string(), PRIMARY)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(PRIMARY));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(2);
+    for slot in [1u8, 2u8] {
+        let occupied = app.slot_bitmap & (1 << (slot - 1)) != 0;
+        // Two independent facts that used to be conflated: which slot the
+        // device is PRESENTING right now (active), and which slot is OURS.
+        // They differ whenever the device is parked on the other host's slot
+        // — or on an empty one — and treating active as "this computer" sent
+        // a user hunting a pairing problem that did not exist.
+        let is_mine = Some(slot) == app.slot_mine;
+
+        let (glyph, glyph_style) = if occupied {
+            ("[✓]", Style::default().fg(OK).add_modifier(Modifier::BOLD))
+        } else {
+            ("[ ]", Style::default().fg(DIM))
+        };
+
+        // "▶ " marks this computer's slot. Where the DEVICE currently sits is
+        // a different fact and lives in the block title — putting both in the
+        // row turned two glanceable lines into prose.
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_mine { "▶ " } else { "  " },
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(glyph, glyph_style),
+            Span::styled(
+                format!(" Host {}: ", slot),
+                if is_mine {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(
+                if occupied { "paired" } else { "empty" },
+                Style::default().fg(if occupied { OK } else { DIM }),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_fingerprints(f: &mut Frame, app: &App, area: Rect) {
     let title = if app.enroll_active {
         format!(" Fingerprints · enrolling slot {} ", app.enroll_slot)
     } else {
         format!(
             " Fingerprints · {}/{} ",
-            fp_count(app.fp_bitmap),
+            // Count authentication fingers only; the switch finger has its
+            // own marker below and is not part of the 5-slot budget.
+            fp_count(app.fp_bitmap & 0x1F),
             protocol::MAX_FINGERPRINT_SLOTS
         )
     };
@@ -299,22 +372,32 @@ fn draw_fingerprints(f: &mut Frame, app: &App, area: Rect) {
 
     // Slot row
     let mut spans: Vec<Span> = vec![Span::raw("  ")];
-    for i in 0..protocol::MAX_FINGERPRINT_SLOTS {
+    for i in 0..protocol::TOTAL_FINGERPRINT_SLOTS {
         let has = app.fp_bitmap & (1 << i) != 0;
         let enrolling = app.enroll_active && i == app.enroll_slot;
-        if enrolling {
-            spans.push(Span::styled(
-                format!("◍ {}", i),
-                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-            ));
+        let glyph = if enrolling {
+            "◍"
         } else if has {
-            spans.push(Span::styled(
-                format!("⬤ {}", i),
-                Style::default().fg(OK).add_modifier(Modifier::BOLD),
-            ));
+            "⬤"
         } else {
-            spans.push(Span::styled(format!("○ {}", i), Style::default().fg(DIM)));
-        }
+            "○"
+        };
+        // Slot 5 only switches hosts and never authenticates, so it gets
+        // the ⇄ marker instead of a slot number — showing "5" would read
+        // as a sixth authentication finger.
+        let label = if i == protocol::SWITCH_FINGER_SLOT {
+            format!("{} ⇄", glyph)
+        } else {
+            format!("{} {}", glyph, i)
+        };
+        let style = if enrolling {
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD)
+        } else if has {
+            Style::default().fg(OK).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw("    "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
@@ -925,9 +1008,21 @@ fn draw_hotkeys(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys: &[(&str, &str)] = match app.mode {
-        Mode::DeleteSelect => &[("0-4", "delete slot"), ("Esc", "cancel")],
+        Mode::DeleteSelect => &[("0-5", "delete slot"), ("Esc", "cancel")],
+        Mode::EnrollKindSelect => &[
+            ("a", "auth finger"),
+            ("s", "host-switch finger"),
+            ("Esc", "cancel"),
+        ],
         Mode::KeyInput => &[("Enter", "confirm"), ("Esc", "cancel")],
         Mode::KeyDeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
+        Mode::HostMenu => &[
+            ("1/2", "unpair that host"),
+            ("s", "enroll switch"),
+            ("R", "factory reset"),
+            ("Esc", "cancel"),
+        ],
+        Mode::HostConfirm => &[("y", "confirm"), ("n/Esc", "cancel")],
         Mode::Help | Mode::Normal => match app.tab {
             Tab::Dashboard => &[
                 ("p", "pair"),
@@ -936,6 +1031,7 @@ fn draw_hotkeys(f: &mut Frame, app: &App, area: Rect) {
                 ("d", "delete"),
                 ("v", "verify"),
                 ("i", "info"),
+                ("H", "hosts"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -1043,11 +1139,21 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("1-4"), Span::raw("Switch tab · Esc back to Dashboard · q quit")]),
         Line::from(""),
         section("Dashboard"),
-        Line::from(vec![key("p / u"), Span::raw("Pair (press device button) · unpair / factory reset")]),
-        Line::from(vec![key("e"), Span::raw("Enroll fingerprint (lowest empty slot)")]),
-        Line::from(vec![key("d / v"), Span::raw("Delete slot (pick 0-4) · verify fingerprint")]),
+        Line::from(vec![key("p / u"), Span::raw("Pair (press device button) · unpair this computer")]),
+        Line::from(vec![
+            key("e"),
+            Span::raw(
+                "Enroll fingerprint — asks auth vs host-switch while slot 5 is free, \
+                 otherwise lowest empty auth slot",
+            ),
+        ]),
+        Line::from(vec![key("d / v"), Span::raw("Delete slot (pick 0-5) · verify fingerprint")]),
         Line::from(vec![key("s o k L h"), Span::raw("Toggle sudo / polkit / screen / long-press lock / ssh")]),
         Line::from(vec![key("i"), Span::raw("Show device info")]),
+        Line::from(vec![
+            key("H"),
+            Span::raw("Dual-host slots: 1/2 unpair that host, s enroll switch finger, R factory reset"),
+        ]),
         Line::from(vec![key("Esc"), Span::raw("Cancel in-flight enrollment")]),
         Line::from(""),
         section("Keys"),

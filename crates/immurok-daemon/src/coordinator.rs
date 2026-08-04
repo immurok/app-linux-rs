@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tracing::{info, warn};
 
-use immurok_common::types::{DeviceStatus, EnrollEvent, PairingData};
+use immurok_common::types::{DeviceStatus, EnrollEvent, PairProgress, PairingData};
 use crate::settings::Settings;
 
 /// Commands sent to ble.rs via channel
@@ -101,12 +101,21 @@ pub struct Coordinator {
     pub settings: RwLock<Settings>,
     pub device_status: RwLock<Option<DeviceStatus>>,
     pub is_device_verified: AtomicBool,
+    /// Set ONLY when the challenge-response HMAC genuinely verified against
+    /// this host's shared key. Unlike `is_device_verified` — which is set
+    /// optimistically on an unexpected answer, a timeout, or no pairing at
+    /// all, for backwards compatibility — this is real proof, so it is the
+    /// only sound basis for "the slot the device is presenting is MINE".
+    pub challenge_verified: AtomicBool,
     pub is_connected: AtomicBool,
     pub screen_locked: AtomicBool,
     pub fp_bitmap_stale: AtomicBool,
 
     // Enrollment progress (status, current, total) — updated by BLE, read by socket
     pub last_enroll_event: RwLock<Option<(u8, u8, u8)>>,
+
+    /// Pairing progress, polled by the CLI/TUI over PAIR:PROGRESS.
+    pub pair_progress: RwLock<PairProgress>,
 
     // Cross-module channels
     pub ble_cmd_tx: mpsc::Sender<BleCommand>,
@@ -167,10 +176,12 @@ impl Coordinator {
             settings: RwLock::new(Settings::default()),
             device_status: RwLock::new(None),
             is_device_verified: AtomicBool::new(false),
+            challenge_verified: AtomicBool::new(false),
             is_connected: AtomicBool::new(false),
             screen_locked: AtomicBool::new(false),
             fp_bitmap_stale: AtomicBool::new(false),
             last_enroll_event: RwLock::new(None),
+            pair_progress: RwLock::new(PairProgress::Idle),
             ble_cmd_tx,
             fp_match_tx,
             enroll_tx,
@@ -184,6 +195,30 @@ impl Coordinator {
             is_suspending: AtomicBool::new(false),
             immurok_dir,
         })
+    }
+
+    pub async fn set_pair_progress(&self, p: PairProgress) {
+        *self.pair_progress.write().await = p;
+    }
+
+    pub async fn pair_progress(&self) -> PairProgress {
+        *self.pair_progress.read().await
+    }
+
+    /// Claim the pairing slot: succeeds only when no attempt is in flight,
+    /// and resets progress to Idle as it claims. Check and set happen under
+    /// one write guard so two concurrent PAIR:START connections cannot both
+    /// see an idle state and race.
+    pub async fn try_begin_pairing(&self) -> bool {
+        let mut p = self.pair_progress.write().await;
+        if matches!(
+            *p,
+            PairProgress::WaitFp | PairProgress::WaitButton | PairProgress::Ecdh
+        ) {
+            return false;
+        }
+        *p = PairProgress::Idle;
+        true
     }
 
     /// Core FP match routing logic — 3-way: pending PAM → approve | screen locked → unlock | else → pre-auth
@@ -443,5 +478,45 @@ impl Coordinator {
     pub fn pairing_path(&self) -> std::path::PathBuf {
         self.immurok_dir
             .join(immurok_common::protocol::PAIRING_FILE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_coordinator() -> Arc<Coordinator> {
+        let (tx, _rx) = mpsc::channel(1);
+        Coordinator::new(tx, std::path::PathBuf::from("/tmp/immurok-test"))
+    }
+
+    #[tokio::test]
+    async fn try_begin_pairing_claims_when_idle() {
+        let coord = new_coordinator();
+        assert_eq!(coord.pair_progress().await, PairProgress::Idle);
+        assert!(coord.try_begin_pairing().await);
+        assert_eq!(coord.pair_progress().await, PairProgress::Idle);
+    }
+
+    #[tokio::test]
+    async fn try_begin_pairing_claims_from_terminal_states() {
+        let coord = new_coordinator();
+        for terminal in [PairProgress::Done, PairProgress::Failed] {
+            coord.set_pair_progress(terminal).await;
+            assert!(coord.try_begin_pairing().await);
+            // Claiming resets progress back to Idle.
+            assert_eq!(coord.pair_progress().await, PairProgress::Idle);
+        }
+    }
+
+    #[tokio::test]
+    async fn try_begin_pairing_rejects_while_in_flight() {
+        let coord = new_coordinator();
+        for in_flight in [PairProgress::WaitFp, PairProgress::WaitButton, PairProgress::Ecdh] {
+            coord.set_pair_progress(in_flight).await;
+            assert!(!coord.try_begin_pairing().await);
+            // Rejected claim must not disturb the in-flight state.
+            assert_eq!(coord.pair_progress().await, in_flight);
+        }
     }
 }

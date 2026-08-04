@@ -9,6 +9,7 @@ pub mod ota;
 pub mod pair;
 pub mod pam;
 pub mod settings;
+pub mod slot;
 pub mod status;
 
 use clap::Subcommand;
@@ -25,8 +26,20 @@ pub enum Commands {
     /// Start ECDH pairing
     Pair,
 
-    /// Clear pairing + factory reset
-    Unpair,
+    /// Clear this computer's pairing on the device (keeps fingerprints and keys)
+    Unpair {
+        /// Clear the OTHER host's slot (1 or 2) instead of this computer's.
+        /// Requires touching an enrolled fingerprint on the device.
+        #[arg(long)]
+        slot: Option<u8>,
+    },
+
+    /// Dual-host slot inspection
+    #[command(subcommand)]
+    Slot(SlotCommands),
+
+    /// Wipe the device: all fingerprints, all keys, both host pairings
+    FactoryReset,
 
     /// Fingerprint management
     #[command(subcommand)]
@@ -73,14 +86,14 @@ pub enum Commands {
 pub enum FpCommands {
     /// List enrolled fingerprints
     List,
-    /// Enroll fingerprint to a slot (0-4)
+    /// Enroll fingerprint to a slot (0-4 auth, 5 = host switch)
     Enroll {
-        /// Slot number (0-4)
+        /// Slot number: 0-4 authenticate, 5 = host-switch finger
         slot: u8,
     },
     /// Delete fingerprint from a slot
     Delete {
-        /// Slot number (0-4)
+        /// Slot number: 0-4 authenticate, 5 = host-switch finger
         slot: u8,
     },
     /// Verify fingerprint (test)
@@ -208,6 +221,14 @@ pub enum DaemonCommands {
     Restart,
 }
 
+/// Dual-host slot subcommands. Clearing a slot is `unpair` / `unpair --slot N`
+/// — deliberately not duplicated here, so there is one way to do it.
+#[derive(Subcommand)]
+pub enum SlotCommands {
+    /// Show which host slots are occupied and which one is active
+    Status,
+}
+
 // ── Shared helpers ───────────────────────────────────────────
 
 /// Parse "on"/"off" to "1"/"0". Returns None for invalid input.
@@ -239,17 +260,57 @@ pub fn requires_pairing(cmd: &Commands) -> bool {
         | Commands::Tui
         | Commands::Ota { .. }
         | Commands::Fw(_)
+        // Slot status is readable while unpaired — that is exactly how a
+        // new host learns it is the second one.
+        | Commands::Slot(_)
+        // Both recovery commands are deliberately NOT gated. Their real
+        // authority lives on the device (SLOT_CLEAR runs on the slot's own
+        // link; FACTORY_RESET is fingerprint-gated by the firmware, which
+        // never reads a payload or checks an HMAC on it), and the daemon
+        // validates both properly. Gating them on *local* pairing state
+        // makes the documented recovery path unfollowable: `unpair` while
+        // the device is out of range answers CLEARED_LOCAL_ONLY and tells
+        // the user to re-run it while connected — which the gate would then
+        // refuse, because local pairing is exactly what that run dropped.
+        | Commands::Unpair { .. }
+        | Commands::FactoryReset
         | Commands::Daemon(_) => false,
 
         // Gated — device-facing / config operations need a paired device
         Commands::Info
-        | Commands::Unpair
         | Commands::Fp(_)
         | Commands::Key(_)
         | Commands::Set(_)
         | Commands::Settings
         | Commands::Pam(_) => true,
     }
+}
+
+/// Yes/no prompt on stdin. Anything other than y/yes — including EOF —
+/// counts as no, so a piped or closed stdin never confirms a destructive
+/// action by accident.
+pub fn confirm(question: &str) -> bool {
+    use std::io::Write;
+    print!("{} [y/N] ", question);
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Strong confirmation: only the literal word `yes` counts, and it is never
+/// abbreviated to a keystroke. Reserved for actions that can destroy data
+/// which exists nowhere else — a stray `y` must not be able to trigger them.
+/// EOF counts as no.
+pub fn confirm_literal_yes(prompt: &str) -> bool {
+    println!("{}", prompt);
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim() == "yes"
 }
 
 /// Query PAIR:STATUS on a fresh connection; exit with a hint if unpaired.
@@ -288,10 +349,20 @@ mod tests {
         assert!(!requires_pairing(&Commands::Fw(FwCommands::Update { yes: false })));
         assert!(!requires_pairing(&Commands::Fw(FwCommands::Status)));
         assert!(!requires_pairing(&Commands::Daemon(DaemonCommands::Restart)));
+        assert!(!requires_pairing(&Commands::Slot(SlotCommands::Status)));
+
+        // Recovery commands — ungated on purpose. `unpair` run while the
+        // device was unreachable clears local pairing and asks to be re-run
+        // while connected; gating it on local pairing would make that
+        // instruction impossible to follow. Factory reset carries no local
+        // authority at all (the firmware gates it on a fingerprint), so a
+        // local-state gate only blocks the user, never an attacker.
+        assert!(!requires_pairing(&Commands::Unpair { slot: None }));
+        assert!(!requires_pairing(&Commands::Unpair { slot: Some(2) }));
+        assert!(!requires_pairing(&Commands::FactoryReset));
 
         // Gated — rejected until paired
         assert!(requires_pairing(&Commands::Info));
-        assert!(requires_pairing(&Commands::Unpair));
         assert!(requires_pairing(&Commands::Fp(FpCommands::List)));
         assert!(requires_pairing(&Commands::Key(KeyCommands::List { category: "ssh".into() })));
         assert!(requires_pairing(&Commands::Set(SetCommands::Sudo { value: "on".into() })));

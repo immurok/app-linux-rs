@@ -8,7 +8,10 @@ mod tui;
 
 use clap::Parser;
 
-use commands::{Commands, DaemonCommands, FpCommands, FwCommands, KeyCommands, PamCommands, SetCommands};
+use commands::{
+    Commands, DaemonCommands, FpCommands, FwCommands, KeyCommands, PamCommands, SetCommands,
+    SlotCommands,
+};
 
 /// immurok-cli — manage immurok fingerprint authentication
 #[derive(Parser)]
@@ -31,7 +34,11 @@ fn main() {
         Commands::Status => commands::status::run(),
         Commands::Info => commands::info::run(),
         Commands::Pair => commands::pair::run_pair(),
-        Commands::Unpair => commands::pair::run_unpair(),
+        Commands::Unpair { slot } => commands::pair::run_unpair(slot),
+        Commands::Slot(s) => match s {
+            SlotCommands::Status => commands::slot::run_status(),
+        },
+        Commands::FactoryReset => commands::pair::run_factory_reset(),
 
         Commands::Fp(fp) => match fp {
             FpCommands::List => commands::fingerprint::run_list(),

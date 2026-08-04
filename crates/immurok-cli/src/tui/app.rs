@@ -7,6 +7,10 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::socket_client::DaemonClient;
+use immurok_common::dual_host::{
+    classify_unpair_response, parse_slot_owner, parse_slot_status_line, SlotStatus,
+    UnpairOutcome,
+};
 use immurok_common::protocol;
 
 /// Max lines retained in the in-TUI log viewer ring buffer.
@@ -59,6 +63,63 @@ pub enum Mode {
     KeyDeleteConfirm,
     /// Full-screen help overlay (read-only).
     Help,
+    /// Pick what kind of finger to enroll — offered only while the
+    /// host-switch slot is still free, since otherwise there is no choice.
+    EnrollKindSelect,
+    /// Dual-host actions menu (opened with H on the Dashboard).
+    HostMenu,
+    /// Confirm the picked host action (y / n).
+    HostConfirm,
+}
+
+/// A destructive dual-host action awaiting confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAction {
+    /// Clear this computer's own slot.
+    UnpairSelf,
+    /// Clear the other host's slot (needs a fingerprint on the device).
+    /// Clear a specific host slot, chosen explicitly by the user. Never
+    /// derived from the active slot: the slot the device is PRESENTING is
+    /// not the slot that belongs to this computer, and guessing pointed a
+    /// destructive action at the wrong host.
+    UnpairSlot(u8),
+    /// Wipe the device entirely.
+    FactoryReset,
+    /// Enroll the host-switch finger (slot 5).
+    EnrollSwitch,
+}
+
+impl HostAction {
+    /// Confirmation line shown in the footer. Spells out the blast radius —
+    /// these three differ enormously and "are you sure?" would not.
+    pub fn prompt(self, mine: Option<u8>) -> String {
+        match self {
+            Self::UnpairSelf => {
+                "Unpair THIS computer? Fingerprints and keys are kept. (y/n)".into()
+            }
+            Self::UnpairSlot(s) => match mine {
+                Some(m) if m == s => format!(
+                    "Clear host slot {} — THIS computer's own pairing? (y/n)",
+                    s
+                ),
+                Some(_) => format!(
+                    "Clear host slot {} — the OTHER computer? Needs a fingerprint. (y/n)",
+                    s
+                ),
+                None => format!(
+                    "Clear host slot {}? Cannot tell whether it is this computer's — \
+                     needs a fingerprint. (y/n)",
+                    s
+                ),
+            },
+            Self::FactoryReset => {
+                "WIPE the device: all fingerprints, ALL SSH keys, both hosts? (y/n)".into()
+            }
+            Self::EnrollSwitch => {
+                "Enroll the host-switch finger in slot 5? (y/n)".into()
+            }
+        }
+    }
 }
 
 /// Firmware page state machine (mirrors macOS FirmwareUpdateService.state).
@@ -112,6 +173,12 @@ pub struct EventEntry {
     pub text: String,
     pub style: MessageStyle,
 }
+
+/// Refresh ticks between SLOT:STATUS polls. The base refresh is 2 s, so slot
+/// state is re-read about every 10 s — often enough for a picture that only
+/// changes on pair / unpair / host-switch, all of which force a refresh of
+/// their own anyway.
+const SLOT_POLL_EVERY: u8 = 5;
 
 /// Max entries retained in the Dashboard event feed.
 pub const EVENT_BUFFER_CAP: usize = 200;
@@ -201,6 +268,17 @@ pub struct App {
     pub fp_bitmap: u8,
     pub daemon_ok: bool,
 
+    // Dual-host slots
+    /// False when the firmware predates dual-host — the Hosts panel hides.
+    pub dual_host: bool,
+    pub slot_bitmap: u8,
+    pub slot_active: u8,
+    /// Which slot is THIS computer's, when the daemon could prove it.
+    /// `None` means unproven — never render it as somebody else's.
+    pub slot_mine: Option<u8>,
+    /// Counts refreshes so slot state can be polled on a slower cadence.
+    slot_poll_tick: u8,
+
     // Firmware update state
     /// Set by the startup silent check / prepare when an update exists.
     pub fw_update_available: Option<String>,
@@ -247,6 +325,8 @@ pub struct App {
     pub key_add_flow: Option<KeyAddFlow>,
     /// Pending delete target (cat + index) while in KeyDeleteConfirm.
     pub pending_delete: Option<(KeyTab, u8)>,
+    /// Host action awaiting y/n while in Mode::HostConfirm.
+    pub pending_host_action: Option<HostAction>,
 
     // PAM panel cursor
     pub pam_cursor: usize,
@@ -310,6 +390,11 @@ impl App {
             paired: false,
             fp_bitmap: 0,
             daemon_ok: false,
+            dual_host: false,
+            slot_bitmap: 0,
+            slot_mine: None,
+            slot_poll_tick: 0,
+            slot_active: 0,
             fw_update_available: None,
             fw_state: FwState::Idle,
             fw_prepared: None,
@@ -340,6 +425,7 @@ impl App {
             input_buf: String::new(),
             key_add_flow: None,
             pending_delete: None,
+            pending_host_action: None,
             pam_cursor: 0,
             log_lines: VecDeque::with_capacity(LOG_BUFFER_CAP),
             log_scroll: 0,
@@ -466,6 +552,53 @@ impl App {
             self.fp_bitmap = 0;
         }
 
+        // SLOT:STATUS — dual-host occupancy. Old firmware answers
+        // UNSUPPORTED, in which case the Hosts panel stays hidden rather
+        // than showing a half-truth.
+        //
+        // Polled far less often than the rest: slot state only changes on
+        // pair / unpair / host-switch, and every one of those either reboots
+        // the device or runs through a command of ours that already forces a
+        // refresh. At the 2 s base cadence this was a BLE round-trip every
+        // two seconds on the UI thread, which is both needless radio traffic
+        // and — since refresh() is synchronous — a recurring stall.
+        self.slot_poll_tick = self.slot_poll_tick.wrapping_add(1);
+        let poll_slots = self.slot_poll_tick % SLOT_POLL_EVERY == 1;
+        if self.connected && poll_slots {
+            let line = daemon_send("SLOT:STATUS").ok();
+            match line.as_deref().and_then(parse_slot_status_line) {
+                Some(SlotStatus::Supported { bitmap, active }) => {
+                    self.dual_host = true;
+                    self.slot_bitmap = bitmap;
+                    self.slot_active = active;
+                    // Which slot is OURS is a separate question from which
+                    // one the device is presenting — the two differ whenever
+                    // the device is parked on the other host's slot.
+                    self.slot_mine = line.as_deref().and_then(parse_slot_owner);
+                }
+                Some(SlotStatus::Unsupported) => {
+                    // Firmware genuinely predates dual-host: hide the panel.
+                    self.dual_host = false;
+                    self.slot_bitmap = 0;
+                    self.slot_active = 0;
+                    self.slot_mine = None;
+                }
+                None => {
+                    // The query itself failed — a flapping link answers
+                    // "write failed: Not connected" while is_connected is
+                    // still true. Keep the last known picture instead of
+                    // blanking the panel; FP:LIST already falls back to its
+                    // cache for exactly this reason, and losing the whole
+                    // Hosts block on a transient hiccup reads as a bug.
+                }
+            }
+        } else {
+            // Disconnected: keep the last known bindings on screen (the
+            // header already says Disconnected) but stop claiming to know
+            // where the device is.
+            self.slot_active = 0;
+        }
+
         // GET:SETTINGS
         if let Ok(rsp) = daemon_send("GET:SETTINGS") {
             let parts: Vec<&str> = rsp.split(':').collect();
@@ -584,6 +717,12 @@ impl App {
     /// Enroll into the lowest empty slot. Slot picking is intentionally
     /// not exposed in the TUI — `immurok-cli fp enroll <slot>` still takes
     /// an explicit slot if ever needed.
+    /// True when the host-switch finger can still be enrolled: the firmware
+    /// knows about dual-host and slot 5 is free.
+    pub fn switch_finger_available(&self) -> bool {
+        self.dual_host && self.fp_bitmap & (1 << protocol::SWITCH_FINGER_SLOT) == 0
+    }
+
     pub fn auto_enroll(&mut self) {
         if !self.guard_paired() {
             return;
@@ -595,12 +734,53 @@ impl App {
         if self.busy {
             return;
         }
+
+        // While the switch slot is free, "enroll" means two genuinely
+        // different things. Choosing silently would either hide host
+        // switching from the user entirely, or spend an authentication slot
+        // on a finger that never authenticates. Ask which one they want.
+        if self.switch_finger_available() {
+            self.mode = Mode::EnrollKindSelect;
+            self.set_msg(
+                "Enroll:  a = authentication finger  ·  s = host-switch finger (slot 5)  ·  Esc",
+                MessageStyle::Yellow,
+            );
+            return;
+        }
+        self.enroll_auth_finger();
+    }
+
+    /// Enroll into the lowest free AUTHENTICATION slot (0-4). Slot 5 is never
+    /// picked here — it only switches hosts, so it has to be chosen on purpose.
+    pub fn enroll_auth_finger(&mut self) {
         let slot = (0..protocol::MAX_FINGERPRINT_SLOTS)
             .find(|i| self.fp_bitmap & (1 << i) == 0);
         match slot {
             Some(s) => self.action_enroll(s),
-            None => self.set_msg("All fingerprint slots are full", MessageStyle::Red),
+            None => {
+                self.mode = Mode::Normal;
+                self.set_msg("All authentication slots are full", MessageStyle::Red);
+            }
         }
+    }
+
+    pub fn enroll_kind_pick(&mut self, c: char) {
+        match c {
+            'a' | 'A' => {
+                self.mode = Mode::Normal;
+                self.enroll_auth_finger();
+            }
+            's' | 'S' => {
+                self.mode = Mode::Normal;
+                self.action_enroll(protocol::SWITCH_FINGER_SLOT);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn cancel_enroll_kind(&mut self) {
+        self.mode = Mode::Normal;
+        self.set_msg("Ready", MessageStyle::Dim);
     }
 
     pub fn enter_delete_select(&mut self) {
@@ -614,8 +794,9 @@ impl App {
         self.mode = Mode::DeleteSelect;
         self.set_msg(
             &format!(
-                "Press 0-{} to choose slot to delete (Esc to cancel)",
-                protocol::MAX_FINGERPRINT_SLOTS - 1
+                "Press 0-{} to choose slot to delete ({} = host-switch finger, Esc to cancel)",
+                protocol::SWITCH_FINGER_SLOT,
+                protocol::SWITCH_FINGER_SLOT
             ),
             MessageStyle::Yellow,
         );
@@ -624,6 +805,299 @@ impl App {
     pub fn cancel_select(&mut self) {
         self.mode = Mode::Normal;
         self.set_msg("Ready", MessageStyle::Dim);
+    }
+
+    pub fn enter_host_menu(&mut self) {
+        if self.busy {
+            return;
+        }
+        if !self.dual_host {
+            self.set_msg(
+                "This device's firmware has no dual-host support.",
+                MessageStyle::Yellow,
+            );
+            return;
+        }
+        self.mode = Mode::HostMenu;
+        self.set_msg(
+            "Hosts:  1 / 2 unpair that host  ·  s enroll switch finger  ·  R factory reset  ·  Esc",
+            MessageStyle::Yellow,
+        );
+    }
+
+    pub fn host_menu_pick(&mut self, c: char) {
+        let action = match c {
+            '1' => Some(HostAction::UnpairSlot(1)),
+            '2' => Some(HostAction::UnpairSlot(2)),
+            's' => Some(HostAction::EnrollSwitch),
+            'R' => Some(HostAction::FactoryReset),
+            _ => None,
+        };
+        let Some(action) = action else { return };
+
+        if let HostAction::UnpairSlot(slot) = action {
+            if self.slot_bitmap & (1 << (slot - 1)) == 0 {
+                self.mode = Mode::Normal;
+                self.set_msg(
+                    &format!("Host slot {} is already empty.", slot),
+                    MessageStyle::Yellow,
+                );
+                return;
+            }
+        }
+
+        // Same guards `auto_enroll` applies before enrolling: this is a
+        // second entrance to enrollment and must be exactly as careful as
+        // the front door. Checked here (before the confirm prompt) rather
+        // than in confirm_host_action so a doomed pick never gets a "(y/n)"
+        // prompt it cannot honour.
+        if action == HostAction::EnrollSwitch {
+            if !self.guard_paired() {
+                self.mode = Mode::Normal;
+                return;
+            }
+            if !self.connected {
+                self.mode = Mode::Normal;
+                self.set_msg("Device not connected", MessageStyle::Red);
+                return;
+            }
+            if self.fp_bitmap & (1 << protocol::SWITCH_FINGER_SLOT) != 0 {
+                self.mode = Mode::Normal;
+                self.set_msg(
+                    "Host-switch finger (slot 5) is already enrolled — delete it first.",
+                    MessageStyle::Yellow,
+                );
+                return;
+            }
+        }
+
+        self.pending_host_action = Some(action);
+        self.mode = Mode::HostConfirm;
+        let prompt = match action {
+            // Own-slot unpair has a state-dependent warning; the other
+            // actions' blast radius does not vary.
+            HostAction::UnpairSelf => self.unpair_self_prompt(),
+            other => other.prompt(self.slot_mine),
+        };
+        self.set_msg(&prompt, MessageStyle::Red);
+    }
+
+    /// Dashboard `u`. Same destructive action as `H` → `u`, so it takes the
+    /// same route: stage it and require an explicit `y`. It used to fire
+    /// `SLOT:CLEAR` on that single keystroke while the identical item behind
+    /// the Hosts menu asked for confirmation.
+    ///
+    /// Unlike `enter_host_menu` this does not require dual-host firmware —
+    /// unpairing this computer is meaningful on every firmware.
+    pub fn request_unpair_self(&mut self) {
+        if self.busy {
+            return;
+        }
+        let action = HostAction::UnpairSelf;
+        self.pending_host_action = Some(action);
+        self.mode = Mode::HostConfirm;
+        let prompt = self.unpair_self_prompt();
+        self.set_msg(&prompt, MessageStyle::Red);
+    }
+
+    /// Confirmation line for unpairing this computer.
+    ///
+    /// "Fingerprints and keys are kept" stops being the whole truth when
+    /// this host holds the only occupied slot and fingerprints are enrolled:
+    /// the firmware then refuses PAIR_INIT (NEEDS_RESET) and accepts neither
+    /// FACTORY_RESET nor DELETE_FP before pairing, so the only way back is
+    /// the 3 s button hold that erases every key. Both facts are already in
+    /// the polled state, so this costs no extra round trip. Same reasoning
+    /// as `assess_unpair_risk` / `classify_unpair_risk` in `commands/pair.rs`.
+    ///
+    /// Firmware that predates dual-host support (`refresh` falls to the
+    /// `_ =>` arm on `SLOT:STATUS` and sets `dual_host = false`) is the
+    /// `OldFirmware` case there: it still enforces the same PAIR_INIT
+    /// refusal while fingerprints remain, so "keys are kept" is incomplete
+    /// there too — a factory reset would be needed to get back to a working
+    /// pairing. `self.connected && !self.dual_host` is that state: when
+    /// disconnected `self.connected` is false instead, so this does not
+    /// also fire for the offline case (that one genuinely changes nothing
+    /// on the device, same as `DeviceOffline`).
+    pub fn unpair_self_prompt(&self) -> String {
+        if self.connected && !self.dual_host {
+            return "Unpair? This firmware predates dual-host support: if fingerprints remain \
+                    enrolled, re-pairing afterward will need a factory reset (erases ALL keys). \
+                    Delete fingerprints first to avoid that. (y/n)"
+                .into();
+        }
+        let only_us = self.dual_host
+            && self.slot_active != 0
+            && self.slot_bitmap == 1u8 << (self.slot_active - 1);
+        if only_us && self.fp_bitmap != 0 {
+            "Unpair? This is the ONLY paired host and fingerprints remain — re-pairing will \
+             be refused and only a 3s button hold (erases ALL keys) recovers. Delete \
+             fingerprints first. (y/n)"
+                .into()
+        } else {
+            HostAction::UnpairSelf.prompt(self.slot_mine)
+        }
+    }
+
+    pub fn cancel_host_action(&mut self) {
+        self.pending_host_action = None;
+        self.mode = Mode::Normal;
+        self.set_msg("Ready", MessageStyle::Dim);
+    }
+
+    pub fn confirm_host_action(&mut self) {
+        let Some(action) = self.pending_host_action.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        match action {
+            // Delegates to the SAME function the Dashboard `u` key calls —
+            // one place that knows the own-clear response arms. This used
+            // to call `action_slot_clear(None)` with its own hand-maintained
+            // copy of the four-way match, which drifted from the CLI's.
+            HostAction::UnpairSelf => self.action_unpair(),
+            // Clearing our OWN slot has to go through action_unpair: only
+            // that path drops the now-dead local pairing record. Routing it
+            // through the explicit-slot command would clear the device side
+            // and leave this host believing it is still paired.
+            HostAction::UnpairSlot(slot) if Some(slot) == self.slot_mine => self.action_unpair(),
+            HostAction::UnpairSlot(slot) => self.action_slot_clear(slot),
+            HostAction::FactoryReset => self.action_factory_reset(),
+            HostAction::EnrollSwitch => self.action_enroll(protocol::SWITCH_FINGER_SLOT),
+        }
+    }
+
+    /// Clear the *other* host's slot — this computer's own clear goes
+    /// through `action_unpair` instead, which is the only place that knows
+    /// the own-clear response arms (see `confirm_host_action`).
+    ///
+    /// The response goes through `dual_host::classify_unpair_response`, the
+    /// one decoder all four unpair call sites share — a `contains("CLEARED")`
+    /// check would also match `CLEARED_UNCONFIRMED` / `CLEARED_LOCAL_ONLY`
+    /// and misreport an own-slot clear as the far slot going away.
+    fn action_slot_clear(&mut self, slot: u8) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        let request = format!("SLOT:CLEAR:{}", slot);
+        self.set_msg(
+            &format!("Clearing host slot {} — touch an enrolled finger…", slot),
+            MessageStyle::Yellow,
+        );
+
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = DaemonClient::connect().and_then(|mut c| {
+                c.send_with_timeout(&request, std::time::Duration::from_secs(60))
+            });
+            match result {
+                Ok(rsp) => match classify_unpair_response(&rsp) {
+                    UnpairOutcome::Cleared => {
+                        let _ = tx.send(ActionResult::Message(
+                            "Host slot cleared.".into(),
+                            MessageStyle::Green,
+                        ));
+                    }
+                    // Both partial outcomes come from the OWN-clear path:
+                    // the daemon re-resolves the target itself, so if the
+                    // active slot changed after this menu was drawn the
+                    // request landed on this computer's slot instead.
+                    UnpairOutcome::ClearedUnconfirmed | UnpairOutcome::ClearedLocalOnly => {
+                        let _ = tx.send(ActionResult::Message(
+                            "The device's active slot changed — the request was re-routed to \
+                             THIS computer's own slot, which is now unpaired. The other slot \
+                             was NOT touched."
+                                .into(),
+                            MessageStyle::Yellow,
+                        ));
+                    }
+                    UnpairOutcome::ClearedSlotUnpaired => {
+                        let _ = tx.send(ActionResult::Message(
+                            "The device is on an empty slot and refused the command. No slot \
+                             was cleared; the local pairing record was dropped. Touch the \
+                             host-switch finger to bring it back to a paired slot."
+                                .into(),
+                            MessageStyle::Yellow,
+                        ));
+                    }
+                    UnpairOutcome::Refused => {
+                        let _ = tx.send(ActionResult::Message(
+                            "The device refused to clear that slot. Nothing changed.".into(),
+                            MessageStyle::Red,
+                        ));
+                    }
+                    UnpairOutcome::Failed => {
+                        let _ = tx.send(ActionResult::Message(
+                            format!("Clear failed: {}", rsp),
+                            MessageStyle::Red,
+                        ));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!("Clear error: {}", e),
+                        MessageStyle::Red,
+                    ));
+                }
+            }
+            let _ = tx.send(ActionResult::Refresh);
+            let _ = tx.send(ActionResult::Done);
+        });
+    }
+
+    /// Wipe the device. The daemon runs this through the device's
+    /// fingerprint gate (up to 30s) on top of the wipe itself, so this uses
+    /// a 60s read timeout, and success is matched EXACTLY against `OK:RESET`
+    /// — the failure string is `ERROR:FACTORY_RESET_FAILED:...`, which also
+    /// contains the substring "RESET" and would otherwise read as success.
+    /// On failure the device was NOT wiped and local pairing is deliberately
+    /// left intact so the user can retry.
+    fn action_factory_reset(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.set_msg(
+            "Wiping device — touch an enrolled finger to authorize…",
+            MessageStyle::Red,
+        );
+
+        let tx = self.action_tx.clone();
+        thread::spawn(move || {
+            let result = DaemonClient::connect().and_then(|mut c| {
+                c.send_with_timeout("PAIR:FACTORY_RESET", std::time::Duration::from_secs(60))
+            });
+            match result {
+                Ok(rsp) if rsp == "OK:RESET" => {
+                    let _ = tx.send(ActionResult::Message(
+                        "Device wiped and pairing cleared.".into(),
+                        MessageStyle::Green,
+                    ));
+                }
+                Ok(rsp) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!(
+                            "Factory reset failed: {}. Device was NOT wiped — this computer is still paired.",
+                            rsp
+                        ),
+                        MessageStyle::Red,
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(ActionResult::Message(
+                        format!(
+                            "Factory reset error: {}. Device was NOT wiped — this computer is still paired.",
+                            e
+                        ),
+                        MessageStyle::Red,
+                    ));
+                }
+            }
+            let _ = tx.send(ActionResult::Refresh);
+            let _ = tx.send(ActionResult::Done);
+        });
     }
 
     pub fn action_pair(&mut self) {
@@ -639,24 +1113,98 @@ impl App {
             return;
         }
 
+        // Binding the SECOND host is two physical actions — an enrolled
+        // fingerprint, THEN the button — not one. The slot picture is already
+        // in hand from refresh(), so this costs no extra round trip.
+        let second_host = self.dual_host
+            && SlotStatus::Supported {
+                bitmap: self.slot_bitmap,
+                active: self.slot_active,
+            }
+            .is_second_host();
+
         self.busy = true;
         self.set_msg(
-            "Pairing… press the device button within 30s",
+            if second_host {
+                "Pairing as second host — (1/2) touch an enrolled finger, \
+                 (2/2) press the device button"
+            } else {
+                "Pairing… press the device button within 30s"
+            },
             MessageStyle::Yellow,
         );
 
         let tx = self.action_tx.clone();
+        // Stops the progress poller once PAIR:START has returned.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Progress poller. PAIR:START blocks for the whole flow and the daemon
+        // serves one request per connection, so step feedback has to come from
+        // a second connection — same shape as `run_pair` in commands/pair.rs.
+        {
+            let tx = tx.clone();
+            let done = done.clone();
+            thread::spawn(move || {
+                let mut last = String::new();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(300));
+                    let Ok(line) = DaemonClient::connect().and_then(|mut c| c.send("PAIR:PROGRESS"))
+                    else {
+                        continue;
+                    };
+                    let stage = line.split(':').nth(1).unwrap_or("").to_string();
+                    if stage == last {
+                        continue;
+                    }
+                    last = stage.clone();
+                    // Step markers only for the second host: first-host
+                    // pairing is a single action, so "(2/2)" there would
+                    // invent a step that does not exist.
+                    let msg = match stage.as_str() {
+                        "WAIT_FP" => "(1/2) Waiting for your fingerprint on the device…",
+                        "WAIT_BUTTON" if second_host => {
+                            "(1/2) ✓ fingerprint accepted — (2/2) now press the device button"
+                        }
+                        "WAIT_BUTTON" => "Press the device button…",
+                        "ECDH" => "Button pressed — exchanging keys…",
+                        _ => continue,
+                    };
+                    let _ = tx.send(ActionResult::Message(msg.into(), MessageStyle::Yellow));
+                }
+            });
+        }
+
         thread::spawn(move || {
             let result = (|| -> Result<String, String> {
                 let mut client = DaemonClient::connect()?;
-                client.send("PAIR:START")
+                // Second-host enrollment is a 30 s fingerprint gate followed
+                // by a 30 s button window, so the 60 s default read timeout
+                // can expire while the daemon is still succeeding — the TUI
+                // would report a failure for a pairing that actually worked.
+                client.send_with_timeout("PAIR:START", std::time::Duration::from_secs(150))
             })();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
 
             match result {
-                Ok(rsp) if rsp.contains("PAIRED") => {
+                // Exact match against the full line, mirroring `run_pair` in
+                // commands/pair.rs: the daemon's success answer is literally
+                // "OK:PAIRED", while every failure is "ERROR:PAIRING_FAILED:…"
+                // — and "OK:UNPAIRED" contains "PAIRED" too.
+                Ok(rsp) if rsp == "OK:PAIRED" => {
                     let _ = tx.send(ActionResult::Message(
                         "Pairing successful.".into(),
                         MessageStyle::Green,
+                    ));
+                }
+                // The daemon refuses a second concurrent PAIR:START rather
+                // than stomping the progress of one already waiting on the
+                // user. That is not a generic failure.
+                Ok(rsp) if rsp == "ERROR:PAIRING_IN_PROGRESS" => {
+                    let _ = tx.send(ActionResult::Message(
+                        "Another pairing attempt is already in progress — wait for it to \
+                         finish or time out."
+                            .into(),
+                        MessageStyle::Yellow,
                     ));
                 }
                 Ok(rsp) => {
@@ -677,36 +1225,80 @@ impl App {
         });
     }
 
+    /// Unpair this computer. Goes through `SLOT:CLEAR` (not the old
+    /// `PAIR:RESET`) and decodes the answer with
+    /// `dual_host::classify_unpair_response` — same decoder as `unpair_own`
+    /// in `commands/pair.rs` — rather than a `contains("CLEARED")` check
+    /// that would also match `CLEARED_LOCAL_ONLY`.
+    ///
+    /// Deliberately NOT behind `guard_paired()`, matching the CLI's
+    /// `requires_pairing` table: an unpair that ran while the device was
+    /// unreachable clears local pairing and asks to be repeated while
+    /// connected, and a local-pairing guard would make that impossible to
+    /// follow. The authority for the clear lives on the device's own link.
     pub fn action_unpair(&mut self) {
-        if !self.guard_paired() {
-            return;
-        }
         if self.busy {
             return;
         }
         self.busy = true;
-        self.set_msg("Resetting pairing…", MessageStyle::Yellow);
+        self.set_msg("Unpairing this computer…", MessageStyle::Yellow);
 
         let tx = self.action_tx.clone();
         thread::spawn(move || {
             let result = (|| -> Result<String, String> {
                 let mut client = DaemonClient::connect()?;
-                client.send("PAIR:RESET")
+                client.send("SLOT:CLEAR")
             })();
 
             match result {
-                Ok(rsp) if rsp.contains("RESET") => {
-                    let _ = tx.send(ActionResult::Message(
-                        "Pairing cleared.".into(),
-                        MessageStyle::Green,
-                    ));
-                }
-                Ok(rsp) => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("Unpair failed: {}", rsp),
-                        MessageStyle::Red,
-                    ));
-                }
+                Ok(rsp) => match classify_unpair_response(&rsp) {
+                    UnpairOutcome::Cleared => {
+                        let _ = tx.send(ActionResult::Message(
+                            "This computer unpaired.".into(),
+                            MessageStyle::Green,
+                        ));
+                    }
+                    UnpairOutcome::ClearedUnconfirmed => {
+                        let _ = tx.send(ActionResult::Message(
+                            "This computer unpaired (device likely rebooted after clearing; \
+                             on firmware < 1.6.12 it may still hold this slot — check slot status)."
+                                .into(),
+                            MessageStyle::Yellow,
+                        ));
+                    }
+                    UnpairOutcome::ClearedLocalOnly => {
+                        let _ = tx.send(ActionResult::Message(
+                            "Local pairing cleared, but the device was unreachable — its slot \
+                             still holds this host's key. Re-run this while connected."
+                                .into(),
+                            MessageStyle::Yellow,
+                        ));
+                    }
+                    UnpairOutcome::ClearedSlotUnpaired => {
+                        let _ = tx.send(ActionResult::Message(
+                            "Local pairing cleared — nothing on the device changed. It is \
+                             sitting on an empty slot and refuses every command; if this \
+                             host's key is in the other slot it is still there. Touch the \
+                             host-switch finger to bring the device back to it."
+                                .into(),
+                            MessageStyle::Yellow,
+                        ));
+                    }
+                    UnpairOutcome::Refused => {
+                        let _ = tx.send(ActionResult::Message(
+                            "The device refused to clear this slot. Nothing cleared — this \
+                             computer is still paired."
+                                .into(),
+                            MessageStyle::Red,
+                        ));
+                    }
+                    UnpairOutcome::Failed => {
+                        let _ = tx.send(ActionResult::Message(
+                            format!("Unpair failed: {}", rsp),
+                            MessageStyle::Red,
+                        ));
+                    }
+                },
                 Err(e) => {
                     let _ = tx.send(ActionResult::Message(
                         format!("Unpair error: {}", e),

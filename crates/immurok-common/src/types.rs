@@ -97,15 +97,79 @@ impl EnrollEvent {
     }
 }
 
-/// Helper to check fingerprint bitmap
+/// Pairing progress, polled over `PAIR:PROGRESS`.
+///
+/// The daemon serves exactly one request per connection, so progress cannot
+/// be streamed on the connection that is blocked inside PAIR:START — the
+/// client opens a second connection and polls, same shape as FP:STATUS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PairProgress {
+    #[default]
+    Idle,
+    /// Second-host enrollment: the device wants an already-enrolled finger.
+    WaitFp,
+    /// Waiting for the physical button press.
+    WaitButton,
+    /// Button pressed; the device is running ECDH.
+    Ecdh,
+    Done,
+    Failed,
+}
+
+impl PairProgress {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::WaitFp => "WAIT_FP",
+            Self::WaitButton => "WAIT_BUTTON",
+            Self::Ecdh => "ECDH",
+            Self::Done => "DONE",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// Enrolled slot indices. Covers all 6 physical slots — index 5 is the
+/// host-switch finger, which callers distinguish via
+/// `protocol::SWITCH_FINGER_SLOT`.
 pub fn fp_bitmap_slots(bitmap: u8) -> Vec<u8> {
-    (0..5).filter(|i| bitmap & (1 << i) != 0).collect()
+    (0..crate::protocol::TOTAL_FINGERPRINT_SLOTS)
+        .filter(|i| bitmap & (1 << i) != 0)
+        .collect()
 }
 
 /// Helper to format fingerprint bitmap for display
 pub fn fp_bitmap_display(bitmap: u8) -> String {
-    (0..5)
+    (0..crate::protocol::TOTAL_FINGERPRINT_SLOTS)
         .map(|i| if bitmap & (1 << i) != 0 { "[■]" } else { "[ ]" })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_progress_wire_names_are_stable() {
+        // The CLI matches on these strings to drive the two-step guide.
+        assert_eq!(PairProgress::Idle.as_wire(), "IDLE");
+        assert_eq!(PairProgress::WaitFp.as_wire(), "WAIT_FP");
+        assert_eq!(PairProgress::WaitButton.as_wire(), "WAIT_BUTTON");
+        assert_eq!(PairProgress::Ecdh.as_wire(), "ECDH");
+        assert_eq!(PairProgress::Done.as_wire(), "DONE");
+        assert_eq!(PairProgress::Failed.as_wire(), "FAILED");
+        assert_eq!(PairProgress::default(), PairProgress::Idle);
+    }
+
+    #[test]
+    fn bitmap_helpers_cover_the_switch_slot() {
+        // Slot 5 is the host-switch finger; it must show up in listings,
+        // otherwise a user cannot tell whether switching is set up.
+        assert_eq!(fp_bitmap_slots(0b0010_0001), vec![0, 5]);
+        assert_eq!(
+            fp_bitmap_display(0b0010_0001),
+            "[■] [ ] [ ] [ ] [ ] [■]"
+        );
+    }
 }

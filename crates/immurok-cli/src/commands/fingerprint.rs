@@ -20,10 +20,24 @@ pub fn run_list() {
             let slots = immurok_common::types::fp_bitmap_slots(bitmap);
             let display = immurok_common::types::fp_bitmap_display(bitmap);
             println!("Fingerprints: {}", display);
-            if slots.is_empty() {
-                println!("No fingerprints enrolled.");
+            let auth: Vec<u8> = slots
+                .iter()
+                .copied()
+                .filter(|s| *s < immurok_common::protocol::MAX_FINGERPRINT_SLOTS)
+                .collect();
+            if auth.is_empty() {
+                println!("No authentication fingerprints enrolled.");
             } else {
-                println!("Enrolled slots: {:?}", slots);
+                println!("Authentication slots: {:?}", auth);
+            }
+            let switch = immurok_common::protocol::SWITCH_FINGER_SLOT;
+            if bitmap & (1 << switch) != 0 {
+                println!("Host-switch finger (slot {}): enrolled", switch);
+            } else {
+                println!(
+                    "Host-switch finger (slot {}): not enrolled — 'immurok-cli fp enroll {}'",
+                    switch, switch
+                );
             }
         } else {
             println!("Response: {}", rsp);
@@ -35,11 +49,12 @@ pub fn run_list() {
 
 /// Enroll a fingerprint to a slot (with live progress).
 pub fn run_enroll(slot: u8) {
-    if slot >= immurok_common::protocol::MAX_FINGERPRINT_SLOTS {
+    if slot > immurok_common::protocol::SWITCH_FINGER_SLOT {
         super::error_exit(&format!(
-            "Invalid slot {}. Must be 0-{}.",
+            "Invalid slot {}. Use 0-{} for authentication, or {} for the host-switch finger.",
             slot,
-            immurok_common::protocol::MAX_FINGERPRINT_SLOTS - 1
+            immurok_common::protocol::MAX_FINGERPRINT_SLOTS - 1,
+            immurok_common::protocol::SWITCH_FINGER_SLOT
         ));
     }
 
@@ -61,6 +76,11 @@ pub fn run_enroll(slot: u8) {
         .is_some_and(|bitmap| bitmap != 0);
     if has_fingerprints {
         println!("Verify with an enrolled finger to authorize enrollment…");
+    }
+
+    if slot == immurok_common::protocol::SWITCH_FINGER_SLOT {
+        println!("Slot {} is the host-switch finger: touching it switches the device", slot);
+        println!("between its two paired hosts. It never authenticates anything.");
     }
 
     let mut client = match DaemonClient::connect() {
@@ -165,11 +185,12 @@ pub fn run_enroll(slot: u8) {
 
 /// Delete a fingerprint from a slot.
 pub fn run_delete(slot: u8) {
-    if slot >= immurok_common::protocol::MAX_FINGERPRINT_SLOTS {
+    if slot > immurok_common::protocol::SWITCH_FINGER_SLOT {
         super::error_exit(&format!(
-            "Invalid slot {}. Must be 0-{}.",
+            "Invalid slot {}. Use 0-{} for authentication, or {} for the host-switch finger.",
             slot,
-            immurok_common::protocol::MAX_FINGERPRINT_SLOTS - 1
+            immurok_common::protocol::MAX_FINGERPRINT_SLOTS - 1,
+            immurok_common::protocol::SWITCH_FINGER_SLOT
         ));
     }
 

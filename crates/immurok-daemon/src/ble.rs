@@ -24,9 +24,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use zbus::zvariant::OwnedValue;
 
+use immurok_common::dual_host::{classify_pair_button, parse_slot_status, PairButtonEvent};
 use immurok_common::protocol::*;
 use immurok_common::security;
-use immurok_common::types::{EnrollEvent, PairingData};
+use immurok_common::types::{EnrollEvent, PairProgress, PairingData};
 
 use crate::coordinator::{BleCommand, BleResult, Coordinator};
 use crate::keystore;
@@ -45,6 +46,7 @@ pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCo
         }
         coordinator.is_connected.store(false, Ordering::Relaxed);
         coordinator.is_device_verified.store(false, Ordering::Relaxed);
+        coordinator.challenge_verified.store(false, Ordering::Relaxed);
         *coordinator.device_status.write().await = None;
 
         // Backoff before retrying. A GATT discovery failure (transient BlueZ
@@ -95,6 +97,10 @@ struct BleState {
     /// PAIR_INIT completion still arrives via pending_response as
     /// [0x30][pubkey:33B] once the device finishes ECDH.
     pair_button_tx: Option<oneshot::Sender<u8>>,
+    /// Set when the device reports `[0x34][0x03]` — second-host enrollment
+    /// passed the fingerprint half and moved on to the button. Read by
+    /// wait_pair_button to extend its window.
+    pair_button_fp_ok: bool,
 }
 
 impl BleState {
@@ -109,6 +115,7 @@ impl BleState {
             pair_fp_gate: false,
             pair_button_pending: false,
             pair_button_tx: None,
+            pair_button_fp_ok: false,
         }
     }
 }
@@ -650,6 +657,7 @@ async fn connect_and_serve(
 
     coordinator.is_connected.store(true, Ordering::Relaxed);
     coordinator.is_device_verified.store(false, Ordering::Relaxed);
+    coordinator.challenge_verified.store(false, Ordering::Relaxed);
 
     let mut state = BleState::new();
     let mut notify_rx = notify_rx;
@@ -702,6 +710,10 @@ async fn connect_and_serve(
                     if security::verify_challenge_response(&shared_key, &nonce, &device_hmac) {
                         info!("Challenge-Response: verified");
                         coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                        // Real proof, unlike the optimistic fallbacks below:
+                        // the shared key is per-slot, so a genuine verify
+                        // means the slot the device is presenting is ours.
+                        coordinator.challenge_verified.store(true, Ordering::Relaxed);
                     } else {
                         warn!("Challenge-Response: HMAC mismatch — degraded mode");
                     }
@@ -765,6 +777,7 @@ fn abort_pending(state: &mut BleState) {
     state.auth_pending = false;
     if let Some(tx) = state.pair_button_tx.take() { let _ = tx.send(PAIR_BUTTON_CANCELLED); }
     state.pair_button_pending = false;
+    state.pair_button_fp_ok = false;
     state.pending_response.take();
 }
 
@@ -834,24 +847,57 @@ async fn route_notification(
     }
 
     // 3b. Pair button event: [0x34, status]
-    //   0x01 CONFIRMED: device about to run ECDH; the actual [0x30][pubkey]
-    //                   arrives later via pending_response (do nothing here).
-    //   0x00 TIMEOUT / 0x02 CANCELLED: terminal — wake wait_pair_button.
-    if first == CMD_PAIR_BUTTON && len == 2 {
+    //
+    // Every status is handled here and the block always returns. Falling
+    // through on an unknown code is what broke second-host pairing: the
+    // 0x03 "fingerprint accepted" progress notification landed in the
+    // generic command-response path below and resolved the oneshot that
+    // pairing had armed for [0x30][pubkey:33], so do_pair rejected it as a
+    // malformed PAIR_INIT answer and the second host could never bind.
+    // The length check is part of the guard, not part of the match: a
+    // malformed [0x34] or [0x34, x, y] frame must not fall through to the
+    // generic command-response path either. That path is what resolves the
+    // oneshot armed for [0x30][pubkey:33], so ANY 0x34 frame reaching it can
+    // break pairing — the exact shape of the bug above, just via a bad
+    // length instead of a bad status code.
+    if first == CMD_PAIR_BUTTON {
+        if len != 2 {
+            warn!("Pair button notification with unexpected length {} ({:?}) — ignored", len, data);
+            return;
+        }
         let status = data[1];
         info!("Pair button event: 0x{:02x}", status);
-        if status == PAIR_BUTTON_CONFIRMED {
-            return;
-        }
-        if status == PAIR_BUTTON_TIMEOUT || status == PAIR_BUTTON_CANCELLED {
-            if state.pair_button_pending {
-                if let Some(tx) = state.pair_button_tx.take() {
-                    let _ = tx.send(status);
+        match classify_pair_button(status) {
+            PairButtonEvent::Confirmed => {
+                // The device is running ECDH now; completion still arrives
+                // separately as [0x30][pubkey:33] via pending_response.
+                if state.pair_button_pending {
+                    coordinator.set_pair_progress(PairProgress::Ecdh).await;
+                } else {
+                    info!("Pair button confirm with no pairing in flight — ignored");
                 }
             }
-            return;
+            PairButtonEvent::FingerprintOk => {
+                if state.pair_button_pending {
+                    info!("Second-host enrollment: fingerprint accepted, waiting for button");
+                    state.pair_button_fp_ok = true;
+                    coordinator.set_pair_progress(PairProgress::WaitButton).await;
+                } else {
+                    info!("Fingerprint-ok pair event with no pairing in flight — ignored");
+                }
+            }
+            PairButtonEvent::Terminal(s) => {
+                if state.pair_button_pending {
+                    if let Some(tx) = state.pair_button_tx.take() {
+                        let _ = tx.send(s);
+                    }
+                }
+            }
+            PairButtonEvent::Ignore => {
+                warn!("Unknown pair button status 0x{:02x} — ignored", status);
+            }
         }
-        // Unknown status: fall through to generic handling.
+        return;
     }
 
     // 4. FP-gate approved (0x10) — swallow
@@ -1389,6 +1435,23 @@ async fn do_pair(
 ) -> BleResult {
     let mut retries = 3u8;
 
+    // Read slot occupancy BEFORE PAIR_INIT. Sending both concurrently would
+    // let WAIT_BUTTON arrive first and the progress reporting would pick the
+    // wrong branch (dual-host-port.md §3). Here both run on this same BLE
+    // worker, so ordering is guaranteed by construction.
+    let second_host = {
+        let frame = send_command_inner(
+            helper, state, coordinator, notify_rx,
+            CMD_SLOT_STATUS, &[], BLE_COMMAND_TIMEOUT_SECS,
+        )
+        .await
+        .unwrap_or_default();
+        parse_slot_status(&frame).is_second_host()
+    };
+    if second_host {
+        info!("Slot is empty while the other is taken — enrolling as second host");
+    }
+
     loop {
         // PAIR_INIT
         let rsp = send_command_inner(helper, state, coordinator, notify_rx, CMD_PAIR_INIT, &[], 30).await?;
@@ -1414,7 +1477,13 @@ async fn do_pair(
         // Response: [0x30, 0xF0]. The real [0x30][pubkey:33B] arrives after
         // the user short-presses the button and the device finishes ECDH.
         let rsp = if rsp.len() == 2 && rsp[0] == CMD_PAIR_INIT && rsp[1] == RSP_PAIR_WAIT_BUTTON {
-            info!("PAIR_INIT accepted; press the device button within 30s to confirm");
+            if second_host {
+                info!("PAIR_INIT accepted; touch an enrolled finger, then press the device button");
+                coordinator.set_pair_progress(PairProgress::WaitFp).await;
+            } else {
+                info!("PAIR_INIT accepted; press the device button within 30s to confirm");
+                coordinator.set_pair_progress(PairProgress::WaitButton).await;
+            }
             wait_pair_button(helper, state, coordinator, notify_rx).await?
         } else if rsp.len() == 1 && rsp[0] == RSP_WAIT_FP {
             // Backwards compat with pre-1.2.3 firmware that uses FP-gate during pair
@@ -1491,10 +1560,19 @@ async fn wait_pair_button(
 
     state.pair_button_pending = true;
     state.pair_button_tx = Some(btn_tx);
+    state.pair_button_fp_ok = false;
     state.pending_response.take();
     state.pending_response = Some(cmd_tx);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(BLE_PAIR_BUTTON_TIMEOUT_SECS);
+    // First-host pairing is one human action (press the button), which the
+    // 35 s window covers. Second-host enrollment is two independent ones —
+    // a 30 s fingerprint gate followed by a 30 s button window — and never
+    // fits. Extend once when the device reports the fingerprint half is
+    // done. Once only: otherwise a device that keeps emitting 0x03 could
+    // pin the BLE worker here forever.
+    let mut deadline =
+        tokio::time::Instant::now() + Duration::from_secs(BLE_PAIR_BUTTON_TIMEOUT_SECS);
+    let mut extended = false;
     let result = loop {
         tokio::select! {
             r = &mut cmd_rx => {
@@ -1517,6 +1595,12 @@ async fn wait_pair_button(
             }
             Some(data) = notify_rx.recv() => {
                 route_notification(&data, state, coordinator, helper).await;
+                if state.pair_button_fp_ok && !extended {
+                    extended = true;
+                    deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(BLE_PAIR_BUTTON_TIMEOUT_SECS);
+                    info!("Pair button window extended: fingerprint gate passed");
+                }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 break Err("pair timeout: no button event".to_string());
@@ -1526,6 +1610,7 @@ async fn wait_pair_button(
 
     state.pair_button_pending = false;
     state.pair_button_tx.take();
+    state.pair_button_fp_ok = false;
     result
 }
 
@@ -1657,6 +1742,14 @@ async fn handle_ble_command(
         }
         BleCommand::Pair { reply } => {
             let result = do_pair(helper, state, coordinator, notify_rx).await;
+            // Single place that covers every early return inside do_pair.
+            coordinator
+                .set_pair_progress(if result.is_ok() {
+                    PairProgress::Done
+                } else {
+                    PairProgress::Failed
+                })
+                .await;
             let _ = reply.send(result);
         }
         BleCommand::AuthRequest { reply } => {

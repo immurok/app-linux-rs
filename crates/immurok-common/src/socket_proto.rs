@@ -19,7 +19,11 @@
 //! | GATE:CANCEL         | `GATE:CANCEL`                      |
 //! | PAIR:STATUS         | `PAIR:STATUS`                      |
 //! | PAIR:START          | `PAIR:START`                       |
-//! | PAIR:RESET          | `PAIR:RESET`                       |
+//! | PAIR:PROGRESS       | `PAIR:PROGRESS`                    |
+//! | PAIR:RESET (alias)  | `PAIR:RESET` → SLOT:CLEAR          |
+//! | PAIR:FACTORY_RESET  | `PAIR:FACTORY_RESET`               |
+//! | SLOT:STATUS         | `SLOT:STATUS`                      |
+//! | SLOT:CLEAR          | `SLOT:CLEAR` / `SLOT:CLEAR:<n>`    |
 //! | SET:UNLOCK_SUDO     | `SET:UNLOCK_SUDO:1` / `:0`         |
 //! | SET:UNLOCK_POLKIT   | `SET:UNLOCK_POLKIT:1` / `:0`       |
 //! | SET:UNLOCK_SCREEN   | `SET:UNLOCK_SCREEN:1` / `:0`       |
@@ -92,7 +96,15 @@ pub enum Request {
     GateCancel,
     PairStatus,
     PairStart,
-    PairReset,
+    /// Dual-host: read slot occupancy. Answerable while unpaired — that is
+    /// how a new host learns it is the second one.
+    SlotStatus,
+    /// Dual-host: clear a host slot. `None` = the slot this host uses.
+    SlotClear { slot: Option<u8> },
+    /// Wipe the device: all fingerprints, all keys, both host slots.
+    FactoryReset,
+    /// Poll pairing progress (see PairProgress).
+    PairProgress,
     SetUnlockSudo(bool),
     SetUnlockPolkit(bool),
     SetUnlockScreen(bool),
@@ -243,8 +255,30 @@ pub fn parse_request(line: &str) -> Result<Request, ParseError> {
             match sub {
                 "STATUS" => Ok(Request::PairStatus),
                 "START" => Ok(Request::PairStart),
-                "RESET" => Ok(Request::PairReset),
+                "PROGRESS" => Ok(Request::PairProgress),
+                // Deprecated alias. A pre-dual-host CLI sends PAIR:RESET for
+                // `unpair`; back then that factory-reset the device. Redirect
+                // it to the safe meaning so a stale client cannot wipe the
+                // other host's slot and every SSH private key.
+                "RESET" => Ok(Request::SlotClear { slot: None }),
+                "FACTORY_RESET" => Ok(Request::FactoryReset),
                 other => Err(ParseError::UnknownCommand(format!("PAIR:{other}"))),
+            }
+        }
+
+        "SLOT" => {
+            let sub = require(&parts, 1, "SLOT", "subcommand")?;
+            match sub {
+                "STATUS" => Ok(Request::SlotStatus),
+                "CLEAR" => {
+                    // Bare SLOT:CLEAR targets this host's own slot.
+                    let slot = match parts.get(2) {
+                        None => None,
+                        Some(_) => Some(parse_u8(&parts, 2, "SLOT:CLEAR", "slot")?),
+                    };
+                    Ok(Request::SlotClear { slot })
+                }
+                other => Err(ParseError::UnknownCommand(format!("SLOT:{other}"))),
             }
         }
 
@@ -476,7 +510,6 @@ mod tests {
     fn test_parse_pair_commands() {
         assert_eq!(parse_request("PAIR:STATUS").unwrap(), Request::PairStatus);
         assert_eq!(parse_request("PAIR:START").unwrap(), Request::PairStart);
-        assert_eq!(parse_request("PAIR:RESET").unwrap(), Request::PairReset);
     }
 
     #[test]
@@ -540,5 +573,56 @@ mod tests {
         // Leading/trailing whitespace (e.g. Windows-style \r\n lines) must be handled.
         let req = parse_request("  AUTH:bob:polkit  ").expect("parse failed");
         assert_eq!(req, Request::Auth { user: "bob".into(), service: "polkit".into() });
+    }
+
+    #[test]
+    fn parse_slot_status() {
+        assert_eq!(parse_request("SLOT:STATUS").unwrap(), Request::SlotStatus);
+    }
+
+    #[test]
+    fn parse_slot_clear_own_and_targeted() {
+        assert_eq!(
+            parse_request("SLOT:CLEAR").unwrap(),
+            Request::SlotClear { slot: None }
+        );
+        assert_eq!(
+            parse_request("SLOT:CLEAR:2").unwrap(),
+            Request::SlotClear { slot: Some(2) }
+        );
+    }
+
+    #[test]
+    fn parse_slot_clear_rejects_non_numeric_slot() {
+        assert!(matches!(
+            parse_request("SLOT:CLEAR:x"),
+            Err(ParseError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn pair_reset_is_an_alias_for_clearing_own_slot() {
+        // Regression pin. PAIR:RESET used to mean "factory reset the
+        // device", which under dual-host destroys the other host's slot
+        // and every SSH private key on the device. A pre-dual-host CLI
+        // still sends it for `unpair`, so it must land on the safe
+        // meaning rather than be rejected.
+        assert_eq!(
+            parse_request("PAIR:RESET").unwrap(),
+            Request::SlotClear { slot: None }
+        );
+    }
+
+    #[test]
+    fn parse_factory_reset() {
+        assert_eq!(
+            parse_request("PAIR:FACTORY_RESET").unwrap(),
+            Request::FactoryReset
+        );
+    }
+
+    #[test]
+    fn parse_pair_progress() {
+        assert_eq!(parse_request("PAIR:PROGRESS").unwrap(), Request::PairProgress);
     }
 }

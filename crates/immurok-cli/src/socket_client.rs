@@ -4,6 +4,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+/// Default read timeout. Long enough for any single device round-trip,
+/// short enough that a wedged daemon surfaces within a minute.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Client for the immurok daemon Unix socket.
 pub struct DaemonClient {
     stream: UnixStream,
@@ -25,7 +29,7 @@ impl DaemonClient {
         })?;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
+            .set_read_timeout(Some(DEFAULT_READ_TIMEOUT))
             .map_err(|e| format!("Failed to set read timeout: {}", e))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
@@ -51,4 +55,28 @@ impl DaemonClient {
         Ok(line.trim().to_string())
     }
 
+    /// Send a request and wait for the answer with a per-call read timeout.
+    ///
+    /// Binding a second host is two independent human actions — a 30 s
+    /// fingerprint gate then a 30 s button window — and blows past the
+    /// default. Without this the daemon would still finish the pairing while
+    /// the CLI had already printed a failure.
+    ///
+    /// The default deliberately stays 60 s for everything else: raising it
+    /// globally would make a wedged daemon take minutes to surface.
+    ///
+    /// `self.reader` wraps a dup of `self.stream`; dup'd descriptors share
+    /// the socket's SO_RCVTIMEO, so setting it here does apply to the read.
+    pub fn send_with_timeout(
+        &mut self,
+        request: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+        let result = self.send(request);
+        let _ = self.stream.set_read_timeout(Some(DEFAULT_READ_TIMEOUT));
+        result
+    }
 }

@@ -14,8 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
+use immurok_common::dual_host::{self, ClearPath, SlotClearAck, SlotStatus};
 use immurok_common::protocol;
 use immurok_common::socket_proto::{parse_request, serialize_response, Request, Response};
+use immurok_common::types::PairProgress;
 
 use crate::coordinator::Coordinator;
 use crate::ota;
@@ -281,7 +283,10 @@ async fn dispatch_request(
         Request::GateCancel => handle_gate_cancel(coord).await,
         Request::PairStatus => handle_pair_status(coord).await,
         Request::PairStart => handle_pair_start(coord).await,
-        Request::PairReset => handle_pair_reset(coord).await,
+        Request::PairProgress => handle_pair_progress(coord).await,
+        Request::SlotStatus => handle_slot_status(coord).await,
+        Request::SlotClear { slot } => handle_slot_clear(coord, slot).await,
+        Request::FactoryReset => handle_factory_reset(coord).await,
         Request::SetUnlockSudo(v) => handle_set_setting(coord, "unlock_sudo", v).await,
         Request::SetUnlockPolkit(v) => handle_set_setting(coord, "unlock_polkit", v).await,
         Request::SetUnlockScreen(v) => handle_set_setting(coord, "unlock_screen", v).await,
@@ -616,7 +621,9 @@ async fn handle_fp_list(coord: &Arc<Coordinator>) -> Response {
 }
 
 async fn handle_fp_enroll(coord: &Arc<Coordinator>, slot: u8, stream: &mut UnixStream) -> Response {
-    if slot >= protocol::MAX_FINGERPRINT_SLOTS {
+    // Slots 0-4 authenticate; slot 5 is the dedicated host-switch finger.
+    // Both are enrollable — MAX_FINGERPRINT_SLOTS alone would reject slot 5.
+    if slot > protocol::SWITCH_FINGER_SLOT {
         return Response::Error("INVALID_SLOT".into());
     }
     if !coord.is_connected.load(Ordering::Relaxed) {
@@ -804,6 +811,13 @@ async fn handle_pair_start(coord: &Arc<Coordinator>) -> Response {
         return Response::Error("NOT_CONNECTED".into());
     }
 
+    // Atomic check-and-set: a second PAIR:START while one is genuinely in
+    // flight (WaitFp/WaitButton/Ecdh) must not clobber the first attempt's
+    // progress with a spurious Idle.
+    if !coord.try_begin_pairing().await {
+        return Response::Error("PAIRING_IN_PROGRESS".into());
+    }
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     if coord
         .ble_cmd_tx
@@ -811,39 +825,239 @@ async fn handle_pair_start(coord: &Arc<Coordinator>) -> Response {
         .await
         .is_err()
     {
+        coord.set_pair_progress(PairProgress::Failed).await;
         return Response::Error("BLE_CHANNEL_CLOSED".into());
     }
 
     match rx.await {
         Ok(Ok(_)) => Response::Ok("PAIRED".into()),
         Ok(Err(e)) => Response::Error(format!("PAIRING_FAILED:{}", e)),
-        Err(_) => Response::Error("PAIR_REPLY_DROPPED".into()),
+        Err(_) => {
+            coord.set_pair_progress(PairProgress::Failed).await;
+            Response::Error("PAIR_REPLY_DROPPED".into())
+        }
     }
 }
 
-async fn handle_pair_reset(coord: &Arc<Coordinator>) -> Response {
-    // Send factory reset to device if connected and paired
-    let is_paired = coord.pairing.read().await.is_some();
-    if is_paired && coord.is_connected.load(Ordering::Relaxed) {
-        // Compute reset HMAC
-        let pairing = coord.pairing.read().await;
-        if let Some(ref p) = *pairing {
-            let hmac = immurok_common::security::compute_reset_hmac(&p.shared_key);
-            drop(pairing);
-            let _ = coord
-                .ble_send(protocol::CMD_FACTORY_RESET, hmac.to_vec())
-                .await;
+async fn handle_pair_progress(coord: &Arc<Coordinator>) -> Response {
+    Response::Ok(coord.pair_progress().await.as_wire().to_string())
+}
+
+/// Drop this host's pairing material. Idempotent.
+async fn clear_local_pairing(coord: &Arc<Coordinator>) {
+    let _ = immurok_common::security::clear_pairing();
+    *coord.pairing.write().await = None;
+    // Both verification flags derive from the shared key we just dropped;
+    // leaving them set would keep a stale "device verified" badge and, worse,
+    // keep claiming one of the device's slots is ours.
+    coord.is_device_verified.store(false, Ordering::Relaxed);
+    coord.challenge_verified.store(false, Ordering::Relaxed);
+    info!("Local pairing data cleared");
+}
+
+/// Read slot occupancy off the device.
+///
+/// `ble_send` hands back the response frame already split into
+/// `(frame[0], frame[1..])`; the decoder works on the whole wire frame, so
+/// stitch it back together rather than duplicating the format knowledge here.
+async fn query_slot_status(coord: &Arc<Coordinator>) -> Result<SlotStatus, String> {
+    let (first, rest) = coord.ble_send(protocol::CMD_SLOT_STATUS, vec![]).await?;
+    let mut frame = Vec::with_capacity(1 + rest.len());
+    frame.push(first);
+    frame.extend_from_slice(&rest);
+    Ok(dual_host::parse_slot_status(&frame))
+}
+
+async fn handle_slot_status(coord: &Arc<Coordinator>) -> Response {
+    if !coord.is_connected.load(Ordering::Relaxed) {
+        return Response::Error("NOT_CONNECTED".into());
+    }
+    match query_slot_status(coord).await {
+        Ok(SlotStatus::Supported { bitmap, active }) => {
+            // Fourth field: which slot belongs to THIS host, or 0 when that
+            // cannot be proven. The shared key is per-slot, so a genuine
+            // challenge-response verify means the slot the device is
+            // presenting is ours. Anything weaker — the device sitting on an
+            // empty slot, or the optimistic `is_device_verified` fallbacks —
+            // is not proof, and a UI that guesses here mislabels the user's
+            // own pairing as somebody else's.
+            let occupied = bitmap & (1 << (active - 1)) != 0;
+            let mine = if occupied
+                && coord.challenge_verified.load(Ordering::Relaxed)
+                && coord.pairing.read().await.is_some()
+            {
+                active
+            } else {
+                0
+            };
+            Response::Ok(format!("{}:{}:{}", bitmap, active, mine))
+        }
+        Ok(SlotStatus::Unsupported) => Response::Ok("UNSUPPORTED".into()),
+        Err(e) => Response::Error(format!("SLOT_STATUS_FAILED:{}", e)),
+    }
+}
+
+/// Clear this host's own slot.
+///
+/// The device answers `[0x3C][status]` and then reboots ~50 ms later on
+/// success, so the answer frequently dies with the link — and by then the
+/// slot on the device is already gone. Local pairing data is therefore
+/// dropped on confirmed clear, on a lost/garbled answer, and on a link
+/// error: re-pairing once too often costs far less than the split state
+/// where this host still believes it is paired while the device slot is
+/// empty (the user then sees "unpair does nothing").
+///
+/// The one case that must NOT drop local pairing is an explicit refusal
+/// (`[0x3C][non-zero other than 0xF2]`): the device did not reboot, the slot
+/// is still occupied, and the link is still up — dropping local state here
+/// would create the reverse split (a zombie slot the host has forgotten
+/// about, occupying one of only two).
+///
+/// `0xF2` (SEC_ERR_NOT_PAIRED) is deliberately NOT in that exception. It
+/// means the slot the device is presenting is empty, so the firmware's
+/// pre-pair whitelist refuses everything — including this command. Treating
+/// it as a refusal is what deadlocked a user in the field: the device had
+/// switched to its other (empty) slot, so `unpair` could never clear local
+/// state, and `pair` bails out whenever local state exists. Nothing on the
+/// device changes in this case, so dropping the now-unusable local record is
+/// both safe and the only way out.
+async fn clear_own_slot(coord: &Arc<Coordinator>, target: Option<u8>) -> Response {
+    let payload = target.map(|s| vec![s]).unwrap_or_default();
+    match coord.ble_send(protocol::CMD_SLOT_CLEAR, payload).await {
+        Ok((first, rest)) => match dual_host::classify_slot_clear_ack(first, &rest) {
+            SlotClearAck::Cleared => {
+                clear_local_pairing(coord).await;
+                Response::Ok("CLEARED".into())
+            }
+            SlotClearAck::SlotUnpaired => {
+                warn!(
+                    "SLOT_CLEAR (own): device is sitting on an unpaired slot \
+                     (0xF2) — clearing local pairing only"
+                );
+                clear_local_pairing(coord).await;
+                Response::Ok("CLEARED_SLOT_UNPAIRED".into())
+            }
+            SlotClearAck::Refused => {
+                warn!("SLOT_CLEAR (own): device refused 0x{:02x} {:?}", first, rest);
+                Response::Error("SLOT_CLEAR_REFUSED".into())
+            }
+            SlotClearAck::Unrecognised => {
+                warn!("SLOT_CLEAR (own): unexpected response 0x{:02x} {:?}", first, rest);
+                clear_local_pairing(coord).await;
+                Response::Ok("CLEARED_UNCONFIRMED".into())
+            }
+        },
+        Err(e) => {
+            // Expected on the happy path: the reboot takes the answer with it.
+            info!("SLOT_CLEAR (own): no answer ({}) — device most likely rebooted after clearing", e);
+            clear_local_pairing(coord).await;
+            Response::Ok("CLEARED_UNCONFIRMED".into())
         }
     }
+}
 
-    // Clear local pairing data
-    let _ = immurok_common::security::clear_pairing();
-    {
-        let mut pairing = coord.pairing.write().await;
-        *pairing = None;
+/// Dual-host slot clear. `slot == None` means "the slot this host uses".
+///
+/// The two paths differ on the wire and cannot share a send call: own is
+/// ungated and reboots the device, other runs a fingerprint gate and keeps
+/// the link. So the path is resolved from SLOT_STATUS *before* sending.
+async fn handle_slot_clear(coord: &Arc<Coordinator>, slot: Option<u8>) -> Response {
+    if !coord.is_connected.load(Ordering::Relaxed) {
+        // Clearing a far slot needs a fingerprint on the device, so it
+        // cannot happen offline. Clearing our own can: drop local state and
+        // say plainly that the device side is untouched.
+        return match slot {
+            None => {
+                clear_local_pairing(coord).await;
+                Response::Ok("CLEARED_LOCAL_ONLY".into())
+            }
+            Some(_) => Response::Error("NOT_CONNECTED".into()),
+        };
     }
-    info!("Pairing data cleared");
-    Response::Ok("RESET".into())
+
+    // Only query the device when a target was named — a bare clear is
+    // always the own path and must keep working on firmware without 0x39.
+    let status = if slot.is_some() {
+        match query_slot_status(coord).await {
+            Ok(s) => s,
+            Err(e) => return Response::Error(format!("SLOT_STATUS_FAILED:{}", e)),
+        }
+    } else {
+        SlotStatus::Unsupported
+    };
+
+    match dual_host::resolve_clear_path(slot, status) {
+        ClearPath::Own => clear_own_slot(coord, slot).await,
+        ClearPath::Other(target) => {
+            match coord
+                .ble_send_fp_gated(protocol::CMD_SLOT_CLEAR, vec![target])
+                .await
+            {
+                Ok(_) => {
+                    info!("Slot {} cleared (other host)", target);
+                    Response::Ok("CLEARED".into())
+                }
+                Err(e) => Response::Error(format!("SLOT_CLEAR_FAILED:{}", e)),
+            }
+        }
+        ClearPath::InvalidSlot => Response::Error("INVALID_SLOT".into()),
+        ClearPath::Unsupported => Response::Error("DUAL_HOST_UNSUPPORTED".into()),
+    }
+}
+
+/// Wipe the device completely: every fingerprint (including the host-switch
+/// finger), every SSH/OTP/API key, and both host slots.
+///
+/// This used to be what `unpair` did. Under dual-host that destroys the
+/// *other* host's slot and all SSH private keys — which exist nowhere else —
+/// so it now lives behind its own command with its own confirmation.
+///
+/// Division of labour: `SLOT:CLEAR` (unpair) is for detaching from a device
+/// you no longer possess — it degrades gracefully offline by dropping local
+/// state alone. `FACTORY_RESET` is for wiping a device you ARE holding, so
+/// it requires a live connection and only drops local pairing once the
+/// device has confirmed the wipe. Clearing it on failure (or when merely
+/// offline) would strand the host with no pairing, a device that still has
+/// its old key/slots, and no way back except the destructive 3-second
+/// long-press — exactly the trap this task exists to close.
+async fn handle_factory_reset(coord: &Arc<Coordinator>) -> Response {
+    if !coord.is_connected.load(Ordering::Relaxed) {
+        return Response::Error("NOT_CONNECTED".into());
+    }
+
+    // Firmware never reads the payload or verifies an HMAC on
+    // CMD_FACTORY_RESET, so this is best-effort backward-compat, not a
+    // precondition: send the HMAC when we have local pairing to derive one
+    // from, otherwise an empty payload — honest about having no key rather
+    // than faking zeros.
+    let hmac = {
+        let pairing = coord.pairing.read().await;
+        pairing
+            .as_ref()
+            .map(|p| immurok_common::security::compute_reset_hmac(&p.shared_key))
+    };
+    let payload = hmac.map(|h| h.to_vec()).unwrap_or_default();
+
+    // Fingerprint-gated: with no prints enrolled the firmware answers
+    // RSP_OK immediately; with prints enrolled it answers RSP_WAIT_FP
+    // (0x11) and only wipes after a touch. Using plain ble_send here would
+    // report success without ever waiting for that touch.
+    match coord
+        .ble_send_fp_gated(protocol::CMD_FACTORY_RESET, payload)
+        .await
+    {
+        Ok((status, _))
+            if status == protocol::RSP_OK || status == protocol::RSP_FP_GATE_APPROVED =>
+        {
+            clear_local_pairing(coord).await;
+            Response::Ok("RESET".into())
+        }
+        Ok((status, _)) => {
+            warn!("FACTORY_RESET: device refused 0x{:02x}", status);
+            Response::Error(format!("FACTORY_RESET_FAILED:0x{:02x}", status))
+        }
+        Err(e) => Response::Error(format!("FACTORY_RESET_FAILED:{}", e)),
+    }
 }
 
 // ── AGENT_APPROVE ────────────────────────────────────────────

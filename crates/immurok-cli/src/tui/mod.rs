@@ -23,6 +23,11 @@ pub fn run() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    // Paint the empty frame BEFORE the first refresh. refresh() is synchronous
+    // and can spend seconds inside BLE round-trips, and we have already
+    // switched to the alternate screen — so refreshing first leaves the user
+    // staring at a black terminal for as long as the device takes to answer.
+    terminal.draw(|f| widgets::draw(f, &app))?;
     app.refresh();
     app.spawn_fw_silent_check();
 
@@ -71,7 +76,10 @@ pub fn run() -> io::Result<()> {
                         code => match app.tab {
                             Tab::Dashboard => match code {
                                 KeyCode::Char('p') => app.action_pair(),
-                                KeyCode::Char('u') => app.action_unpair(),
+                                // Goes through Mode::HostConfirm, the same
+                                // y/n gate as `H` → `u` — it used to unpair
+                                // on this single keystroke.
+                                KeyCode::Char('u') => app.request_unpair_self(),
                                 // Enrolls into the lowest empty slot —
                                 // no manual slot picking.
                                 KeyCode::Char('e') | KeyCode::Char('E') => app.auto_enroll(),
@@ -83,6 +91,7 @@ pub fn run() -> io::Result<()> {
                                 KeyCode::Char('L') => app.action_toggle_lock(),
                                 KeyCode::Char('h') => app.action_toggle_ssh(),
                                 KeyCode::Char('i') => app.action_info(),
+                                KeyCode::Char('H') => app.enter_host_menu(),
                                 KeyCode::Char('U') => app.fw_enter(),
                                 KeyCode::Esc => {
                                     // Cancel in-flight enrollment if any
@@ -184,10 +193,16 @@ pub fn run() -> io::Result<()> {
                         KeyCode::Esc => app.cancel_select(),
                         KeyCode::Char(c) if c.is_ascii_digit() => {
                             let slot = c as u8 - b'0';
-                            if slot < immurok_common::protocol::MAX_FINGERPRINT_SLOTS {
+                            if slot <= immurok_common::protocol::SWITCH_FINGER_SLOT {
                                 app.action_delete(slot);
                             }
                         }
+                        _ => {}
+                    },
+
+                    app::Mode::EnrollKindSelect => match key.code {
+                        KeyCode::Esc => app.cancel_enroll_kind(),
+                        KeyCode::Char(c) => app.enroll_kind_pick(c),
                         _ => {}
                     },
 
@@ -205,6 +220,24 @@ pub fn run() -> io::Result<()> {
                         }
                         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                             app.cancel_key_delete();
+                        }
+                        _ => {}
+                    },
+
+                    app::Mode::HostMenu => match key.code {
+                        KeyCode::Esc => app.cancel_host_action(),
+                        KeyCode::Char(c) => app.host_menu_pick(c),
+                        _ => {}
+                    },
+
+                    // Deliberately does NOT accept Enter (unlike
+                    // KeyDeleteConfirm above) — the heaviest item reachable
+                    // from here wipes every SSH private key on the device,
+                    // which exists nowhere else, so it requires an explicit y.
+                    app::Mode::HostConfirm => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_host_action(),
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.cancel_host_action()
                         }
                         _ => {}
                     },
