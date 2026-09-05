@@ -4,7 +4,7 @@
 //!   - ECDH P-256 ephemeral keypair
 //!   - HKDF-SHA256 (Salt="immurok-pairing-salt", Info="immurok-shared-key")
 //!   - HMAC-SHA256 truncated to 8 bytes for FP match notifications
-//!   - Pairing data persisted to ~/.immurok/pairing.json (mode 0o600)
+//!   - Pairing data persisted to <state_dir>/pairing.json (mode 0o600)
 
 use std::fs;
 use std::io;
@@ -21,7 +21,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-use crate::protocol::{HKDF_INFO, HKDF_SALT, HMAC_TRUNCATED_LEN, IMMUROK_DIR, PAIRING_FILE};
+use crate::paths;
+use crate::protocol::{HKDF_INFO, HKDF_SALT, HMAC_TRUNCATED_LEN, PAIRING_FILE};
 use crate::types::PairingData;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -156,19 +157,13 @@ pub fn compute_reset_hmac(key: &[u8; 32]) -> [u8; 32] {
 
 // ── Pairing data persistence ──────────────────────────────────
 
-/// Resolve `~/.immurok/pairing.json`.
+/// Resolve `<state_dir>/pairing.json`. Infallible now that the location no
+/// longer depends on $HOME, but the Result is kept so callers stay unchanged.
 fn pairing_path() -> Result<PathBuf, SecurityError> {
-    let home = dirs_home()?;
-    Ok(home.join(IMMUROK_DIR).join(PAIRING_FILE))
+    Ok(paths::state_dir().join(PAIRING_FILE))
 }
 
-fn dirs_home() -> Result<PathBuf, SecurityError> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| SecurityError::Io(io::Error::new(io::ErrorKind::NotFound, "HOME not set")))
-}
-
-/// Save `PairingData` to `~/.immurok/pairing.json` with mode 0o600.
+/// Save `PairingData` to `<state_dir>/pairing.json` with mode 0o600.
 /// Uses a temporary file + rename for atomicity.
 pub fn save_pairing(data: &PairingData) -> Result<(), SecurityError> {
     let path = pairing_path()?;
@@ -198,7 +193,7 @@ pub fn save_pairing(data: &PairingData) -> Result<(), SecurityError> {
     Ok(())
 }
 
-/// Load `PairingData` from `~/.immurok/pairing.json`.
+/// Load `PairingData` from `<state_dir>/pairing.json`.
 /// Returns `None` if the file does not exist or is malformed.
 pub fn load_pairing() -> Result<Option<PairingData>, SecurityError> {
     let path = pairing_path()?;
@@ -212,7 +207,7 @@ pub fn load_pairing() -> Result<Option<PairingData>, SecurityError> {
     }
 }
 
-/// Delete `~/.immurok/pairing.json`.
+/// Delete `<state_dir>/pairing.json`.
 /// Returns `true` if the file existed and was removed.
 pub fn clear_pairing() -> Result<bool, SecurityError> {
     let path = pairing_path()?;

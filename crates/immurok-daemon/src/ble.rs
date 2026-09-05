@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zbus::zvariant::OwnedValue;
 
 use immurok_common::dual_host::{classify_pair_button, parse_slot_status, PairButtonEvent};
@@ -604,11 +604,19 @@ async fn connect_and_serve(
     let (response_tx, response_rx) = mpsc::channel::<String>(16);
     let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<()>(1);
 
+    // helper 的 READY 必须等到才能发第一条命令。以前 READY 只是在读取任务里
+    // 打一行日志，会话主流程不等它 —— 实测第一条 GET_STATUS 比 READY 早 49ms
+    // 发出，写直接失败 "Not connected"，而调用处是 `if let Ok(rsp)`，于是静默
+    // 跳过；紧接着的挑战同样失败，却走进 Err 分支「assuming verified」。
+    // 结果就是：一个字节都没成功交换过的会话，对外报告已验证。
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Spawn reader task that reads ALL lines from helper stdout and routes them
     {
         let notify_tx = notify_tx;
         let response_tx = response_tx;
         let disconnect_tx = disconnect_tx;
+        let mut ready_tx = Some(ready_tx);
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -619,6 +627,9 @@ async fn connect_and_serve(
             if let Ok(Some(line)) = lines.next_line().await {
                 if line.trim() == "READY" {
                     info!("BLE helper ready (dbus-fast)");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
                 }
             }
 
@@ -655,6 +666,14 @@ async fn connect_and_serve(
         response_rx,
     };
 
+    // 等 helper 就绪再往下走。等不到就结束会话，让外层重连 —— 总比对着一个
+    // 还没接上 D-Bus 的 helper 空写一通、然后自称已验证要好。
+    match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err("BLE helper exited before READY".into()),
+        Err(_) => return Err("BLE helper did not report READY within 5s".into()),
+    }
+
     coordinator.is_connected.store(true, Ordering::Relaxed);
     coordinator.is_device_verified.store(false, Ordering::Relaxed);
     coordinator.challenge_verified.store(false, Ordering::Relaxed);
@@ -665,6 +684,12 @@ async fn connect_and_serve(
     info!("BLE session active");
 
     // GET_STATUS on connect
+    //
+    // 这条响应里的 paired 字节是设备对「我们俩配没配对」的直接回答。设备被
+    // 工厂复位、或本机对应的槽在别处被清掉之后，主机的 pairing.json 还在，
+    // 于是所有界面继续显示 Paired: Yes 而认证全部静默失败 —— 这个字节是唯一
+    // 能戳破那个假象的信息，以前解析出来就扔了。
+    let mut device_reported_paired: Option<bool> = None;
     if let Ok(rsp) = send_command_inner(&mut helper, &mut state, coordinator, &mut notify_rx, CMD_GET_STATUS, &[], BLE_COMMAND_TIMEOUT_SECS).await {
         if rsp.len() >= 4 && rsp[0] == RSP_OK {
             let bitmap = rsp[1];
@@ -686,12 +711,41 @@ async fn connect_and_serve(
                 fw_version: fw,
                 pending_match: None,
             });
+            device_reported_paired = Some(paired);
             info!("Device status: bitmap=0x{:02x} paired={} battery={}", bitmap, paired, battery);
         }
     }
 
+    // 设备说它不认识我们 —— 那就没有任何认证应该通过。
+    //
+    // 不做挑战、不置 verified，并把这句话记下来给 UI 用。以前这里会一路走到
+    // 挑战的「未知响应 → 假定已验证」兼容分支，把设备的拒绝咽掉，结果是
+    // 认证全废而每个界面都说一切正常。
+    let has_local_pairing = coordinator.pairing.read().await.is_some();
+    let device_disowns_us = has_local_pairing && device_reported_paired == Some(false);
+    if device_disowns_us {
+        error!(
+            "Device reports it is NOT paired with this host (factory reset, or this \
+             host's slot was cleared elsewhere). Refusing to mark the device verified."
+        );
+        coordinator
+            .device_reports_unpaired
+            .store(true, Ordering::Relaxed);
+        coordinator
+            .push_ui("NOTIFY:Device is no longer paired with this computer — run 'immurok-cli pair' to pair again")
+            .await;
+    } else {
+        coordinator
+            .device_reports_unpaired
+            .store(false, Ordering::Relaxed);
+    }
+
     // Challenge-Response verification
-    {
+    //
+    // 设备不认我们时跳过它、也不置 verified —— 但**会话要继续跑下去**：重新
+    // 配对本身需要一条活着的 BLE 会话（PAIR:* 在固件的 pre-pair 白名单里），
+    // 在这里断开会让用户永远修不好。
+    if !device_disowns_us {
         let pairing = coordinator.pairing.read().await;
         if let Some(ref p) = *pairing {
             let shared_key = p.shared_key;
@@ -719,13 +773,58 @@ async fn connect_and_serve(
                     }
                 }
                 Ok(rsp) => {
-                    warn!("Challenge-Response: unexpected response: [{}]", hex::encode(&rsp));
-                    // Still mark as verified for backwards compatibility with old firmware
-                    coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                    // 收到的不是 [0x38][hmac:8B]。以前这里直接「假定已验证」，
+                    // 理由是兼容旧固件 —— 但那等于在最该警惕的时候放行：一次
+                    // 事故里，设备的拒绝就是被这条分支咽掉的。
+                    //
+                    // 先重试一次：真正的旧固件会稳定地答不上来，而响应错位是
+                    // 一次性的，重试就能拿到正确的帧。
+                    warn!(
+                        "Challenge-Response: unexpected response: [{}] — retrying once",
+                        hex::encode(&rsp)
+                    );
+                    let mut nonce2 = [0u8; 8];
+                    rand::thread_rng().fill_bytes(&mut nonce2);
+                    match send_command_inner(&mut helper, &mut state, coordinator, &mut notify_rx, CMD_CHALLENGE, &nonce2, BLE_COMMAND_TIMEOUT_SECS).await {
+                        Ok(rsp2) if rsp2.len() >= 9 && rsp2[0] == CMD_CHALLENGE => {
+                            let mut device_hmac = [0u8; 8];
+                            device_hmac.copy_from_slice(&rsp2[1..9]);
+                            if security::verify_challenge_response(&shared_key, &nonce2, &device_hmac) {
+                                info!("Challenge-Response: verified on retry");
+                                coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                                coordinator.challenge_verified.store(true, Ordering::Relaxed);
+                            } else {
+                                warn!("Challenge-Response: HMAC mismatch on retry — degraded mode");
+                            }
+                        }
+                        other => {
+                            // 两次都答不上 [0x38][hmac] —— 这才像是旧固件。保持
+                            // 兼容放行，但把两次的原始帧都记下来，以后要收紧这条
+                            // 分支（按固件版本判定）时有据可依。
+                            warn!(
+                                "Challenge-Response: still unexpected on retry ({:?}) — \
+                                 assuming pre-CHALLENGE firmware",
+                                other.map(|r| hex::encode(r))
+                            );
+                            coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Err(e) => {
-                    warn!("Challenge-Response failed: {} — assuming verified", e);
-                    coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                    // 「兼容旧固件」只有在确实和设备说上过话时才讲得通。本会话
+                    // 连 GET_STATUS 都没成功的话，我们对这台设备一无所知 ——
+                    // 那时候自称已验证，等于把「链路是坏的」谎报成「设备没问题」。
+                    if device_reported_paired.is_some() {
+                        warn!("Challenge-Response failed: {} — assuming pre-CHALLENGE firmware", e);
+                        coordinator.is_device_verified.store(true, Ordering::Relaxed);
+                    } else {
+                        error!(
+                            "Challenge-Response failed: {} — and GET_STATUS never answered \
+                             either, so nothing about this device is known. Ending session.",
+                            e
+                        );
+                        return Err(format!("no usable BLE link: {}", e).into());
+                    }
                 }
             }
         } else {
@@ -1044,7 +1143,7 @@ async fn sync_ssh_keys(
 ) -> Result<(), String> {
     info!("Starting key cache sync...");
 
-    let digests_path = coordinator.immurok_dir.join(KEYSTORE_DIGESTS_FILE);
+    let digests_path = coordinator.state_dir.join(KEYSTORE_DIGESTS_FILE);
     let saved = keystore::load_digests(&digests_path);
     let mut fresh = saved.clone();
 
@@ -1059,7 +1158,7 @@ async fn sync_ssh_keys(
     } else {
         let entries =
             read_ssh_entries(helper, state, coordinator, notify_rx, KEY_CAT_SSH, ssh_count).await?;
-        let ssh_path = coordinator.immurok_dir.join(SSH_KEYS_FILE);
+        let ssh_path = coordinator.state_dir.join(SSH_KEYS_FILE);
         keystore::save_ssh_keys_to(&ssh_path, &entries)?;
         info!(
             "SSH digest miss → cached {} entries (count={} checksum=0x{:08x})",
@@ -1085,7 +1184,7 @@ async fn sync_ssh_keys(
         info!("OTP+API digest hit — skipping full read");
     } else {
         // Mixed-hit: load disk entries for the hit side, BLE-read the miss side
-        let cached = keystore::load_key_names(&coordinator.immurok_dir);
+        let cached = keystore::load_key_names(&coordinator.state_dir);
         let otp_entries = if otp_hit {
             cached.iter().filter(|e| e.category == "otp").cloned().collect()
         } else {
@@ -1100,7 +1199,7 @@ async fn sync_ssh_keys(
         };
         let mut combined = otp_entries;
         combined.extend(api_entries);
-        let names_path = coordinator.immurok_dir.join(KEY_NAMES_FILE);
+        let names_path = coordinator.state_dir.join(KEY_NAMES_FILE);
         keystore::save_key_names_to(&names_path, &combined)?;
         info!(
             "OTP+API digest miss(otp={}, api={}) → cached {} names",
@@ -1538,6 +1637,14 @@ async fn do_pair(
             warn!("Failed to save pairing: {}", e);
         }
 
+        // 刚配上，设备当然认我们了。不清这个标志的话，那句「设备已不再与本机
+        // 配对」会一直挂到下次重连为止 —— 用户照做了却看不到变化，是最让人
+        // 怀疑自己的那种反馈。
+        coordinator
+            .device_reports_unpaired
+            .store(false, Ordering::Relaxed);
+        coordinator.is_device_verified.store(true, Ordering::Relaxed);
+
         info!("ECDH pairing successful");
         return Ok((RSP_OK, vec![RSP_OK]));
     }
@@ -1812,7 +1919,17 @@ async fn ota_write_only(
 }
 
 /// Find the ble-notify-helper.py script.
+///
+/// `IMMUROK_HELPER_DIR` is checked first: the source-tree fallback below is
+/// unreachable under `ProtectHome=yes`, so a developer running the daemon out
+/// of a checkout needs an explicit way to point at `scripts/`.
 fn find_helper_script() -> String {
+    if let Ok(dir) = std::env::var("IMMUROK_HELPER_DIR") {
+        let candidate = std::path::Path::new(&dir).join("ble-notify-helper.py");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
     // Check next to the daemon binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

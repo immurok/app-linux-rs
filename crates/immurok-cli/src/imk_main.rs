@@ -14,11 +14,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use immurok_common::protocol;
+use immurok_common::paths;
 
 const EXIT_REJECTED: i32 = 77; // EX_NOPERM — agent rejected by user
 const EXIT_USAGE: i32 = 64;    // EX_USAGE
@@ -129,19 +128,10 @@ fn cmd_run(args: &[String]) -> i32 {
         }
     }
 
-    // Drop a marker keyed by our own PID so the daemon's PAM AUTH path can
-    // walk the wrapped subprocess's parent chain and recognize "this is
-    // running under an agent wrap" — useful when the 5-min sudo pre-auth
-    // window expires mid-command and a late sudo arrives at raw AUTH. See
-    // commit 31aa5f6 (macOS) for the originating defense-in-depth design.
-    let marker_guard = if is_agent {
-        AgentMarker::write(&cmd_string).map(MarkerGuard).ok()
-    } else {
-        None
-    };
-
-    // Spawn (rather than exec) so the marker can be cleaned up after the
-    // wrapped command exits. Force SSH_AUTH_SOCK to the daemon's actual
+    // Spawn (rather than exec) so we stay alive as the wrapped command's
+    // parent: the daemon recognises a late raw AUTH as agent-driven by
+    // walking that parent chain back to the pid it saw on AGENT_APPROVE.
+    // Force SSH_AUTH_SOCK to the daemon's actual
     // agent socket: user shells often have a stale path baked in (e.g.
     // ~/.zshrc still pointing at ~/.immurok/agent.sock from a previous
     // Linux install), and the wrapped subprocess inherits that → git push
@@ -174,95 +164,14 @@ fn cmd_run(args: &[String]) -> i32 {
         }
     };
 
-    drop(marker_guard);
     exit_code
 }
 
-// ── AgentMarker (defense-in-depth for late sudo after pre-auth expiry) ──
-
-/// File at `~/.immurok/markers/<pid>`:
-///   line 1: expiry epoch (seconds since 1970)
-///   line 2 (optional): wrapped command, single line, ≤1024 chars
-/// Mode 0600 so other local users can't fabricate markers under our PID.
-/// Mirrors macOS `AgentMarker` (CLISources/AgentMarker.swift) format.
-struct AgentMarker;
-
-impl AgentMarker {
-    const TTL_SECS: u64 = 3600;
-    const MAX_CMD_LEN: usize = 1024;
-
-    fn directory() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(".immurok").join("markers")
-    }
-
-    fn path_for(pid: u32) -> PathBuf {
-        Self::directory().join(pid.to_string())
-    }
-
-    fn write(command: &str) -> std::io::Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = Self::directory();
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-
-        let pid = std::process::id();
-        let expiry = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() + Self::TTL_SECS)
-            .unwrap_or(0);
-
-        // Sanitize: collapse newlines + cap length so the file stays
-        // bounded even for runaway scripts.
-        let cmd_one_line: String = command
-            .replace(['\n', '\r'], " ")
-            .chars()
-            .take(Self::MAX_CMD_LEN)
-            .collect();
-
-        let path = Self::path_for(pid);
-        let body = format!("{}\n{}\n", expiry, cmd_one_line);
-        std::fs::write(&path, body)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(path)
-    }
-
-    fn remove(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// RAII wrapper so the marker is removed on imk exit even if the wrapped
-/// command panics or wait() errors out.
-struct MarkerGuard(PathBuf);
-
-impl Drop for MarkerGuard {
-    fn drop(&mut self) {
-        AgentMarker::remove(&self.0);
-    }
-}
-
-/// Daemon's SSH agent socket path — same XDG_RUNTIME_DIR convention as
-/// daemon's main.rs (with /run/user/$UID fallback resolved via $UID env
-/// var which is always set by login/systemd-user). If neither is set,
-/// fail-open: don't override SSH_AUTH_SOCK and let whatever is in the
-/// parent env propagate.
+/// Daemon's SSH agent socket path. Machine-level now (the daemon serves the
+/// whole machine as a system user), resolved the same way on both sides —
+/// see immurok_common::paths.
 fn ssh_agent_socket_path() -> Result<String, String> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return Ok(format!(
-            "{}/immurok/{}",
-            runtime_dir,
-            protocol::AGENT_SOCKET_NAME
-        ));
-    }
-    if let Ok(uid) = std::env::var("UID") {
-        return Ok(format!(
-            "/run/user/{}/immurok/{}",
-            uid,
-            protocol::AGENT_SOCKET_NAME
-        ));
-    }
-    Err("XDG_RUNTIME_DIR / UID not set".into())
+    Ok(paths::agent_socket().to_string_lossy().into_owned())
 }
 
 enum ApprovalResult {
@@ -334,20 +243,7 @@ fn request_agent_approval(cmd: &str) -> ApprovalResult {
 }
 
 fn daemon_socket_path() -> Result<String, String> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return Ok(format!(
-            "{}/immurok/{}",
-            runtime_dir,
-            protocol::PAM_SOCKET_NAME
-        ));
-    }
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    Ok(format!(
-        "{}/{}/{}",
-        home,
-        protocol::IMMUROK_DIR,
-        protocol::PAM_SOCKET_NAME
-    ))
+    Ok(paths::pam_socket().to_string_lossy().into_owned())
 }
 
 fn cmd_list(args: &[String]) -> i32 {

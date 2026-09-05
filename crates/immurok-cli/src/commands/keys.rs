@@ -18,59 +18,40 @@ fn parse_category(cat: &str) -> &'static str {
     }
 }
 
-/// List keys in a category. Reads from daemon's local cache files.
+/// List keys in a category, from the cache the daemon maintains.
 pub fn run_list(category: &str) {
     let cat = parse_category(category);
-    let home = std::env::var("HOME").unwrap_or_default();
-    let immurok_dir = std::path::PathBuf::from(&home)
-        .join(immurok_common::protocol::IMMUROK_DIR);
 
     match cat {
         "ssh" => {
-            let ssh_path = immurok_dir.join(immurok_common::protocol::SSH_KEYS_FILE);
-            match std::fs::read_to_string(&ssh_path) {
-                Ok(contents) => {
-                    let entries: Vec<serde_json::Value> =
-                        serde_json::from_str(&contents).unwrap_or_default();
-                    if entries.is_empty() {
-                        println!("No SSH keys.");
-                        return;
-                    }
-                    println!("SSH keys:");
-                    for entry in &entries {
-                        let idx = entry["index"].as_u64().unwrap_or(0);
-                        let name = entry["name"].as_str().unwrap_or("-");
-                        let fp = entry["fingerprint"].as_str().unwrap_or("-");
-                        println!("  [{}] {} ({})", idx, name, fp);
-                    }
-                }
-                Err(_) => println!("No SSH keys cached. Connect device to sync."),
+            let entries = crate::socket_client::fetch_key_cache("ssh");
+            if entries.is_empty() {
+                println!("No SSH keys cached. Connect device to sync.");
+                return;
+            }
+            println!("SSH keys:");
+            for entry in &entries {
+                let idx = entry["index"].as_u64().unwrap_or(0);
+                let name = entry["name"].as_str().unwrap_or("-");
+                let fp = entry["fingerprint"].as_str().unwrap_or("-");
+                println!("  [{}] {} ({})", idx, name, fp);
             }
         }
         _ => {
-            let names_path = immurok_dir.join(immurok_common::protocol::KEY_NAMES_FILE);
-            match std::fs::read_to_string(&names_path) {
-                Ok(contents) => {
-                    let entries: Vec<serde_json::Value> =
-                        serde_json::from_str(&contents).unwrap_or_default();
-                    let filtered: Vec<&serde_json::Value> = entries
-                        .iter()
-                        .filter(|e: &&serde_json::Value| {
-                            e["category"].as_str() == Some(cat)
-                        })
-                        .collect();
-                    if filtered.is_empty() {
-                        println!("No {} keys.", cat.to_uppercase());
-                        return;
-                    }
-                    println!("{} keys:", cat.to_uppercase());
-                    for entry in &filtered {
-                        let idx = entry["index"].as_u64().unwrap_or(0);
-                        let name = entry["name"].as_str().unwrap_or("-");
-                        println!("  [{}] {}", idx, name);
-                    }
-                }
-                Err(_) => println!("No {} keys cached. Connect device to sync.", cat.to_uppercase()),
+            let entries = crate::socket_client::fetch_key_cache("names");
+            let filtered: Vec<&serde_json::Value> = entries
+                .iter()
+                .filter(|e: &&serde_json::Value| e["category"].as_str() == Some(cat))
+                .collect();
+            if filtered.is_empty() {
+                println!("No {} keys cached. Connect device to sync.", cat.to_uppercase());
+                return;
+            }
+            println!("{} keys:", cat.to_uppercase());
+            for entry in &filtered {
+                let idx = entry["index"].as_u64().unwrap_or(0);
+                let name = entry["name"].as_str().unwrap_or("-");
+                println!("  [{}] {}", idx, name);
             }
         }
     }
@@ -238,20 +219,10 @@ pub fn run_delete(category: &str, index: u8) {
 
 /// Export an SSH public key in authorized_keys format.
 pub fn run_export_ssh(index: u8) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let ssh_path = std::path::PathBuf::from(&home)
-        .join(immurok_common::protocol::IMMUROK_DIR)
-        .join(immurok_common::protocol::SSH_KEYS_FILE);
-
-    let contents = match std::fs::read_to_string(&ssh_path) {
-        Ok(c) => c,
-        Err(_) => {
-            super::error_exit("No SSH keys cached. Connect device to sync.");
-        }
-    };
-
-    let entries: Vec<serde_json::Value> =
-        serde_json::from_str(&contents).unwrap_or_default();
+    let entries = crate::socket_client::fetch_key_cache("ssh");
+    if entries.is_empty() {
+        super::error_exit("No SSH keys cached. Connect device to sync.");
+    }
 
     let entry = entries
         .iter()
@@ -278,19 +249,10 @@ pub fn run_export_ssh(index: u8) {
 /// previously failed silently on the device side. Mirrors macOS commit
 /// 11d3f40.
 fn cached_count(category: &str) -> usize {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let immurok_dir = std::path::PathBuf::from(&home)
-        .join(immurok_common::protocol::IMMUROK_DIR);
     if category == "ssh" {
-        let path = immurok_dir.join(immurok_common::protocol::SSH_KEYS_FILE);
-        let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        let entries: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_default();
-        return entries.len();
+        return crate::socket_client::fetch_key_cache("ssh").len();
     }
-    let path = immurok_dir.join(immurok_common::protocol::KEY_NAMES_FILE);
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_default();
-    entries
+    crate::socket_client::fetch_key_cache("names")
         .iter()
         .filter(|e| e["category"].as_str() == Some(category))
         .count()

@@ -1,55 +1,84 @@
 mod ble;
 mod coordinator;
 mod keystore;
+mod logbuf;
 mod ota;
 mod screen;
+mod session;
 mod settings;
 mod socket;
 mod ssh_agent;
-mod ssh_config;
 mod suspend;
 
-use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::info;
+use immurok_common::paths;
 use immurok_common::protocol;
 use immurok_common::security;
 
-#[tokio::main]
-async fn main() {
-    let home_dir = std::env::var("HOME").expect("HOME not set");
-    let log_path = PathBuf::from(&home_dir).join(protocol::IMMUROK_DIR).join(protocol::LOG_FILE);
-    let log_file = std::fs::OpenOptions::new()
+/// Log to `<log_dir>/daemon.log`, falling back to stderr (→ journald) when
+/// that cannot be opened. Never fatal: a daemon that cannot write its log must
+/// still be able to authenticate.
+fn init_logging() {
+    fn filter() -> tracing_subscriber::EnvFilter {
+        tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("immurok=info".parse().unwrap())
+    }
+
+    let _ = std::fs::create_dir_all(paths::log_dir());
+    let log_path = paths::daemon_log();
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
-        .expect("cannot open log file");
+        .open(&log_path);
+    let opened = file.is_ok();
 
+    // Everything goes through the same sink: the file (for post-mortem and
+    // for root) and an in-memory ring the CLI/TUI can subscribe to over the
+    // socket, since they can no longer read the file themselves.
+    let writer = logbuf::install(file.ok());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("immurok=info".parse().unwrap()),
-        )
+        .with_env_filter(filter())
         .with_target(false)
-        .with_writer(std::sync::Mutex::new(log_file))
+        .with_writer(writer)
         .with_ansi(false)
         .init();
 
+    if !opened {
+        tracing::warn!(
+            "cannot open {} — log file disabled, socket log stream still works",
+            log_path.display()
+        );
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    init_logging();
+
     info!("immurok-daemon starting");
 
-    let home = std::env::var("HOME").expect("HOME not set");
-    let immurok_dir = PathBuf::from(&home).join(protocol::IMMUROK_DIR);
-    std::fs::create_dir_all(&immurok_dir).expect("cannot create ~/.immurok");
+    // State lives at a machine-level path (systemd StateDirectory, or the
+    // compiled-in fallback) — the daemon runs as the `immurok` system user
+    // with ProtectHome=yes and must never derive anything from $HOME.
+    let state_dir = paths::state_dir();
+    std::fs::create_dir_all(&state_dir)
+        .unwrap_or_else(|e| panic!("cannot create {}: {}", state_dir.display(), e));
+    // systemd's StateDirectory= already lands on 0700; a hand-started daemon
+    // must not leave the pairing key readable by the rest of the machine.
+    if let Err(e) = std::fs::set_permissions(
+        &state_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    ) {
+        tracing::warn!("cannot chmod 0700 {}: {}", state_dir.display(), e);
+    }
 
-    // Use XDG_RUNTIME_DIR for sockets — accessible even with ProtectHome=yes (polkitd)
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
-    let runtime_immurok = runtime_dir.join("immurok");
-    std::fs::create_dir_all(&runtime_immurok).expect("cannot create runtime dir");
+    let runtime_dir = paths::runtime_dir();
+    std::fs::create_dir_all(&runtime_dir)
+        .unwrap_or_else(|e| panic!("cannot create {}: {}", runtime_dir.display(), e));
 
     let pairing = security::load_pairing().unwrap_or(None);
-    let user_settings = settings::Settings::load(&immurok_dir.join(protocol::SETTINGS_FILE));
+    let user_settings = settings::Settings::load(&state_dir.join(protocol::SETTINGS_FILE));
 
     // 启动 PAM 自检：按已启用功能检查 /etc/pam.d，仅日志不修复（修复需 pkexec/TTY）。
     {
@@ -66,8 +95,7 @@ async fn main() {
     }
 
     let (ble_cmd_tx, ble_cmd_rx) = mpsc::channel(32);
-    let coord = coordinator::Coordinator::new(ble_cmd_tx, immurok_dir.clone());
-    let ssh_takeover_intent = user_settings.ssh_takeover;
+    let coord = coordinator::Coordinator::new(ble_cmd_tx, state_dir.clone());
     {
         let mut p = coord.pairing.write().await;
         *p = pairing;
@@ -75,14 +103,8 @@ async fn main() {
         *s = user_settings;
     }
 
-    // Reconcile ~/.ssh/config with the persisted ssh_takeover intent — a
-    // hand-edited config must not drift from the stored setting.
-    if let Err(e) = ssh_config::apply(ssh_takeover_intent) {
-        tracing::warn!("ssh_takeover reconcile failed: {}", e);
-    }
-
-    let pam_sock = runtime_immurok.join(protocol::PAM_SOCKET_NAME);
-    let agent_sock = runtime_immurok.join(protocol::AGENT_SOCKET_NAME);
+    let pam_sock = paths::pam_socket();
+    let agent_sock = paths::agent_socket();
 
     tokio::select! {
         _ = ble::run(coord.clone(), ble_cmd_rx) => {},

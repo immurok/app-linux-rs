@@ -1,0 +1,22 @@
+# 用户级单元 —— 由 root 装到 /etc/systemd/user/，每个登录用户自己 enable。
+#
+# daemon 以专用系统用户运行，没有显示、没有会话总线、也进不了家目录，所以
+# 凡是必须发生在会话里的事（授权弹窗、桌面通知、~/.ssh/config）都由这个
+# 小进程代办。它不持有任何密钥，也不参与授权判定。
+#
+# 挂 default.target 而不是 graphical-session.target：纯 tty 登录同样需要
+# ssh_takeover 对账，而且不是所有窗口管理器都会把 graphical-session.target
+# 拉起来 —— 那种情况下弹窗会毫无征兆地永远不出现。
+[Unit]
+Description=immurok session agent (dialogs, notifications, ~/.ssh/config)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/immurok-session-agent
+# 进程自己有重连退避；这条只是兜底（比如二进制被换掉后崩溃）。
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

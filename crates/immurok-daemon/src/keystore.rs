@@ -90,14 +90,14 @@ pub fn save_key_names_to(path: &Path, names: &[KeyNameEntry]) -> Result<(), Stri
 }
 
 /// Load SSH keys from disk cache (used by ssh_agent).
-pub fn load_ssh_keys(immurok_dir: &Path) -> Vec<SshKeyCacheEntry> {
-    let path = immurok_dir.join(protocol::SSH_KEYS_FILE);
+pub fn load_ssh_keys(state_dir: &Path) -> Vec<SshKeyCacheEntry> {
+    let path = state_dir.join(protocol::SSH_KEYS_FILE);
     load_json(&path).unwrap_or_default()
 }
 
 /// Load key names from disk cache.
-pub fn load_key_names(immurok_dir: &Path) -> Vec<KeyNameEntry> {
-    let path = immurok_dir.join(protocol::KEY_NAMES_FILE);
+pub fn load_key_names(state_dir: &Path) -> Vec<KeyNameEntry> {
+    let path = state_dir.join(protocol::KEY_NAMES_FILE);
     load_json(&path).unwrap_or_default()
 }
 

@@ -1,8 +1,10 @@
 /*
  * pam_immurok.c - PAM module for immurok fingerprint authentication (Linux)
  *
- * Communicates with immurok-daemon via Unix socket at ~/.immurok/pam.sock.
- * The socket path is resolved from the authenticating user's home directory.
+ * Communicates with immurok-daemon via Unix socket at /run/immurok/pam.sock.
+ * The daemon runs as a dedicated system user and serves the whole machine, so
+ * the path is fixed; the socket directory's ownership is the trust boundary
+ * (see socket_trust.h).
  * Protocol: "AUTH:username:service" -> "OK", "DENY", or "TIMEOUT"
  *
  * Shows an animated braille spinner on the terminal while waiting.
@@ -32,9 +34,13 @@
 #include <security/pam_ext.h>
 
 #include "fp_policy.h"
+#include "socket_trust.h"
 
-#define SOCKET_DIR_FMT "/run/user/%d/immurok"
+#define SOCKET_DIR  "/run/immurok"
 #define SOCKET_NAME "pam.sock"
+#define SOCKET_PATH SOCKET_DIR "/" SOCKET_NAME
+#define DAEMON_USER "immurok"
+#define CONNECT_TIMEOUT_MS 2000
 #define DEFAULT_TIMEOUT_SEC 40
 #define BUFFER_SIZE 256
 
@@ -88,6 +94,62 @@ static int parse_timeout(int argc, const char **argv) {
     return DEFAULT_TIMEOUT_SEC;
 }
 
+/* uid of the dedicated daemon user, or (uid_t)-1 when it does not exist. */
+static uid_t daemon_uid(void) {
+    struct passwd *pw = getpwnam(DAEMON_USER);
+    return pw ? pw->pw_uid : (uid_t)-1;
+}
+
+/* Connect with a hard upper bound.
+ *
+ * A blocking connect() on AF_UNIX is unbounded: SO_SNDTIMEO does not cover
+ * connect(), so a daemon that is alive but wedged with a full accept backlog
+ * would park us here forever — before the spinner loop below, which is what
+ * gives the user the keypress/Ctrl+C escape, ever starts. Fail closed instead:
+ * the module is `sufficient`, so giving up just falls through to the password.
+ *
+ * Returns 0 on success, -1 on error/timeout (errno set). The socket is left in
+ * blocking mode either way; the rest of the module expects that. */
+static int connect_timeout(int sock, const struct sockaddr_un *addr, int timeout_ms) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    int rc = connect(sock, (const struct sockaddr *)addr, sizeof(*addr));
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval ctv;
+        ctv.tv_sec = timeout_ms / 1000;
+        ctv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        int ready = select(sock + 1, NULL, &wfds, NULL, &ctv);
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            rc = -1;
+        } else if (ready > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+                rc = -1;
+            } else if (err != 0) {
+                errno = err;
+                rc = -1;
+            } else {
+                rc = 0;
+            }
+        } else {
+            rc = -1;
+        }
+    }
+
+    int saved = errno;
+    (void)fcntl(sock, F_SETFL, flags);
+    errno = saved;
+    return rc < 0 ? -1 : 0;
+}
+
 /* Send authentication request to immurok-daemon and wait for response
  * with animated spinner on the terminal */
 static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
@@ -96,36 +158,42 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
     struct sockaddr_un addr;
     char request[BUFFER_SIZE];
     char response[BUFFER_SIZE];
-    char socket_path[256];
     ssize_t n;
-    struct passwd *pw;
+    struct stat dir_st;
+    struct timeval tv;
 
-    /* Resolve the authenticating user's UID for XDG_RUNTIME_DIR */
-    pw = getpwnam(user);
-    if (pw == NULL) {
-        pam_syslog(pamh, LOG_ERR, "Cannot resolve user: %s", user);
+    /* The socket directory is the entire trust boundary: if an ordinary user
+     * owns it (or can write it), they could have unlinked the daemon's socket
+     * and bound one that answers "OK" to everything. lstat, not stat — a
+     * symlink planted at the path must not be followed into somewhere
+     * writable. */
+    if (lstat(SOCKET_DIR, &dir_st) < 0) {
+        pam_syslog(pamh, LOG_ERR, "Cannot stat %s: %s", SOCKET_DIR, strerror(errno));
         return PAM_AUTH_ERR;
     }
-    snprintf(socket_path, sizeof(socket_path),
-             SOCKET_DIR_FMT "/%s", (int)pw->pw_uid, SOCKET_NAME);
+    if (!immurok_dir_trusted(dir_st.st_mode, dir_st.st_uid, daemon_uid())) {
+        pam_syslog(pamh, LOG_ERR,
+                   "Refusing %s: untrusted socket directory (uid=%u mode=%04o)",
+                   SOCKET_DIR, (unsigned)dir_st.st_uid,
+                   (unsigned)(dir_st.st_mode & 07777));
+        return PAM_AUTH_ERR;
+    }
 
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0)
         return PAM_AUTH_ERR;
 
-    /* Non-blocking connect with overall timeout */
-    struct timeval tv;
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (connect_timeout(sock, &addr, CONNECT_TIMEOUT_MS) < 0) {
         pam_syslog(pamh, LOG_ERR, "Failed to connect to %s: %s",
-                   socket_path, strerror(errno));
+                   SOCKET_PATH, strerror(errno));
         close(sock);
         return PAM_AUTH_ERR;
     }

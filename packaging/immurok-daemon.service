@@ -1,0 +1,55 @@
+# System unit — the daemon runs as the dedicated `immurok` user so that no
+# process of the logged-in user can stop it, replace its binary, read the
+# pairing key, or rebind its PAM socket. See
+# docs/superpowers/specs/2026-09-03-pam-channel-hardening-design.md.
+[Unit]
+Description=immurok BLE fingerprint authentication daemon
+After=bluetooth.target dbus.service
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/immurok-daemon
+User=immurok
+Group=immurok
+# BlueZ 授权来自 packaging/dbus/immurok.conf。不写 SupplementaryGroups=
+# bluetooth：Arch 之类的发行版根本没有这个组，指向不存在的组会让单元直接
+# 启动失败。改由 immurok-pam-helper 在组存在时 usermod -aG，systemd 对
+# User= 会按 /etc/group 取补充组，效果相同且不会在缺组的发行版上炸掉。
+
+# /run/immurok (0755, immurok-owned) holds the PAM and SSH-agent sockets. Kept
+# across restarts so anything that references the path — see the note about
+# polkit overrides in the hardening design — never points at a missing dir.
+RuntimeDirectory=immurok
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# /var/lib/immurok (0700) holds pairing.json and the key caches.
+StateDirectory=immurok
+StateDirectoryMode=0700
+LogsDirectory=immurok
+LogsDirectoryMode=0750
+
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Hardening. The three directories above stay writable; everything else is
+# read-only, so a compromised daemon cannot rewrite its own binary or the PAM
+# configuration that trusts it.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# D-Bus (BlueZ, logind) and the sockets are all AF_UNIX; AF_NETLINK is what
+# the runtime uses for uevent-ish lookups. The daemon does no networking.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

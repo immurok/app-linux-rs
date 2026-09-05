@@ -1,6 +1,16 @@
 CC ?= gcc
-LOCAL_BIN = $(HOME)/.local/bin
-SYSTEMD_DIR = $(HOME)/.config/systemd/user
+# 二进制进 /usr/local/bin（root 所有）：daemon 以专用系统用户运行，用户
+# 可写的 ~/.local/bin 里的二进制随时能被替换，那样特权分离就白做了。
+# 同样的道理适用于 pkexec 的 exec.path —— 它以前指向 ~/.local/bin。
+PREFIX ?= /usr/local
+BIN_DIR = $(PREFIX)/bin
+SYSTEMD_SYSTEM_DIR = /etc/systemd/system
+TMPFILES_DIR = /etc/tmpfiles.d
+DBUS_POLICY_DIR = /etc/dbus-1/system.d
+POLKIT_RULES_DIR = /etc/polkit-1/rules.d
+# 旧版（用户级 daemon）留下的东西，装/卸时都要清理
+LEGACY_BIN = $(HOME)/.local/bin
+LEGACY_USER_UNIT_DIR = $(HOME)/.config/systemd/user
 # cargo 位置因发行版而异：rustup 装在 ~/.cargo/bin，
 # 发行版包（Fedora/Arch dnf/pacman）装在 /usr/bin。
 # 优先 rustup（通常更新），回退到 PATH，最后裸 cargo（让报错可读）。
@@ -9,8 +19,11 @@ CARGO := $(shell \
     elif command -v cargo >/dev/null 2>&1; then command -v cargo; \
     else echo cargo; fi)
 POLKIT_DIR = /usr/share/polkit-1/actions
-POLKIT_OVERRIDE_DIR = /etc/systemd/system/polkit.service.d
-POLKIT_HELPER_OVERRIDE_DIR = /etc/systemd/system/polkit-agent-helper@.service.d
+# 旧版给 polkit 开的两个 override（socket 还在 /run/user/<uid> 的年代，
+# ProtectHome=yes 会把它整个挡掉）。socket 搬到 /run/immurok 后不再需要，
+# 由 immurok-pam-helper migrate-daemon 负责删除。
+LEGACY_POLKIT_OVERRIDE_DIR = /etc/systemd/system/polkit.service.d
+LEGACY_POLKIT_HELPER_OVERRIDE_DIR = /etc/systemd/system/polkit-agent-helper@.service.d
 
 PAM_DIR := $(shell \
     if [ -d /usr/lib64/security ]; then echo /usr/lib64/security; \
@@ -37,70 +50,39 @@ pam:
 
 install: all
 	@echo "=== immurok install ==="
-	@# ── Binaries and scripts ──
-	install -Dm755 target/release/immurok-daemon $(LOCAL_BIN)/immurok-daemon
-	install -Dm755 target/release/immurok-cli $(LOCAL_BIN)/immurok-cli
-	install -Dm755 target/release/imk $(LOCAL_BIN)/imk
-	install -Dm755 scripts/immurok-auth-dialog $(LOCAL_BIN)/immurok-auth-dialog
-	install -Dm755 scripts/immurok-pam-helper $(LOCAL_BIN)/immurok-pam-helper
-	install -Dm755 scripts/ble-notify-helper.py $(LOCAL_BIN)/ble-notify-helper.py
-	@# ── PAM module ──
-	@# Install via a temp file + atomic rename, never overwrite in place:
-	@# the sudo running this has the OLD pam_immurok.so mmap'd, and an in-place
-	@# overwrite corrupts its code pages → SIGSEGV in dlclose at pam_end.
-	sudo install -Dm755 pam/pam_immurok.so $(PAM_DIR)/pam_immurok.so.new
-	sudo mv -f $(PAM_DIR)/pam_immurok.so.new $(PAM_DIR)/pam_immurok.so
-	@# ── PAM service configs (add pam_immurok.so if not already present) ──
-	-sudo $(LOCAL_BIN)/immurok-pam-helper add sudo 2>/dev/null
-	-sudo $(LOCAL_BIN)/immurok-pam-helper add polkit-1 2>/dev/null
-	-sudo $(LOCAL_BIN)/immurok-pam-helper add gdm-password 2>/dev/null
-	@# ── Polkit policy + systemd overrides ──
-	sed 's|@HELPER_PATH@|$(LOCAL_BIN)/immurok-pam-helper|' scripts/com.immurok.pam-helper.policy.in | sudo tee $(POLKIT_DIR)/com.immurok.pam-helper.policy > /dev/null
-	@# Allow polkitd and polkit-agent-helper to access /run/user
-	@# (ProtectHome=yes blocks /run/user by default)
-	sudo mkdir -p $(POLKIT_OVERRIDE_DIR) $(POLKIT_HELPER_OVERRIDE_DIR)
-	printf '[Service]\nBindPaths=/run/user\n' | sudo tee $(POLKIT_OVERRIDE_DIR)/immurok.conf > /dev/null
-	printf '[Service]\nProtectHome=no\n' | sudo tee $(POLKIT_HELPER_OVERRIDE_DIR)/immurok.conf > /dev/null
-	sudo systemctl daemon-reload
-	-sudo systemctl restart polkit 2>/dev/null
-	@# ── User service ──
-	install -Dm644 immurok-daemon.service $(SYSTEMD_DIR)/immurok-daemon.service
+	@# root 步骤全部收敛到一次 sudo（原因见 scripts/install-root.sh 顶部注释）
+	sudo bash scripts/install-root.sh $$(id -un) "$$(pwd)" $(PAM_DIR) $(BIN_DIR)
+	@# ── 用户级：启动会话代理（弹窗/通知/~/.ssh/config 都归它）──
+	-rm -f $(LEGACY_USER_UNIT_DIR)/immurok-daemon.service
 	systemctl --user daemon-reload
-	-systemctl --user stop immurok-daemon.service 2>/dev/null
-	systemctl --user enable --now immurok-daemon.service
-	@# ── User data directory ──
-	mkdir -p $(HOME)/.immurok
-	@# ── Ensure ~/.local/bin is on PATH (idempotent) ──
-	@if echo "$$PATH" | tr ':' '\n' | grep -qx "$(LOCAL_BIN)"; then \
-		echo "✓ $(LOCAL_BIN) 已在 PATH 中"; \
-	else \
-		for rc in $(HOME)/.bashrc $(HOME)/.zshrc; do \
-			[ -f "$$rc" ] || continue; \
-			if grep -q '# added by immurok install' "$$rc"; then \
-				echo "✓ $$rc 已配置 PATH（跳过）"; \
-			else \
-				printf '\n# added by immurok install\nexport PATH="%s:$$PATH"\n' "$(LOCAL_BIN)" >> "$$rc"; \
-				echo "✓ 已把 $(LOCAL_BIN) 写入 $$rc"; \
-			fi; \
-		done; \
-		echo "⚠️  新开终端，或运行 'source ~/.bashrc'（zsh 用 ~/.zshrc）后生效"; \
-	fi
+	systemctl --user enable --now immurok-session-agent.service
+	-rm -f $(LEGACY_BIN)/immurok-daemon $(LEGACY_BIN)/immurok-cli $(LEGACY_BIN)/imk
+	-rm -f $(LEGACY_BIN)/immurok-auth-dialog $(LEGACY_BIN)/immurok-pam-helper
+	-rm -f $(LEGACY_BIN)/ble-notify-helper.py
+	-@for rc in $(HOME)/.bashrc $(HOME)/.zshrc; do \
+		[ -f "$$rc" ] || continue; \
+		if grep -q '# added by immurok install' "$$rc"; then \
+			sed -i '/# added by immurok install/,+1d' "$$rc"; \
+			echo "✓ 已从 $$rc 移除旧的 PATH 配置（二进制已在 $(BIN_DIR)）"; \
+		fi; \
+	done
+	@echo ""
 	@echo "=== Done ==="
+	@systemctl is-active --quiet immurok-daemon && echo "✓ immurok-daemon 运行中（用户 immurok）" || echo "⚠️  immurok-daemon 未运行，看 'systemctl status immurok-daemon'"
+	@echo "  日志: journalctl -u immurok-daemon  或  /var/log/immurok/daemon.log"
 
+# 卸载。默认保留 /var/lib/immurok（配对数据）；PURGE=1 才连它一起删。
 uninstall:
 	@echo "=== immurok uninstall ==="
-	@# ── Stop and disable service ──
+	sudo bash scripts/uninstall-root.sh $(PAM_DIR) $(BIN_DIR) $(if $(PURGE),--purge-state,--keep-state)
+	@# ── 用户级 ──
+	-systemctl --user disable --now immurok-session-agent.service 2>/dev/null
 	-systemctl --user disable --now immurok-daemon.service 2>/dev/null
-	@# ── Remove PAM service configs ──
-	-sudo $(LOCAL_BIN)/immurok-pam-helper remove sudo 2>/dev/null
-	-sudo $(LOCAL_BIN)/immurok-pam-helper remove polkit-1 2>/dev/null
-	-sudo $(LOCAL_BIN)/immurok-pam-helper remove gdm-password 2>/dev/null
-	@# ── Remove binaries and scripts ──
-	rm -f $(LOCAL_BIN)/immurok-daemon $(LOCAL_BIN)/immurok-cli $(LOCAL_BIN)/imk
-	rm -f $(LOCAL_BIN)/immurok-auth-dialog $(LOCAL_BIN)/immurok-pam-helper
-	rm -f $(LOCAL_BIN)/ble-notify-helper.py
-	rm -f $(SYSTEMD_DIR)/immurok-daemon.service
-	@# ── Remove PATH line added by install ──
+	-rm -f $(LEGACY_USER_UNIT_DIR)/immurok-daemon.service
+	-systemctl --user daemon-reload 2>/dev/null
+	-rm -f $(LEGACY_BIN)/immurok-daemon $(LEGACY_BIN)/immurok-cli $(LEGACY_BIN)/imk
+	-rm -f $(LEGACY_BIN)/immurok-auth-dialog $(LEGACY_BIN)/immurok-pam-helper
+	-rm -f $(LEGACY_BIN)/ble-notify-helper.py
 	-@for rc in $(HOME)/.bashrc $(HOME)/.zshrc; do \
 		[ -f "$$rc" ] || continue; \
 		if grep -q '# added by immurok install' "$$rc"; then \
@@ -108,20 +90,7 @@ uninstall:
 			echo "✓ 已从 $$rc 移除 PATH 配置"; \
 		fi; \
 	done
-	@# ── Remove PAM module ──
-	-sudo rm -f $(PAM_DIR)/pam_immurok.so 2>/dev/null
-	@# ── Remove polkit policy + systemd overrides ──
-	-sudo rm -f $(POLKIT_DIR)/com.immurok.pam-helper.policy 2>/dev/null
-	-sudo rm -f $(POLKIT_OVERRIDE_DIR)/immurok.conf 2>/dev/null
-	-sudo rmdir $(POLKIT_OVERRIDE_DIR) 2>/dev/null
-	-sudo rm -f $(POLKIT_HELPER_OVERRIDE_DIR)/immurok.conf 2>/dev/null
-	-sudo rmdir $(POLKIT_HELPER_OVERRIDE_DIR) 2>/dev/null
-	-sudo systemctl daemon-reload 2>/dev/null
-	-sudo systemctl restart polkit 2>/dev/null
-	systemctl --user daemon-reload
-	@# ── Remove runtime sockets ──
-	-rm -rf /run/user/$$(id -u)/immurok 2>/dev/null
-	@echo "=== Done (user data in ~/.immurok preserved) ==="
+	@echo "=== Done$(if $(PURGE), (含 /var/lib/immurok), （/var/lib/immurok 保留，PURGE=1 可一并删除）) ==="
 
 clean:
 	$(CARGO) clean

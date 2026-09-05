@@ -131,6 +131,9 @@ pub enum Response {
         name: String,
         battery: u8,
         version: String,
+        /// 设备自己说它没和本机配对（工厂复位 / 槽被清）。主机的 pairing.json
+        /// 还在时，这是唯一能戳破「Paired: Yes」假象的信息。
+        device_unpaired: bool,
     },
 }
 
@@ -358,9 +361,12 @@ pub fn serialize_response(resp: &Response) -> String {
             name,
             battery,
             version,
+            device_unpaired,
         } => {
             let conn_flag = if *connected { 1u8 } else { 0u8 };
-            format!("STATUS:{conn_flag}:{name}:{battery}:{version}")
+            // device_unpaired 追加在末尾：老客户端按下标取前四项，不受影响。
+            let unpaired_flag = if *device_unpaired { 1u8 } else { 0u8 };
+            format!("STATUS:{conn_flag}:{name}:{battery}:{version}:{unpaired_flag}")
         }
     }
 }
@@ -454,9 +460,10 @@ mod tests {
             name: "immurok-AB12".to_string(),
             battery: 85,
             version: "v1.0.0".to_string(),
+            device_unpaired: false,
         };
         let s = serialize_response(&resp);
-        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0");
+        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0:0");
 
         // disconnected variant
         let resp_off = Response::Status {
@@ -464,9 +471,23 @@ mod tests {
             name: String::new(),
             battery: 0,
             version: String::new(),
+            device_unpaired: false,
         };
         let s_off = serialize_response(&resp_off);
-        assert_eq!(s_off, "STATUS:0::0:");
+        assert_eq!(s_off, "STATUS:0::0::0");
+
+        // 设备自报未配对：新字段追加在末尾，前四段与老格式逐字节一致 ——
+        // 老客户端按下标取值，不会因为多一段而错乱。
+        let resp_unpaired = Response::Status {
+            connected: true,
+            name: "immurok-AB12".to_string(),
+            battery: 85,
+            version: "v1.0.0".to_string(),
+            device_unpaired: true,
+        };
+        let s_unpaired = serialize_response(&resp_unpaired);
+        assert_eq!(s_unpaired, "STATUS:1:immurok-AB12:85:v1.0.0:1");
+        assert!(s_unpaired.starts_with("STATUS:1:immurok-AB12:85:v1.0.0"));
     }
 
     #[test]

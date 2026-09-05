@@ -100,7 +100,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().add_modifier(Modifier::BOLD),
             ));
         }
-        if !app.paired {
+        // 设备的说法优先于本地推断：设备被工厂复位后本地仍然认为已配对，
+        // 而认证会全部静默失败 —— 那一行必须刺眼。
+        if app.device_unpaired {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                "DEVICE NOT PAIRED — run 'immurok-cli pair'",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ));
+        } else if !app.paired {
             spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
             spans.push(Span::styled("not paired", Style::default().fg(WARN)));
         }
@@ -674,6 +682,39 @@ fn draw_pam(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Isolation first: a daemon running as the logged-in user means any of
+    // that user's processes can stop it and answer PAM in its place, so this
+    // outranks anything else on the tab.
+    lines.push(match app.isolated {
+        Some(true) => Line::from(vec![
+            Span::styled("  ✓ ", Style::default().fg(OK)),
+            Span::styled(
+                "isolated daemon",
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   running as its own system user",
+                Style::default().fg(DIM),
+            ),
+        ]),
+        Some(false) => Line::from(vec![
+            Span::styled("  ✗ ", Style::default().fg(ERR)),
+            Span::styled(
+                "NOT isolated",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   running as YOUR user — any of your processes can pass sudo. Run 'make install'.",
+                Style::default().fg(ERR),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            "  ? isolation unknown (daemon not reachable)",
+            Style::default().fg(DIM),
+        )),
+    });
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  install/remove needs admin auth — pkexec will prompt.",
         Style::default().fg(DIM),
@@ -712,7 +753,7 @@ fn draw_pam(f: &mut Frame, app: &App, area: Rect) {
 // ── Logs tab ─────────────────────────────────────────────────
 
 fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let live = app.log_child.is_some();
+    let live = app.log_stream.is_some();
     let tail = if !live {
         Span::styled("● stream closed ", Style::default().fg(ERR))
     } else if app.log_scroll == 0 {
@@ -730,7 +771,7 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " Logs · ~/.immurok/logs.txt ",
+            " Logs · immurok-daemon ",
             Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
         ))
         .title_top(Line::from(tail).right_aligned())

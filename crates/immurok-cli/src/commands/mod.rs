@@ -263,6 +263,13 @@ pub fn requires_pairing(cmd: &Commands) -> bool {
         // Slot status is readable while unpaired — that is exactly how a
         // new host learns it is the second one.
         | Commands::Slot(_)
+        // `settings` is read-only (run_show) and everything it prints is about
+        // *this host*, not the device: feature toggles, whether the daemon is
+        // privilege-separated, and which PAM services are wired up. A fresh
+        // install that has not paired yet is exactly when someone wants to
+        // check those — gating it behind pairing hid the isolation line from
+        // the one situation it was added for.
+        | Commands::Settings
         // Both recovery commands are deliberately NOT gated. Their real
         // authority lives on the device (SLOT_CLEAR runs on the slot's own
         // link; FACTORY_RESET is fingerprint-gated by the firmware, which
@@ -281,7 +288,6 @@ pub fn requires_pairing(cmd: &Commands) -> bool {
         | Commands::Fp(_)
         | Commands::Key(_)
         | Commands::Set(_)
-        | Commands::Settings
         | Commands::Pam(_) => true,
     }
 }
@@ -341,6 +347,11 @@ mod tests {
     fn pairing_gate_classification() {
         // Whitelist — usable before pairing (design doc §2)
         assert!(!requires_pairing(&Commands::Status));
+        // 这条曾经断言 settings 必须被闸住（写白名单时它只显示设备相关的功能
+        // 开关）。加入「daemon 是否特权分离」和 PAM 装配状态之后，它的内容变成
+        // 了纯本机信息，而新装未配对恰恰是最需要看这两项的时刻。改的是只读命令
+        // 的可见性，写操作（Set）仍然闸住。
+        assert!(!requires_pairing(&Commands::Settings));
         assert!(!requires_pairing(&Commands::Pair));
         assert!(!requires_pairing(&Commands::Logs));
         assert!(!requires_pairing(&Commands::Tui));
@@ -366,7 +377,6 @@ mod tests {
         assert!(requires_pairing(&Commands::Fp(FpCommands::List)));
         assert!(requires_pairing(&Commands::Key(KeyCommands::List { category: "ssh".into() })));
         assert!(requires_pairing(&Commands::Set(SetCommands::Sudo { value: "on".into() })));
-        assert!(requires_pairing(&Commands::Settings));
         assert!(requires_pairing(&Commands::Pam(PamCommands::Check)));
     }
 }

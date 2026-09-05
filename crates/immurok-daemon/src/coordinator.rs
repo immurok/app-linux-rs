@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+
+/// How long an `imk run --agent` claim stays useful for log classification.
+const AGENT_CLAIM_TTL_SECS: u64 = 3600;
 use tracing::{info, warn};
 
 use immurok_common::types::{DeviceStatus, EnrollEvent, PairProgress, PairingData};
@@ -106,6 +109,13 @@ pub struct Coordinator {
     /// optimistically on an unexpected answer, a timeout, or no pairing at
     /// all, for backwards compatibility — this is real proof, so it is the
     /// only sound basis for "the slot the device is presenting is MINE".
+    /// 设备在 GET_STATUS 里自报「我没和你配对」。
+    ///
+    /// 设备被工厂复位（或本机对应的槽在别处被清掉）之后，主机的 pairing.json
+    /// 还在，于是每个界面都显示 Paired: Yes 而所有认证静默失败。设备其实在每个
+    /// 会话的第一条响应里就说了，这个标志把那句话保存下来供 UI 使用。
+    pub device_reports_unpaired: AtomicBool,
+
     pub challenge_verified: AtomicBool,
     pub is_connected: AtomicBool,
     pub screen_locked: AtomicBool,
@@ -131,6 +141,25 @@ pub struct Coordinator {
     // lock that fires 1.6s after every touch rising edge — a successful auth
     // where the user lingers on the pad would otherwise immediately re-lock.
     last_auth_flow: RwLock<Option<Instant>>,
+
+    // 用户会话代理（immurok-session-agent）的出站通道。daemon 以系统用户运行、
+    // 没有会话总线也没有显示，所有 UI 都得托它做。None = 没人订阅：那就没有
+    // 窗口，认证本身不受影响 —— 触摸才是门。
+    pub ui_out: RwLock<Option<mpsc::UnboundedSender<String>>>,
+    /// 代理报上来的「用户点了取消」。broadcast 是因为 handle_auth 与
+    /// handle_agent_approve 都要在各自的 select 里等这一件事。
+    pub ui_cancel_tx: broadcast::Sender<()>,
+
+    /// `imk run --agent` 声称过的进程：pid → (记录时刻, 命令)。
+    ///
+    /// 以前这是 ~/.immurok/markers/<pid> 文件。daemon 换成专用系统用户之后
+    /// 那些文件它读不到（0600 归调用者），而放宽到 0644 会把 agent 执行的
+    /// 命令文本泄露给同机其他用户。现在改由 AGENT_APPROVE 自己登记：pid 来
+    /// 自 SO_PEERCRED，比任何人都能创建的文件更可信，也不用在 /run 下留一
+    /// 个全局可写目录。
+    ///
+    /// 仍然只用于日志归类，不参与放行。
+    agent_claims: RwLock<std::collections::HashMap<u32, (Instant, String)>>,
 
     // Notify for auth-dialog kill
     pub auth_dialog_cancel: Notify,
@@ -159,13 +188,13 @@ pub struct Coordinator {
     pub is_suspending: AtomicBool,
 
     // Paths
-    pub immurok_dir: std::path::PathBuf,
+    pub state_dir: std::path::PathBuf,
 }
 
 impl Coordinator {
     pub fn new(
         ble_cmd_tx: mpsc::Sender<BleCommand>,
-        immurok_dir: std::path::PathBuf,
+        state_dir: std::path::PathBuf,
     ) -> Arc<Self> {
         let (fp_match_tx, _) = broadcast::channel(16);
         let (enroll_tx, _) = broadcast::channel(16);
@@ -176,6 +205,7 @@ impl Coordinator {
             settings: RwLock::new(Settings::default()),
             device_status: RwLock::new(None),
             is_device_verified: AtomicBool::new(false),
+            device_reports_unpaired: AtomicBool::new(false),
             challenge_verified: AtomicBool::new(false),
             is_connected: AtomicBool::new(false),
             screen_locked: AtomicBool::new(false),
@@ -189,11 +219,14 @@ impl Coordinator {
             pending_pam: RwLock::new(None),
             pre_auth: RwLock::new(None),
             last_auth_flow: RwLock::new(None),
+            ui_out: RwLock::new(None),
+            ui_cancel_tx: broadcast::channel(4).0,
+            agent_claims: RwLock::new(std::collections::HashMap::new()),
             auth_dialog_cancel: Notify::new(),
             gate_cancel: Notify::new(),
             resume_notify: Notify::new(),
             is_suspending: AtomicBool::new(false),
-            immurok_dir,
+            state_dir,
         })
     }
 
@@ -319,14 +352,30 @@ impl Coordinator {
         }
     }
 
+    /// The owner's graphical session id.
+    ///
+    /// `loginctl unlock-session` with no argument acts on *the caller's own*
+    /// session — which a system daemon does not have, so it could only ever
+    /// fail. The target has to be named explicitly, and unlocking someone
+    /// else's session is what the polkit rule we ship allows.
+    async fn target_session(&self) -> Option<String> {
+        let uid = crate::session::owner_uid()?;
+        crate::session::graphical_session_id(uid).await
+    }
+
     async fn unlock_screen(&self) {
+        let Some(session_id) = self.target_session().await else {
+            warn!("Cannot unlock: no graphical session for the device owner");
+            return;
+        };
         let result = tokio::process::Command::new("loginctl")
             .arg("unlock-session")
+            .arg(&session_id)
             .output()
             .await;
         match result {
             Ok(output) if output.status.success() => {
-                info!("Screen unlocked via loginctl");
+                info!("Screen unlocked via loginctl (session {})", session_id);
                 self.set_pre_auth(
                     Duration::from_secs(immurok_common::protocol::PRE_AUTH_DURATION_SECS),
                     UNLOCK_FOLLOWUP_SERVICES,
@@ -371,12 +420,19 @@ impl Coordinator {
     }
 
     async fn lock_screen(&self) {
+        let Some(session_id) = self.target_session().await else {
+            warn!("Cannot lock: no graphical session for the device owner");
+            return;
+        };
         let result = tokio::process::Command::new("loginctl")
             .arg("lock-session")
+            .arg(&session_id)
             .output()
             .await;
         match result {
-            Ok(output) if output.status.success() => info!("Screen locked via loginctl"),
+            Ok(output) if output.status.success() => {
+                info!("Screen locked via loginctl (session {})", session_id)
+            }
             Ok(output) => warn!("loginctl lock-session failed: {:?}", output.status),
             Err(e) => warn!("Failed to run loginctl: {}", e),
         }
@@ -468,15 +524,44 @@ impl Coordinator {
         rx.await.map_err(|_| "BLE reply dropped".to_string())?
     }
 
+    /// Remember that `pid` ran a command through `imk run --agent`.
+    pub async fn record_agent_claim(&self, pid: u32, command: &str) {
+        let mut claims = self.agent_claims.write().await;
+        // Drop entries whose process is gone: pids get reused, and a stale
+        // claim would mislabel whatever inherits the number.
+        claims.retain(|p, _| std::path::Path::new(&format!("/proc/{}", p)).exists());
+        claims.insert(pid, (Instant::now(), command.to_string()));
+    }
+
+    /// The command `pid` claimed, if it did and the claim is still fresh.
+    pub async fn agent_claim(&self, pid: u32) -> Option<String> {
+        let claims = self.agent_claims.read().await;
+        claims
+            .get(&pid)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(AGENT_CLAIM_TTL_SECS))
+            .map(|(_, cmd)| cmd.clone())
+    }
+
+    /// Push one line to the session agent.
+    ///
+    /// `false` means nobody is subscribed. Callers must treat that as "no UI
+    /// available" and carry on — never as a failure, and never as consent.
+    pub async fn push_ui(&self, line: impl Into<String>) -> bool {
+        match self.ui_out.read().await.as_ref() {
+            Some(tx) => tx.send(line.into()).is_ok(),
+            None => false,
+        }
+    }
+
     pub fn settings_path(&self) -> std::path::PathBuf {
-        self.immurok_dir
+        self.state_dir
             .join(immurok_common::protocol::SETTINGS_FILE)
     }
 
     // Kept for symmetry with settings_path / external tooling; unused internally.
     #[allow(dead_code)]
     pub fn pairing_path(&self) -> std::path::PathBuf {
-        self.immurok_dir
+        self.state_dir
             .join(immurok_common::protocol::PAIRING_FILE)
     }
 }

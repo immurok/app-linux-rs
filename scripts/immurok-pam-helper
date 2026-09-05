@@ -4,6 +4,8 @@
 #
 # 用法: immurok-pam-helper add <service> [service...]
 #        immurok-pam-helper remove <service> [service...]
+#        immurok-pam-helper migrate-daemon <user>
+#        immurok-pam-helper purge-daemon [--keep-state|--purge-state]
 #
 # service: sudo | gdm-password | polkit-1
 #
@@ -53,7 +55,208 @@ check_module() {
 }
 
 # ── 操作 ─────────────────────────────────────────────────────
+# ── 特权分离：把 daemon 从用户级搬到专用系统用户 ──────────────
+#
+# 全部 root 步骤集中在这里，Makefile 与 TUI 调用同一份实现。用户级的那
+# 一半（停掉 systemctl --user 单元）也放这里 —— 顺序很关键：必须先停旧
+# daemon 再起新的，否则两个进程会抢同一条 GATT 通道。
+#
+# 下面的变量可被覆盖，test-migrate-daemon.sh 靠它们在非 root 下跑完整流程。
+DAEMON_USER="${IMMUROK_DAEMON_USER:-immurok}"
+STATE_DIR="${IMMUROK_STATE_DIR:-/var/lib/immurok}"
+SYSTEM_UNIT="${IMMUROK_SYSTEM_UNIT:-/etc/systemd/system/immurok-daemon.service}"
+LEGACY_OVERRIDES="${IMMUROK_LEGACY_OVERRIDES:-/etc/systemd/system/polkit.service.d/immurok.conf /etc/systemd/system/polkit-agent-helper@.service.d/immurok.conf}"
+# 只搬 daemon 自己拥有的状态。fwupdate/ 缓存归 CLI（用户身份下载后经
+# socket 推给 daemon），markers/ 与 logs.txt 是瞬时数据，都留在原地。
+MIGRATE_FILES="pairing.json settings.json ssh_keys.json key_names.json keystore_digests.json"
+
+run_systemctl() {
+    [ "${IMMUROK_SKIP_SYSTEMCTL:-}" = "1" ] && return 0
+    systemctl "$@"
+}
+
+# 以目标用户身份读文件。不用 root 直接 cat：源文件在用户可写的目录里，
+# 换成软链就能诱导 root 把别的文件复制进 STATE_DIR。以用户身份读，最坏
+# 也只是读到他本来就能读的东西。
+read_as_user() {
+    local user="$1" path="$2"
+    # 已经是本人（非 root 手动迁移或跑测试）就直接读，没有权可降。
+    if [ "$(id -u)" -ne 0 ]; then
+        cat "$path" 2>/dev/null
+        return
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$user" -- cat "$path" 2>/dev/null
+    else
+        su -s /bin/sh -c "cat $(printf '%q' "$path")" "$user" 2>/dev/null
+    fi
+}
+
+ensure_daemon_user() {
+    [ "${IMMUROK_SKIP_USERADD:-}" = "1" ] && { echo "OK:USER_SKIPPED"; return 0; }
+    if getent passwd "$DAEMON_USER" >/dev/null 2>&1; then
+        echo "OK:USER_EXISTS($DAEMON_USER)"
+    else
+        local shell=""
+        for c in /usr/sbin/nologin /sbin/nologin /usr/bin/nologin /bin/false; do
+            [ -x "$c" ] && shell="$c" && break
+        done
+        getent group "$DAEMON_USER" >/dev/null 2>&1 || groupadd --system "$DAEMON_USER" || {
+            echo "ERROR:GROUPADD_FAILED"; return 1; }
+        useradd --system --no-create-home -g "$DAEMON_USER" \
+                ${shell:+--shell "$shell"} "$DAEMON_USER" || {
+            echo "ERROR:USERADD_FAILED"; return 1; }
+        echo "OK:USER_CREATED($DAEMON_USER)"
+    fi
+    # BlueZ 授权来自我们自带的 D-Bus policy；有些发行版的 bluetooth.conf
+    # 另外按组放行，两条都占上更稳。组不存在就跳过。
+    if getent group bluetooth >/dev/null 2>&1; then
+        usermod -aG bluetooth "$DAEMON_USER" 2>/dev/null \
+            && echo "OK:GROUP_BLUETOOTH" || echo "OK:GROUP_BLUETOOTH_SKIPPED"
+    fi
+}
+
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR" || { echo "ERROR:STATE_DIR_FAILED"; return 1; }
+    chmod 700 "$STATE_DIR"
+    [ "${IMMUROK_SKIP_USERADD:-}" = "1" ] || chown "$DAEMON_USER:$DAEMON_USER" "$STATE_DIR"
+    echo "OK:STATE_DIR($STATE_DIR)"
+}
+
+# 记下设备属主 uid。daemon 用它拒绝「同机另一个账号借你的指纹提权」——
+# socket 现在是全机一个，AUTH 里的 user 字段必须校验。已存在则不覆盖。
+record_owner() {
+    local user="$1" uid path="$STATE_DIR/owner"
+    uid=$(id -u "$user" 2>/dev/null) || { echo "ERROR:NO_UID($user)"; return 0; }
+    if [ -e "$path" ]; then echo "OK:OWNER_EXISTS($(cat "$path" 2>/dev/null))"; return 0; fi
+    echo "$uid" > "$path"
+    chmod 600 "$path"
+    [ "${IMMUROK_SKIP_USERADD:-}" = "1" ] || chown "$DAEMON_USER:$DAEMON_USER" "$path"
+    echo "OK:OWNER_RECORDED($uid)"
+}
+
+migrate_one_file() {
+    local user="$1" home="$2" name="$3"
+    local src="$home/.immurok/$name" dst="$STATE_DIR/$name"
+
+    if [ -e "$dst" ]; then echo "OK:ALREADY_MIGRATED($name)"; return 0; fi
+    if [ -L "$src" ]; then echo "ERROR:SYMLINK_REFUSED($name)"; return 0; fi
+    if [ ! -f "$src" ]; then echo "OK:ABSENT($name)"; return 0; fi
+
+    local tmp="$dst.migrating"
+    if ! read_as_user "$user" "$src" > "$tmp"; then
+        rm -f "$tmp"; echo "ERROR:READ_FAILED($name)"; return 0
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; echo "ERROR:EMPTY_SOURCE($name)"; return 0
+    fi
+    chmod 600 "$tmp"
+    [ "${IMMUROK_SKIP_USERADD:-}" = "1" ] || chown "$DAEMON_USER:$DAEMON_USER" "$tmp"
+    mv -f "$tmp" "$dst"
+    # 原件改名而不是删除：迁移出问题时用户还能自己搬回去。
+    mv -f "$src" "$src.migrated"
+    echo "OK:MIGRATED($name)"
+}
+
+stop_user_daemon() {
+    local user="$1" uid
+    uid=$(id -u "$user" 2>/dev/null) || { echo "ERROR:NO_UID($user)"; return 0; }
+    [ "${IMMUROK_SKIP_SYSTEMCTL:-}" = "1" ] && { echo "OK:USER_UNIT_SKIPPED"; return 0; }
+    # systemctl --user 要目标用户的会话总线，所以带着 XDG_RUNTIME_DIR 切过去。
+    # 用户没登录时这步失败，没关系：那就没有旧 daemon 在跑。
+    if runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" \
+            systemctl --user disable --now immurok-daemon.service >/dev/null 2>&1; then
+        echo "OK:USER_UNIT_STOPPED"
+    else
+        echo "OK:USER_UNIT_ABSENT"
+    fi
+}
+
+drop_legacy_overrides() {
+    # 这两个 override 是「socket 在 /run/user/<uid>」时代给 polkit 开的口子
+    # （ProtectHome=yes 会把 /run/user 整个挡掉）。socket 搬到 /run/immurok
+    # 之后不再需要，删掉即可把 polkit 沙箱还原成发行版默认。
+    #
+    # 故意不 restart polkit：我们自己很可能正跑在 pkexec 里，而残留的
+    # override 在下次 polkit 重启前是无害的。
+    local removed=0
+    for f in $LEGACY_OVERRIDES; do
+        if [ -f "$f" ]; then
+            rm -f "$f" && removed=1
+            rmdir "$(dirname "$f")" 2>/dev/null
+        fi
+    done
+    if [ "$removed" = "1" ]; then echo "OK:LEGACY_OVERRIDES_REMOVED"; else echo "OK:NO_LEGACY_OVERRIDES"; fi
+}
+
+start_system_daemon() {
+    if [ ! -f "$SYSTEM_UNIT" ]; then echo "ERROR:UNIT_NOT_INSTALLED"; return 1; fi
+    run_systemctl daemon-reload
+    run_systemctl enable immurok-daemon.service >/dev/null 2>&1
+    # restart 而不是 --now：--now 对已在运行的服务是空操作，重装新二进制
+    # 时旧进程会一直跑着，install 就不是升级路径了。
+    if run_systemctl restart immurok-daemon.service >/dev/null 2>&1; then
+        echo "OK:SYSTEM_UNIT_STARTED"
+    else
+        echo "ERROR:SYSTEM_UNIT_START_FAILED"
+        return 1
+    fi
+}
+
+migrate_daemon() {
+    local user="${1:-}"
+    [ -z "$user" ] && { echo "ERROR:NO_USER"; return 1; }
+    # IMMUROK_HOME 是测试钩子（同 IMMUROK_PAM_D），正常路径查 passwd。
+    local home="${IMMUROK_HOME:-}"
+    [ -n "$home" ] || home=$(getent passwd "$user" | cut -d: -f6)
+    [ -z "$home" ] && { echo "ERROR:UNKNOWN_USER($user)"; return 1; }
+
+    stop_user_daemon "$user"
+    ensure_daemon_user || return 1
+    ensure_state_dir || return 1
+    record_owner "$user"
+    for f in $MIGRATE_FILES; do
+        migrate_one_file "$user" "$home" "$f"
+    done
+    drop_legacy_overrides
+    start_system_daemon || return 1
+    echo "OK:MIGRATED"
+}
+
+purge_daemon() {
+    local mode="${1:---keep-state}"
+    if [ "${IMMUROK_SKIP_SYSTEMCTL:-}" != "1" ]; then
+        systemctl disable --now immurok-daemon.service >/dev/null 2>&1
+        rm -f "$SYSTEM_UNIT"
+        systemctl daemon-reload
+    fi
+    echo "OK:UNIT_REMOVED"
+
+    if [ "$mode" = "--purge-state" ]; then
+        rm -rf "$STATE_DIR"
+        echo "OK:STATE_PURGED($STATE_DIR)"
+    else
+        echo "OK:STATE_KEPT($STATE_DIR)"
+    fi
+
+    if [ "${IMMUROK_SKIP_USERADD:-}" != "1" ] && getent passwd "$DAEMON_USER" >/dev/null 2>&1; then
+        if userdel "$DAEMON_USER" >/dev/null 2>&1; then
+            echo "OK:USER_REMOVED($DAEMON_USER)"
+        else
+            echo "ERROR:USERDEL_FAILED($DAEMON_USER)"
+        fi
+        getent group "$DAEMON_USER" >/dev/null 2>&1 && groupdel "$DAEMON_USER" >/dev/null 2>&1
+    else
+        echo "OK:NO_USER($DAEMON_USER)"
+    fi
+}
+
 ACTION="$1"; shift || true
+
+case "$ACTION" in
+    migrate-daemon) migrate_daemon "${1:-}"; exit $? ;;
+    purge-daemon)   purge_daemon "${1:---keep-state}"; exit $? ;;
+esac
 
 process_one() {
     local SERVICE="$1"

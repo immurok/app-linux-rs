@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "immurok-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "chrono",
@@ -1203,6 +1203,7 @@ dependencies = [
  "hex",
  "immurok-common",
  "indicatif",
+ "libc",
  "p256",
  "ratatui",
  "serde",
@@ -1215,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "immurok-common"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "hkdf",
@@ -1232,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "immurok-daemon"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "bluer",
@@ -1250,6 +1251,15 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zbus",
+]
+
+[[package]]
+name = "immurok-session-agent"
+version = "0.6.0"
+dependencies = [
+ "immurok-common",
+ "libc",
+ "tokio",
 ]
 
 [[package]]

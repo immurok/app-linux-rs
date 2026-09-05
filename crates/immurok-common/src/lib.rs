@@ -1,7 +1,9 @@
 pub mod dual_host;
 pub mod fwupdate;
 pub mod pam;
+pub mod paths;
 pub mod protocol;
 pub mod security;
+pub mod ssh_config;
 pub mod socket_proto;
 pub mod types;

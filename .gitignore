@@ -1,1 +1,5 @@
 /target/
+
+# PAM unit-test binaries (built by pam/Makefile `make test`)
+/pam/test_fp_policy
+/pam/test_socket_trust

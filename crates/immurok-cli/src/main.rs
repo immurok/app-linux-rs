@@ -91,24 +91,20 @@ fn main() {
         },
 
         Commands::Logs => {
-            // The daemon's tracing output goes to ~/.immurok/logs.txt —
-            // the journal only carries systemd start/stop lines.
-            let home = std::env::var("HOME").unwrap_or_default();
-            let log_path = std::path::PathBuf::from(&home)
-                .join(immurok_common::protocol::IMMUROK_DIR)
-                .join(immurok_common::protocol::LOG_FILE);
-            let status = std::process::Command::new("tail")
-                .args(["-n", "200", "-F"])
-                .arg(&log_path)
-                .status();
-            match status {
-                Ok(s) if !s.success() => {
-                    eprintln!("tail exited with: {}", s);
+            // The daemon writes to /var/log/immurok, owned by its own system
+            // user — we cannot read it, so it streams the buffered tail plus
+            // live lines over the socket instead.
+            use std::io::{BufRead, BufReader};
+            match socket_client::open_log_stream() {
+                Ok(stream) => {
+                    for line in BufReader::new(stream).lines() {
+                        match line {
+                            Ok(l) => println!("{}", l),
+                            Err(_) => break,
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Failed to run tail: {}", e);
-                }
-                _ => {}
+                Err(e) => eprintln!("{}", e),
             }
         }
 

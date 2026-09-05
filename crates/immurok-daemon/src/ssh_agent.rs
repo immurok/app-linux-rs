@@ -1,6 +1,6 @@
 //! SSH agent — implements the OpenSSH agent protocol over a Unix socket.
 //!
-//! Listens on `~/.immurok/agent.sock` (chmod 0o600).
+//! Listens on `<runtime_dir>/agent.sock` (chmod 0o600).
 //! Proxies sign requests to the hardware device via BLE (FP-gated ECDSA).
 //!
 //! Binary protocol: `[length:4B BE][type:1B][payload]`
@@ -41,18 +41,23 @@ pub async fn serve(coordinator: Arc<Coordinator>, socket_path: &Path) {
     let listener = match UnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
-            warn!(
-                "Failed to bind SSH agent socket at {}: {}",
+            // Same reasoning as the PAM socket: returning would end main()'s
+            // select! with exit 0 and no restart. See socket::serve.
+            tracing::error!(
+                "Failed to bind SSH agent socket at {}: {} — exiting",
                 socket_path.display(),
                 e
             );
-            return;
+            std::process::exit(1);
         }
     };
 
-    // chmod 0o600 — only current user should access the agent
+    // 0o666: the socket is owned by the daemon user now, so 0600 would lock
+    // out every human on the machine. Access control moved into
+    // verify_peer_uid (SO_PEERCRED + logind), and the socket sits in a
+    // directory ordinary users cannot write, so nobody can swap it out.
     if let Err(e) =
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
     {
         warn!("Failed to chmod agent socket: {}", e);
     }
@@ -77,10 +82,14 @@ pub async fn serve(coordinator: Arc<Coordinator>, socket_path: &Path) {
     }
 }
 
-/// Verify peer is current user via SO_PEERCRED.
-/// Verify the connecting process runs as our own UID and return its PID
-/// (from SO_PEERCRED) so the sign path can find the client's terminal.
-fn verify_peer_uid(stream: &UnixStream) -> Result<i32, String> {
+/// Verify the peer may use the agent, returning its PID (from SO_PEERCRED)
+/// so the sign path can find the client's terminal.
+///
+/// "Same uid as me" is meaningless now that `me` is the `immurok` system
+/// user — the keys belong to the person logged in at this machine, so that
+/// is who we check for (same rule as the management commands on the PAM
+/// socket; see socket::authorize).
+async fn verify_peer_uid(stream: &UnixStream) -> Result<i32, String> {
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();
@@ -101,12 +110,16 @@ fn verify_peer_uid(stream: &UnixStream) -> Result<i32, String> {
         return Err("getsockopt(SO_PEERCRED) failed".into());
     }
 
-    let my_uid = unsafe { libc::getuid() };
-    if cred.uid != my_uid {
-        return Err(format!(
-            "Rejected UID {} (expected {})",
-            cred.uid, my_uid
-        ));
+    if cred.uid != 0 {
+        let allowed = match crate::session::uid_is_active(cred.uid).await {
+            Some(active) => active,
+            // logind unreachable — fall back to the recorded owner so a
+            // broken logind does not silently kill SSH signing.
+            None => crate::session::owner_uid() == Some(cred.uid),
+        };
+        if !allowed {
+            return Err(format!("Rejected UID {} (no active session)", cred.uid));
+        }
     }
 
     Ok(cred.pid)
@@ -117,7 +130,7 @@ async fn handle_agent_client(
     mut stream: UnixStream,
     coord: Arc<Coordinator>,
 ) -> Result<(), String> {
-    let peer_pid = match verify_peer_uid(&stream) {
+    let peer_pid = match verify_peer_uid(&stream).await {
         Ok(pid) => pid,
         Err(e) => {
             warn!("SSH agent peer check failed: {}", e);
@@ -166,7 +179,7 @@ async fn handle_agent_client(
 // ── REQUEST_IDENTITIES ──────────────────────────────────────
 
 async fn handle_request_identities(stream: &mut UnixStream, coord: &Arc<Coordinator>) {
-    let keys = keystore::load_ssh_keys(&coord.immurok_dir);
+    let keys = keystore::load_ssh_keys(&coord.state_dir);
 
     let mut body = Vec::new();
     body.push(SSH_AGENT_IDENTITIES_ANSWER);
@@ -215,7 +228,7 @@ async fn handle_sign_request(
     // let _flags = read_u32_be(payload, &mut offset);
 
     // Find key index in cache
-    let keys = keystore::load_ssh_keys(&coord.immurok_dir);
+    let keys = keystore::load_ssh_keys(&coord.state_dir);
     let matching = keys.iter().find(|k| k.public_key_blob == key_blob);
     let key_entry = match matching {
         Some(e) => e,

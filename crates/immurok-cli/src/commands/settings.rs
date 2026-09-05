@@ -38,6 +38,29 @@ pub fn run_show() {
         }
     }
 
+    // Privilege separation status — the one line that says whether the PAM
+    // channel can be hijacked by any process running as this user.
+    println!();
+    println!("Daemon:");
+    match crate::socket_client::probe_isolation() {
+        Some(iso) if iso.isolated => {
+            println!(
+                "  {:<16} \x1b[32misolated\x1b[0m (uid {}, {})",
+                "privileges",
+                iso.daemon_uid.unwrap_or(0),
+                iso.socket
+            );
+        }
+        Some(_) => {
+            println!(
+                "  {:<16} \x1b[31mNOT isolated\x1b[0m — running as your user; any of your \
+                 processes can pass sudo. Run 'make install' to migrate.",
+                "privileges"
+            );
+        }
+        None => println!("  {:<16} unknown (daemon not reachable)", "privileges"),
+    }
+
     // Check PAM installation status
     println!();
     println!("PAM status:");

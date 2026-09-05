@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -338,7 +337,14 @@ pub struct App {
     pub log_scroll: usize,
     /// Owned `tail -F` child while the Logs panel is open. Kept here so
     /// that exiting the panel can `kill()` it deterministically.
-    pub log_child: Option<Child>,
+    /// 设备自己说它没和本机配对（工厂复位 / 槽被清）。与 `paired` 不同 ——
+    /// 那个来自本地 pairing.json，在这种情况下会一直显示已配对。
+    pub device_unpaired: bool,
+    /// Whether the daemon is privilege-separated. `None` = not probed yet or
+    /// daemon unreachable.
+    pub isolated: Option<bool>,
+    /// Live log subscription to the daemon (None = panel closed).
+    pub log_stream: Option<std::os::unix::net::UnixStream>,
 
     // Background action results
     pub action_rx: mpsc::Receiver<ActionResult>,
@@ -429,7 +435,9 @@ impl App {
             pam_cursor: 0,
             log_lines: VecDeque::with_capacity(LOG_BUFFER_CAP),
             log_scroll: 0,
-            log_child: None,
+            device_unpaired: false,
+            isolated: None,
+            log_stream: None,
             action_rx,
             action_tx,
         }
@@ -528,6 +536,8 @@ impl App {
                 self.device_name = parts[2].to_string();
                 self.battery = parts[3].parse().unwrap_or(0);
                 self.fw_version = parts[4].to_string();
+                // 第 6 段是设备自己说的「我没和你配对」（老 daemon 没有这段）。
+                self.device_unpaired = parts.get(5) == Some(&"1");
             }
         } else {
             self.daemon_ok = false;
@@ -623,21 +633,20 @@ impl App {
         self.pam_polkit = immurok_common::pam::pam_line_present("polkit-1");
         self.pam_screen = immurok_common::pam::pam_line_present("gdm-password");
 
-        // Key cache (cheap — just JSON files maintained by the daemon)
+        // Key cache (cheap — one socket round-trip to the daemon)
         self.refresh_keys();
+        self.isolated = crate::socket_client::probe_isolation().map(|i| i.isolated);
     }
 
-    /// Reload key cache files (ssh_keys.json, key_names.json) into memory.
+    /// Reload the daemon's key caches into memory.
+    ///
+    /// These were files under ~/.immurok; the daemon keeps its state in a
+    /// 0700 directory of its own now and serves the JSON over the socket.
     pub fn refresh_keys(&mut self) {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let immurok_dir = std::path::PathBuf::from(&home).join(protocol::IMMUROK_DIR);
-
         // SSH
-        let ssh_path = immurok_dir.join(protocol::SSH_KEYS_FILE);
         let mut ssh_rows: Vec<SshKeyRow> = Vec::new();
-        if let Ok(contents) = std::fs::read_to_string(&ssh_path) {
-            let entries: Vec<serde_json::Value> =
-                serde_json::from_str(&contents).unwrap_or_default();
+        {
+            let entries = crate::socket_client::fetch_key_cache("ssh");
             for e in &entries {
                 let idx = e["index"].as_u64().unwrap_or(0) as u8;
                 let name = e["name"].as_str().unwrap_or("-").to_string();
@@ -653,13 +662,11 @@ impl App {
         }
         self.ssh_keys = ssh_rows;
 
-        // OTP + API share the same names file
-        let names_path = immurok_dir.join(protocol::KEY_NAMES_FILE);
+        // OTP + API share one cache
         let mut otp_rows: Vec<NameKeyRow> = Vec::new();
         let mut api_rows: Vec<NameKeyRow> = Vec::new();
-        if let Ok(contents) = std::fs::read_to_string(&names_path) {
-            let entries: Vec<serde_json::Value> =
-                serde_json::from_str(&contents).unwrap_or_default();
+        {
+            let entries = crate::socket_client::fetch_key_cache("names");
             for e in &entries {
                 let idx = e["index"].as_u64().unwrap_or(0) as u8;
                 let name = e["name"].as_str().unwrap_or("-").to_string();
@@ -1866,40 +1873,30 @@ impl App {
 
     // ── Logs panel ────────────────────────────────────────────
 
-    /// Tail `~/.immurok/logs.txt` (the daemon's tracing output — the journal
-    /// only carries systemd start/stop lines) and stream its stdout into the
-    /// in-TUI log ring buffer via the existing action channel. `-F` follows
-    /// across truncation/rotation and waits for the file to appear.
+    /// Subscribe to the daemon's log stream and feed the in-TUI ring buffer
+    /// through the existing action channel.
+    ///
+    /// This used to `tail -F ~/.immurok/logs.txt`. The daemon writes to
+    /// /var/log/immurok now, which its own system user owns and we cannot
+    /// read — so it sends us its buffered tail followed by live lines.
     fn start_log_stream(&mut self) {
-        if self.log_child.is_some() {
+        if self.log_stream.is_some() {
             return;
         }
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        let log_path = std::path::PathBuf::from(&home)
-            .join(protocol::IMMUROK_DIR)
-            .join(protocol::LOG_FILE);
-
-        let mut child = match Command::new("tail")
-            .args(["-n", "200", "-F"])
-            .arg(&log_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
+        let stream = match crate::socket_client::open_log_stream() {
+            Ok(s) => s,
             Err(e) => {
-                self.set_msg(&format!("Failed to start tail: {}", e), MessageStyle::Red);
+                self.set_msg(&format!("Log stream failed: {}", e), MessageStyle::Red);
                 return;
             }
         };
-
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                self.set_msg("tail produced no stdout", MessageStyle::Red);
+        // One handle for the reader thread, one kept here so leaving the
+        // panel can shut the socket down under it.
+        let reader_handle = match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_msg(&format!("Log stream failed: {}", e), MessageStyle::Red);
                 return;
             }
         };
@@ -1909,7 +1906,7 @@ impl App {
 
         let tx = self.action_tx.clone();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
+            let reader = BufReader::new(reader_handle);
             for line in reader.lines() {
                 match line {
                     Ok(l) => {
@@ -1923,15 +1920,15 @@ impl App {
             let _ = tx.send(ActionResult::LogEnded);
         });
 
-        self.log_child = Some(child);
+        self.log_stream = Some(stream);
     }
 
-    /// Kill the log-tail child (if any) and drop the buffer — re-entering
-    /// Logs starts fresh and avoids accumulating memory across sessions.
+    /// Close the log subscription and drop the buffer — re-entering Logs
+    /// starts fresh and avoids accumulating memory across sessions.
     fn stop_log_stream(&mut self) {
-        if let Some(mut child) = self.log_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(stream) = self.log_stream.take() {
+            // Shutting the socket down ends the reader thread's blocking read.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         self.log_lines.clear();
         self.log_scroll = 0;
@@ -1968,9 +1965,8 @@ impl App {
 
     /// Best-effort cleanup hook invoked on TUI shutdown.
     pub fn shutdown(&mut self) {
-        if let Some(mut child) = self.log_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(stream) = self.log_stream.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
 

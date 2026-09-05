@@ -1,0 +1,13 @@
+// Let the daemon lock and unlock the active graphical session.
+//
+// The daemon used to run as the logged-in user, where logind allows this
+// without authorization. As the `immurok` system user it is acting on someone
+// else's session, which logind gates behind a polkit check. Both Lock() and
+// Unlock() map to the same action id — there is no separate "unlock-sessions"
+// action, despite the method name.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "immurok" &&
+        action.id == "org.freedesktop.login1.lock-sessions") {
+        return polkit.Result.YES;
+    }
+});

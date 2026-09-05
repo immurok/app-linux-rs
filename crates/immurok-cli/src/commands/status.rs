@@ -70,14 +70,32 @@ pub fn run() {
         .unwrap_or_default();
     let pair_parts: Vec<&str> = pair_rsp.split(':').collect();
     let paired = pair_parts.get(1) == Some(&"PAIRED");
+    // STATUS 的第 6 段是设备自己说的「我没和你配对」（老 daemon 没有这一段）。
+    // 本机说已配对、设备说没有，就是设备被工厂复位（或本机的槽在别处被清）后
+    // 的 split state：认证会全部静默失败，而在此之前这一行会一直显示 Yes。
+    let device_unpaired = parts.get(5) == Some(&"1");
     println!(
         "Paired:     {}",
-        if paired {
+        if device_unpaired {
+            "\x1b[31mNo (device says so)\x1b[0m"
+        } else if paired {
             "\x1b[32mYes\x1b[0m"
         } else {
             "\x1b[33mNo\x1b[0m"
         }
     );
+    if device_unpaired {
+        println!(
+            "\x1b[31m⚠ The device is no longer paired with this computer.\x1b[0m"
+        );
+        println!(
+            "  It was probably factory-reset, or this computer's slot was cleared"
+        );
+        println!(
+            "  from the other host. Fingerprint auth will keep falling back to your"
+        );
+        println!("  password until you run: \x1b[1mimmurok-cli pair\x1b[0m");
+    }
 
     // FP:LIST (only if connected)
     if parts.first() == Some(&"STATUS") && parts.len() >= 2 && parts[1] == "1" {

@@ -130,8 +130,14 @@ else
 fi
 
 # dbus_fast — without it ble-notify-helper.py exits immediately and BLE
-# disconnect-reconnects in a loop
-if "$PY_ENV" -c 'import dbus_fast' >/dev/null 2>&1; then
+# disconnect-reconnects in a loop.
+#
+# 按 daemon 实际会用到的解释器判断，两个都试：系统 daemon 从 systemd 拿
+# 到的是默认 PATH（→ /usr/bin/python3），而开发者 shell 里的 python3 常常
+# 是某个 venv（.platformio / conda），少了 dbus_fast 却与 daemon 无关 ——
+# 只按前者判会报一个吓人的假警告。
+if "$PY_SYS" -c 'import dbus_fast' >/dev/null 2>&1 \
+   || "$PY_ENV" -c 'import dbus_fast' >/dev/null 2>&1; then
   ok "python dbus_fast  (BLE notify helper)"
 else
   warn "python dbus_fast" dbusfast; WARN=1

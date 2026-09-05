@@ -20,7 +20,19 @@ pub fn run_pair() {
     // `run_factory_reset` almost shipped with (its failure string contains
     // "RESET" too).
     let pair_rsp = client.send("PAIR:STATUS").unwrap_or_default();
-    if pair_rsp == "OK:PAIRED" {
+    // 设备明说它不认本机时，本地那份 pairing 已经是废纸，不该拿它把用户挡在
+    // 门外 —— 那正好是 status 刚建议他跑 pair 的那种状态，再让他先去 unpair
+    // 就是多绕一圈。配对成功时 daemon 会覆写本地记录。
+    let device_unpaired = crate::socket_client::DaemonClient::connect()
+        .and_then(|mut c| c.send("STATUS"))
+        .map(|r| r.split(':').nth(5) == Some("1"))
+        .unwrap_or(false);
+    if pair_rsp == "OK:PAIRED" && device_unpaired {
+        eprintln!(
+            "Local pairing exists but the device says it is not paired with this \
+             computer — replacing the stale record."
+        );
+    } else if pair_rsp == "OK:PAIRED" {
         eprintln!("Already paired. Unpair first with: immurok-cli unpair");
         std::process::exit(1);
     }

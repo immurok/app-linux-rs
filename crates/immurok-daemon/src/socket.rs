@@ -1,6 +1,7 @@
 //! PAM socket server — handles PAM authentication and CLI management requests.
 //!
-//! Listens on `~/.immurok/pam.sock` (chmod 0o666 so PAM-as-root can connect).
+//! Listens on `<runtime_dir>/pam.sock` (chmod 0o666 so PAM-as-root can connect;
+//! the directory itself is what keeps other users from rebinding it).
 //! Verifies peer credentials via `SO_PEERCRED` (accept root or current user).
 //! Dispatches parsed requests to handler functions and returns serialized responses.
 
@@ -30,8 +31,17 @@ pub async fn serve(coordinator: Arc<Coordinator>, socket_path: &Path) {
     let listener = match UnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
-            warn!("Failed to bind PAM socket at {}: {}", socket_path.display(), e);
-            return;
+            // Answering PAM is the whole job — a daemon that cannot bind is
+            // useless, and returning here would end the select! in main() with
+            // a *successful* exit, which Restart=on-failure ignores. Exit
+            // non-zero so systemd actually retries (and so a stale root-owned
+            // socket file surfaces as a restart loop, not silence).
+            tracing::error!(
+                "Failed to bind PAM socket at {}: {} — exiting",
+                socket_path.display(),
+                e
+            );
+            std::process::exit(1);
         }
     };
 
@@ -87,48 +97,25 @@ fn peer_pid_of(stream: &UnixStream) -> Option<u32> {
     }
 }
 
-/// Walk the parent chain of `start_pid` (max 12 levels) looking for an
-/// `imk run --agent` marker file. Returns `Some(command)` on the first
-/// match — highest-confidence signal that this PAM AUTH was triggered
-/// by an AI agent wrap. `None` means either manual user action (terminal
-/// sudo) or an agent we can't recognize. Mirrors macOS
-/// AuthCallerClassifier.classify (Sources/AuthCallerClassifier.swift),
-/// but Linux-flavored (/proc instead of libproc).
+/// Walk the parent chain of `start_pid` (max 12 levels) looking for a process
+/// that registered itself via `AGENT_APPROVE`. Returns `Some(command)` on the
+/// first match — the highest-confidence signal that this PAM AUTH was
+/// triggered by an AI agent wrap. `None` means manual user action (terminal
+/// sudo) or an agent we cannot recognise. Mirrors macOS
+/// AuthCallerClassifier.classify (Sources/AuthCallerClassifier.swift), but
+/// Linux-flavored (/proc instead of libproc).
 ///
-/// Marker format mirrors imk_main.rs AgentMarker.write:
-///   line 1: expiry epoch (seconds)
-///   line 2 (optional): wrapped command string
-fn classify_agent_marker(start_pid: u32) -> Option<String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let home = std::env::var("HOME").ok()?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+/// Log enrichment only — it must never gate anything.
+async fn classify_agent_claim(coord: &Arc<Coordinator>, start_pid: u32) -> Option<String> {
     let mut pid = start_pid;
     for _ in 0..12 {
-        let marker_path = format!("{}/.immurok/markers/{}", home, pid);
-        if let Ok(content) = std::fs::read_to_string(&marker_path) {
-            let mut lines = content.split('\n');
-            if let Some(expiry_str) = lines.next() {
-                if let Ok(expiry) = expiry_str.trim().parse::<u64>() {
-                    if now <= expiry {
-                        let cmd = lines.next().unwrap_or("").trim();
-                        return Some(if cmd.is_empty() { "<unknown>".into() } else { cmd.into() });
-                    }
-                    // Stale: best-effort cleanup so it doesn't pollute.
-                    let _ = std::fs::remove_file(&marker_path);
-                }
-            }
+        if let Some(cmd) = coord.agent_claim(pid).await {
+            return Some(cmd);
         }
-
-        // Walk up: read /proc/<pid>/status, find PPid line.
-        let parent = match read_ppid(pid) {
-            Some(p) if p > 1 => p,
+        match read_ppid(pid) {
+            Some(p) if p > 1 => pid = p,
             _ => break, // hit init or unreadable
-        };
-        pid = parent;
+        }
     }
     None
 }
@@ -143,9 +130,8 @@ fn read_ppid(pid: u32) -> Option<u32> {
     None
 }
 
-/// Verify peer credentials via SO_PEERCRED.
-/// Accept root (UID 0), current user, or polkitd (runs pam_immurok as its own UID).
-fn verify_peer_credentials(stream: &UnixStream) -> Result<(), String> {
+/// Peer uid from SO_PEERCRED.
+fn peer_uid_of(stream: &UnixStream) -> Option<u32> {
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();
@@ -161,27 +147,79 @@ fn verify_peer_credentials(stream: &UnixStream) -> Result<(), String> {
             &mut len,
         )
     };
-
-    if ret != 0 {
-        return Err("getsockopt(SO_PEERCRED) failed".into());
+    if ret == 0 {
+        Some(cred.uid)
+    } else {
+        None
     }
+}
 
-    let my_uid = unsafe { libc::getuid() };
-    if cred.uid != 0 && cred.uid != my_uid {
-        // Check if peer is polkitd — PAM modules run inside polkitd's process
-        let is_polkitd = unsafe {
-            let pw = libc::getpwnam(c"polkitd".as_ptr());
-            !pw.is_null() && (*pw).pw_uid == cred.uid
-        };
-        if !is_polkitd {
-            return Err(format!(
-                "Rejected peer UID {} (expected 0, {}, or polkitd)",
-                cred.uid, my_uid
-            ));
+fn polkitd_uid() -> Option<u32> {
+    unsafe {
+        let pw = libc::getpwnam(c"polkitd".as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            Some((*pw).pw_uid)
         }
     }
+}
 
-    Ok(())
+/// What a request requires of its caller.
+///
+/// The socket is machine-wide now (0666 in a root-owned directory), so "who
+/// may connect" is no longer the same question as "who may ask for this".
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Tier {
+    /// PAM authentication. Only root and polkitd run pam_immurok.
+    Auth,
+    /// Harmless read-only status any local process may ask for.
+    Public,
+    /// Everything that touches the device or the stored secrets.
+    Manage,
+}
+
+fn tier_of(line: &str) -> Tier {
+    if line.starts_with("AUTH:") {
+        return Tier::Auth;
+    }
+    match line {
+        "STATUS" | "GET:INFO" | "GET:SETTINGS" | "PAIR:STATUS" => Tier::Public,
+        _ => Tier::Manage,
+    }
+}
+
+/// Decide whether `peer_uid` may issue a request of this tier.
+///
+/// Management is for whoever is logged in at this machine right now — the
+/// device is paired per machine, and the person sitting at it is the one it
+/// belongs to. When logind cannot answer we fall back to the recorded owner
+/// uid rather than denying, so a broken/absent logind does not brick the CLI.
+async fn authorize(tier: Tier, peer_uid: u32) -> Result<(), String> {
+    if peer_uid == 0 {
+        return Ok(());
+    }
+    match tier {
+        Tier::Public => Ok(()),
+        Tier::Auth => {
+            if polkitd_uid() == Some(peer_uid) {
+                Ok(())
+            } else {
+                Err(format!("uid {} may not request AUTH (root/polkitd only)", peer_uid))
+            }
+        }
+        Tier::Manage => match crate::session::uid_is_active(peer_uid).await {
+            Some(true) => Ok(()),
+            Some(false) => Err(format!("uid {} has no active session on this machine", peer_uid)),
+            None => match crate::session::owner_uid() {
+                Some(owner) if owner == peer_uid => Ok(()),
+                _ => Err(format!(
+                    "uid {} is not the recorded owner (and logind is unavailable)",
+                    peer_uid
+                )),
+            },
+        },
+    }
 }
 
 /// Handle a single client connection.
@@ -189,10 +227,13 @@ async fn handle_client(
     mut stream: UnixStream,
     coord: Arc<Coordinator>,
 ) -> Result<(), String> {
-    if let Err(e) = verify_peer_credentials(&stream) {
-        warn!("Peer credential check failed: {}", e);
-        return Err(e);
-    }
+    let peer_uid = match peer_uid_of(&stream) {
+        Some(uid) => uid,
+        None => {
+            warn!("Rejecting client: SO_PEERCRED unavailable");
+            return Err("no peer credentials".into());
+        }
+    };
 
     // Read first request with timeout
     let mut buf = vec![0u8; 512];
@@ -206,6 +247,31 @@ async fn handle_client(
     let raw = String::from_utf8_lossy(&buf[..n]);
     let line = raw.trim_matches(|c: char| c == '\0' || c == '\n' || c == '\r' || c == ' ');
     info!("Socket request: {}", line);
+
+    // Authorize per command, not per connection: the socket is machine-wide,
+    // so a plain STATUS and a KEY:WRITE arriving on it are very different
+    // asks. Answer with a DENY rather than dropping the connection — a bare
+    // reset shows up in the CLI as "Connection reset by peer", which tells
+    // the user nothing.
+    let tier = tier_of(line);
+    if let Err(e) = authorize(tier, peer_uid).await {
+        warn!("Denied {:?} request from uid {}: {}", tier, peer_uid, e);
+        let resp = serialize_response(&Response::Deny("NOT_AUTHORIZED".into()));
+        let _ = stream.write_all(format!("{}\n", resp).as_bytes()).await;
+        return Ok(());
+    }
+
+    // The user-session agent holds this connection open for the life of the
+    // session and renders whatever we push at it.
+    if line == "SUBSCRIBE:SESSION" {
+        return serve_session_agent(stream, coord, peer_uid).await;
+    }
+
+    // Log viewer (immurok-cli logs / the TUI panel). They used to `tail -F`
+    // the file; it now lives in a directory they cannot enter.
+    if line == "SUBSCRIBE:LOG" {
+        return serve_log_stream(stream).await;
+    }
 
     // OTA commands use a persistent session
     if line.starts_with("OTA:") {
@@ -264,6 +330,106 @@ async fn handle_client(
     Ok(())
 }
 
+/// Hold a session agent's subscription open: push UI events out, take its
+/// cancels in.
+///
+/// Only one agent at a time — a second subscribe (reconnect after the daemon
+/// restarted, or a second graphical login) replaces the first, and the
+/// displaced connection deregisters only if it is still the registered one.
+async fn serve_session_agent(
+    mut stream: UnixStream,
+    coord: Arc<Coordinator>,
+    peer_uid: u32,
+) -> Result<(), String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mine = tx.clone();
+    *coord.ui_out.write().await = Some(tx);
+    info!("Session agent subscribed (uid {})", peer_uid);
+
+    // Re-send the ssh_takeover intent on every subscribe: the agent may have
+    // been down when the setting changed, and ~/.ssh/config must not drift.
+    push_ssh_takeover(&coord).await;
+
+    let mut buf = vec![0u8; 512];
+    loop {
+        tokio::select! {
+            outbound = rx.recv() => match outbound {
+                Some(l) => {
+                    if stream.write_all(format!("{}\n", l).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            read = stream.read(&mut buf) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    for l in String::from_utf8_lossy(&buf[..n]).lines() {
+                        match l.trim() {
+                            "UI:CANCEL" => {
+                                info!("Session agent: user cancelled");
+                                let _ = coord.ui_cancel_tx.send(());
+                            }
+                            "" => {}
+                            other => debug!("Session agent sent unknown line: {}", other),
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    let mut guard = coord.ui_out.write().await;
+    if guard.as_ref().is_some_and(|t| t.same_channel(&mine)) {
+        *guard = None;
+        info!("Session agent disconnected");
+    }
+    Ok(())
+}
+
+/// Stream the daemon's log: the buffered tail first, then live lines.
+async fn serve_log_stream(mut stream: UnixStream) -> Result<(), String> {
+    let Some(sink) = crate::logbuf::global() else {
+        let _ = stream.write_all(b"ERROR:NO_LOG_SINK\n").await;
+        return Ok(());
+    };
+
+    // Subscribe before snapshotting: a line landing between the two shows up
+    // twice, which is cosmetic, whereas the other order loses it.
+    let mut rx = sink.subscribe();
+    for line in sink.snapshot() {
+        if stream.write_all(format!("{}\n", line).as_bytes()).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    let mut probe = [0u8; 1];
+    loop {
+        tokio::select! {
+            line = rx.recv() => match line {
+                Ok(l) => {
+                    if stream.write_all(format!("{}\n", l).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let note = format!("… {} log lines dropped (viewer too slow)\n", n);
+                    if stream.write_all(note.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            },
+            // Viewer went away.
+            r = stream.read(&mut probe) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Dispatch a parsed request to the appropriate handler.
 async fn dispatch_request(
     request: Request,
@@ -282,7 +448,19 @@ async fn dispatch_request(
         Request::FpLastMatch => handle_fp_last_match(coord).await,
         Request::GateCancel => handle_gate_cancel(coord).await,
         Request::PairStatus => handle_pair_status(coord).await,
-        Request::PairStart => handle_pair_start(coord).await,
+        Request::PairStart => {
+            let resp = handle_pair_start(coord).await;
+            // Whoever paired the device owns it. Recorded here (and by
+            // `immurok-pam-helper migrate-daemon` for installs that predate
+            // privilege separation) so handle_auth can refuse AUTH requests
+            // aimed at other local accounts.
+            if matches!(resp, Response::Ok(_)) {
+                if let Some(uid) = peer_uid_of(stream) {
+                    crate::session::record_owner(uid);
+                }
+            }
+            resp
+        }
         Request::PairProgress => handle_pair_progress(coord).await,
         Request::SlotStatus => handle_slot_status(coord).await,
         Request::SlotClear { slot } => handle_slot_clear(coord, slot).await,
@@ -321,6 +499,7 @@ async fn handle_status(coord: &Arc<Coordinator>) -> Response {
         name,
         battery,
         version,
+        device_unpaired: coord.device_reports_unpaired.load(Ordering::Relaxed),
     }
 }
 
@@ -351,7 +530,10 @@ async fn handle_auth(
     // for log enrichment — daemon doesn't change behavior based on it
     // (Linux has no overlay distinguishing the two; the FP gate runs the
     // same way). But surfaced in journal for diagnostics.
-    let agent_context = peer_pid_of(stream).and_then(classify_agent_marker);
+    let agent_context = match peer_pid_of(stream) {
+        Some(pid) => classify_agent_claim(coord, pid).await,
+        None => None,
+    };
     if let Some(ref cmd) = agent_context {
         info!(
             "AUTH request: user={}, service={} (agent context: {})",
@@ -359,6 +541,27 @@ async fn handle_auth(
         );
     } else {
         info!("AUTH request: user={}, service={}", user, service);
+    }
+
+    // 0. The socket serves the whole machine now, so "who is this AUTH for?"
+    //    became a real question: without this, a second local account running
+    //    sudo would be authorized by the owner's touch. Only enforced once an
+    //    owner is on record (migration and pairing both write it); an
+    //    unpaired/never-migrated install falls through with a warning rather
+    //    than locking the machine's only user out.
+    match crate::session::owner_uid() {
+        Some(owner) => {
+            if crate::session::uid_of_user(user) != Some(owner) {
+                warn!(
+                    "AUTH denied: user {} is not the device owner (uid {})",
+                    user, owner
+                );
+                return Response::Deny("NOT_OWNER".into());
+            }
+        }
+        None => {
+            warn!("AUTH: no owner recorded — skipping owner check");
+        }
     }
 
     // 1. Check settings
@@ -395,11 +598,10 @@ async fn handle_auth(
         let s = service.to_lowercase();
         s.contains("gdm") || s.contains("login") || s == "polkit-1"
     };
-    let dialog_proc = if is_graphical {
-        spawn_auth_dialog()
-    } else {
-        None
-    };
+    // The prompt lives in the user's session now. Subscribe to cancels before
+    // asking for the dialog so a fast click cannot slip through the gap.
+    let mut ui_cancel = coord.ui_cancel_tx.subscribe();
+    let showing_ui = is_graphical && coord.push_ui("UI:DIALOG:AUTH").await;
 
     // Set up pending_pam so on_fp_match() can approve us via 0x21.
     // Refuse if another AUTH is already in flight — overwriting would
@@ -408,7 +610,9 @@ async fn handle_auth(
     let (pending_tx, pending_rx) = tokio::sync::oneshot::channel::<bool>();
     if !coord.try_set_pending_pam(pending_tx).await {
         warn!("AUTH busy: another auth in flight (user={} service={})", user, service);
-        kill_auth_dialog(dialog_proc);
+        if showing_ui {
+            coord.push_ui("UI:DISMISS").await;
+        }
         return Response::Error("BUSY".into());
     }
 
@@ -446,7 +650,13 @@ async fn handle_auth(
                 AuthResult::Denied
             }
         }
-        // Path C: PAM socket closed (user cancelled, e.g. Ctrl+C in sudo)
+        // Path C: the user dismissed the dialog in their session.
+        Ok(_) = ui_cancel.recv(), if showing_ui => {
+            info!("AUTH cancelled: session agent reported cancel");
+            coord.auth_dialog_cancel.notify_one();
+            AuthResult::Denied
+        }
+        // Path D: PAM socket closed (user cancelled, e.g. Ctrl+C in sudo)
         r = stream.read(&mut disconnect_buf) => {
             // Bail the in-flight AuthRequest via the Notify — the single BLE
             // worker is parked in do_auth_request waiting for the touch, so a
@@ -470,7 +680,9 @@ async fn handle_auth(
         }
     };
 
-    kill_auth_dialog(dialog_proc);
+    if showing_ui {
+        coord.push_ui("UI:DISMISS").await;
+    }
     coord.deny_pending_pam().await; // clear any remaining pending
 
     match result {
@@ -486,103 +698,6 @@ enum AuthResult {
     // Reserved for a future explicit timeout path; currently folded into Denied.
     #[allow(dead_code)]
     Timeout,
-}
-
-/// Spawn the auth-dialog GUI subprocess (shows "Touch sensor" prompt).
-fn spawn_auth_dialog() -> Option<tokio::process::Child> {
-    // Look for immurok-auth-dialog in PATH or next to the daemon binary
-    let dialog_name = "immurok-auth-dialog";
-
-    // Try next to our own binary first
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(dialog_name);
-            if candidate.exists() {
-                match tokio::process::Command::new(&candidate)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(child) => return Some(child),
-                    Err(e) => debug!("Failed to spawn auth-dialog from exe dir: {}", e),
-                }
-            }
-        }
-    }
-
-    // Try PATH
-    match tokio::process::Command::new(dialog_name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => Some(child),
-        Err(_) => {
-            debug!("immurok-auth-dialog not found");
-            None
-        }
-    }
-}
-
-/// Kill the auth-dialog subprocess. Sends SIGTERM (graceful) so the dialog's
-/// signal handler can do a clean Adw quit + exit 0; if the child has
-/// already exited, this is a no-op.
-fn kill_auth_dialog(proc: Option<tokio::process::Child>) {
-    if let Some(mut child) = proc {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        } else {
-            let _ = child.start_kill();
-        }
-    }
-}
-
-/// Spawn the agent-mode dialog. Same script as the PAM auth dialog,
-/// invoked with `--agent --command CMD --timeout SECS` so it shows the
-/// command pill + countdown ring instead of the bare "Touch sensor"
-/// prompt. Returns None if the script can't be located/spawned — caller
-/// continues with FP gate just without UI, same fallback as PAM AUTH.
-fn spawn_agent_dialog(cmd: &str, timeout_secs: u64) -> Option<tokio::process::Child> {
-    let dialog_name = "immurok-auth-dialog";
-
-    let try_spawn = |path: &std::path::Path| -> Option<tokio::process::Child> {
-        tokio::process::Command::new(path)
-            .arg("--agent")
-            .arg("--command")
-            .arg(cmd)
-            .arg("--timeout")
-            .arg(timeout_secs.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()
-    };
-
-    // 1. next to the daemon binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(dialog_name);
-            if candidate.exists() {
-                if let Some(child) = try_spawn(&candidate) {
-                    return Some(child);
-                }
-            }
-        }
-    }
-
-    // 2. fall back to PATH (`immurok-auth-dialog` installed via Makefile)
-    try_spawn(std::path::Path::new(dialog_name))
-}
-
-/// Wait for the dialog process to exit. Resolves to None forever if no
-/// dialog was spawned (so the tokio::select! arm just never fires).
-async fn wait_dialog(
-    proc: Option<&mut tokio::process::Child>,
-) -> Option<std::process::ExitStatus> {
-    let child = proc?;
-    child.wait().await.ok()
 }
 
 // ── FP commands ─────────────────────────────────────────────
@@ -1079,6 +1194,13 @@ async fn handle_agent_approve(
 ) -> Response {
     info!("AGENT_APPROVE for command: {}", cmd);
 
+    // Register the caller so a later raw AUTH from one of its children can be
+    // labelled as agent-driven in the log (see classify_agent_claim). The pid
+    // comes from SO_PEERCRED, so it is the kernel's word, not the caller's.
+    if let Some(pid) = peer_pid_of(stream) {
+        coord.record_agent_claim(pid, cmd).await;
+    }
+
     if cmd.is_empty() {
         return Response::Error("EMPTY_COMMAND".into());
     }
@@ -1099,12 +1221,12 @@ async fn handle_agent_approve(
         return Response::Error("BUSY".into());
     }
 
-    // GTK4/Adwaita dialog with the wrapped command pill + countdown bar +
-    // explicit Cancel button. Replaces the previous notify-send (passive,
-    // no interactivity, can't surface countdown). 30s countdown matches the
-    // device's FP gate window; the daemon's own 35s tokio sleep below is
-    // just safety margin.
-    let mut dialog_proc = spawn_agent_dialog(cmd, 30);
+    // The dialog (wrapped command pill + countdown + Cancel) is rendered by
+    // the session agent; 30s matches the device's FP gate window, and the
+    // daemon's own 35s sleep below is safety margin. No agent subscribed
+    // means no window — the touch is still the gate.
+    let mut ui_cancel = coord.ui_cancel_tx.subscribe();
+    let showing_ui = coord.push_ui(format!("UI:DIALOG:AGENT:30:{}", cmd)).await;
 
     // Race AUTH_REQUEST (drives the device's FP gate) against on_fp_match
     // resolving the pending channel directly (when the user touches before
@@ -1140,13 +1262,12 @@ async fn handle_agent_approve(
                 }
             }
         }
-        Some(status) = wait_dialog(dialog_proc.as_mut()) => {
-            // Dialog exited on its own — by Cancel button (exit 1), close
-            // button (exit 1), or some crash. Either way, treat as REJECT.
-            // notify_one() reaches the in-flight AuthRequest's select loop
-            // (a regular ble_send would block on the BleCommand queue
-            // until the auth completes — defeating the point of cancel).
-            info!("AGENT_APPROVE cancelled: dialog exited with {:?}", status.code());
+        Ok(_) = ui_cancel.recv(), if showing_ui => {
+            // The user hit Cancel (or closed the window) in their session.
+            // notify_one() reaches the in-flight AuthRequest's select loop —
+            // a regular ble_send would queue behind the parked auth and never
+            // reach the device, defeating the point of cancelling.
+            info!("AGENT_APPROVE cancelled by user");
             coord.auth_dialog_cancel.notify_one();
             false
         }
@@ -1157,9 +1278,10 @@ async fn handle_agent_approve(
         }
     };
 
-    // Always close the dialog on the way out (graceful SIGTERM so its
-    // signal handler quits cleanly without an exit-1 stale signal).
-    kill_auth_dialog(dialog_proc);
+    // Always take the dialog down on the way out.
+    if showing_ui {
+        coord.push_ui("UI:DISMISS").await;
+    }
 
     coord.deny_pending_pam().await;
 
@@ -1198,6 +1320,22 @@ async fn handle_agent_approve(
 /// All reads come straight from the daemon's local cache files
 /// (ssh_keys.json / key_names.json) — populated on connect via
 /// digest-cached sync_ssh_keys (P1#4). No BLE round-trip.
+/// `KEY:CACHE:<ssh|names>` → `OK:<json array>` on one line.
+///
+/// The payload is exactly what the on-disk cache holds, so callers parse it
+/// the same way they used to parse the file.
+fn key_cache_json(coord: &Arc<Coordinator>, kind: &str) -> String {
+    let json = match kind.trim() {
+        "ssh" => serde_json::to_string(&crate::keystore::load_ssh_keys(&coord.state_dir)),
+        "names" => serde_json::to_string(&crate::keystore::load_key_names(&coord.state_dir)),
+        _ => return "ERROR:UNKNOWN_CACHE".to_string(),
+    };
+    match json {
+        Ok(j) => format!("OK:{}", j),
+        Err(e) => format!("ERROR:SERIALIZE:{}", e),
+    }
+}
+
 async fn handle_list_keys(coord: &Arc<Coordinator>, cat: &str) -> String {
     use base64::Engine;
     let cat = cat.trim();
@@ -1206,7 +1344,7 @@ async fn handle_list_keys(coord: &Arc<Coordinator>, cat: &str) -> String {
     }
 
     if cat == "ssh" {
-        let entries = crate::keystore::load_ssh_keys(&coord.immurok_dir);
+        let entries = crate::keystore::load_ssh_keys(&coord.state_dir);
         let mut out = format!("OK:{}\n", entries.len());
         for e in &entries {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&e.public_key_blob);
@@ -1216,7 +1354,7 @@ async fn handle_list_keys(coord: &Arc<Coordinator>, cat: &str) -> String {
         return out;
     }
 
-    let names = crate::keystore::load_key_names(&coord.immurok_dir);
+    let names = crate::keystore::load_key_names(&coord.state_dir);
     let filtered: Vec<_> = names.iter().filter(|e| e.category == cat).collect();
     let mut out = format!("OK:{}\n", filtered.len());
     for e in &filtered {
@@ -1260,7 +1398,7 @@ async fn handle_get_key(
 
 async fn handle_get_ssh(coord: &Arc<Coordinator>, name: &str) -> String {
     use base64::Engine;
-    let entries = crate::keystore::load_ssh_keys(&coord.immurok_dir);
+    let entries = crate::keystore::load_ssh_keys(&coord.state_dir);
     let entry = match entries.iter().find(|e| e.name == name) {
         Some(e) => e,
         None => return format!("ERROR:NOT_FOUND:{}\n", name),
@@ -1271,8 +1409,8 @@ async fn handle_get_ssh(coord: &Arc<Coordinator>, name: &str) -> String {
 }
 
 /// Look up cache index for a name in (otp/api). Returns None if not present.
-fn find_key_index(coord_immurok_dir: &std::path::Path, cat: &str, name: &str) -> Option<u8> {
-    let names = crate::keystore::load_key_names(coord_immurok_dir);
+fn find_key_index(coord_state_dir: &std::path::Path, cat: &str, name: &str) -> Option<u8> {
+    let names = crate::keystore::load_key_names(coord_state_dir);
     names
         .iter()
         .find(|e| e.category == cat && e.name == name)
@@ -1284,7 +1422,7 @@ async fn handle_get_api(
     name: &str,
     _stream: &mut UnixStream,
 ) -> String {
-    let idx = match find_key_index(&coord.immurok_dir, "api", name) {
+    let idx = match find_key_index(&coord.state_dir, "api", name) {
         Some(i) => i,
         None => return format!("ERROR:NOT_FOUND:{}\n", name),
     };
@@ -1365,7 +1503,7 @@ async fn handle_get_otp(
     name: &str,
     _stream: &mut UnixStream,
 ) -> String {
-    let idx = match find_key_index(&coord.immurok_dir, "otp", name) {
+    let idx = match find_key_index(&coord.state_dir, "otp", name) {
         Some(i) => i,
         None => return format!("ERROR:NOT_FOUND:{}\n", name),
     };
@@ -1444,15 +1582,11 @@ async fn handle_set_setting(coord: &Arc<Coordinator>, key: &str, value: bool) ->
             "unlock_polkit" => settings.unlock_polkit = value,
             "unlock_screen" => settings.unlock_screen = value,
             "lock_screen" => settings.lock_screen = value,
-            "ssh_takeover" => {
-                // Apply the ~/.ssh/config effect first; only persist if it
-                // succeeds, so settings and config never diverge.
-                if let Err(e) = crate::ssh_config::apply(value) {
-                    warn!("Failed to apply ssh_takeover: {}", e);
-                    return Response::Error(format!("SAVE_FAILED:{}", e));
-                }
-                settings.ssh_takeover = value;
-            }
+            // ~/.ssh/config is the session agent's to write now — the daemon
+            // runs with ProtectHome=yes and cannot reach it. We persist the
+            // intent and push it; the agent reconciles (also on every
+            // subscribe, so a change made while it was down is picked up).
+            "ssh_takeover" => settings.ssh_takeover = value,
             _ => return Response::Error("UNKNOWN_KEY".into()),
         }
         if let Err(e) = settings.save(&coord.settings_path()) {
@@ -1461,7 +1595,20 @@ async fn handle_set_setting(coord: &Arc<Coordinator>, key: &str, value: bool) ->
         }
     }
     info!("Setting {}={}", key, value);
+    if key == "ssh_takeover" {
+        push_ssh_takeover(coord).await;
+    }
     Response::Ok(String::new())
+}
+
+/// Tell the session agent what the ssh_takeover intent is, so it can bring
+/// ~/.ssh/config in line. No-op when no agent is subscribed; the next
+/// subscribe re-sends it.
+async fn push_ssh_takeover(coord: &Arc<Coordinator>) {
+    let on = coord.settings.read().await.ssh_takeover;
+    coord
+        .push_ui(format!("SSH_TAKEOVER:{}", if on { "ON" } else { "OFF" }))
+        .await;
 }
 
 async fn handle_get_settings(coord: &Arc<Coordinator>) -> Response {
@@ -1486,10 +1633,12 @@ async fn handle_get_info(coord: &Arc<Coordinator>) -> Response {
     };
     let connected = coord.is_connected.load(Ordering::Relaxed);
     let msg = format!(
-        "fw={}:model=IK-1:connected={}:battery={}",
+        "fw={}:model=IK-1:connected={}:battery={}:uid={}:sock={}",
         fw,
         if connected { "1" } else { "0" },
         battery,
+        unsafe { libc::getuid() },
+        immurok_common::paths::pam_socket().display(),
     );
     Response::Ok(msg)
 }
@@ -1510,6 +1659,15 @@ async fn handle_key_command(line: &str, coord: &Arc<Coordinator>) -> String {
     let parts: Vec<&str> = line.splitn(4, ':').collect();
     if parts.len() < 2 {
         return "ERROR:INVALID_FORMAT".to_string();
+    }
+
+    // Cache reads answer from disk and must work with the device away — that
+    // is the entire point of having a cache. Handled before the connectivity
+    // checks below. The CLI and TUI used to read these files directly from
+    // ~/.immurok; the daemon's state now lives in a 0700 directory they
+    // cannot enter, so it hands the JSON over instead.
+    if parts[1] == "CACHE" && parts.len() >= 3 {
+        return key_cache_json(coord, parts[2]);
     }
 
     if !coord.is_connected.load(Ordering::Relaxed) {

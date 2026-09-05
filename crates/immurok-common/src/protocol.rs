@@ -223,4 +223,12 @@ pub const KEY_NAMES_FILE: &str = "key_names.json";
 // Format: { "ssh": {"count":N,"checksum":U32}, "otp": {...}, "api": {...} }
 pub const KEYSTORE_DIGESTS_FILE: &str = "keystore_digests.json";
 pub const PAM_SOCKET_NAME: &str = "pam.sock";
+pub const DAEMON_LOG_FILE: &str = "daemon.log";
+
+// System paths — the daemon runs as the `immurok` system user and derives
+// nothing from $HOME. Resolution (including systemd/dev overrides) lives in
+// `paths.rs`; these are the compiled-in fallbacks.
+pub const SYSTEM_RUNTIME_DIR: &str = "/run/immurok";
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/immurok";
+pub const SYSTEM_LOG_DIR: &str = "/var/log/immurok";
 pub const AGENT_SOCKET_NAME: &str = "agent.sock";

@@ -1,6 +1,10 @@
 //! Manage the immurok-owned block in ~/.ssh/config that routes SSH through
 //! the daemon's fingerprint-gated SSH agent (see docs spec 2026-07-31).
 //!
+//! Lives in the shared crate because the daemon can no longer write it: it
+//! runs as a system user with ProtectHome=yes. The user-session agent applies
+//! the toggle on the daemon's behalf.
+//!
 //! enable() prepends a sentinel-delimited `Host * / IdentityAgent <sock>`
 //! block; disable() removes it. Both preserve all user content outside the
 //! block. The socket path is written as a resolved absolute path — ssh does
@@ -110,17 +114,10 @@ pub fn is_enabled(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the daemon's SSH agent socket path from the environment — same
-/// XDG_RUNTIME_DIR (fallback /run/user/<uid>) convention as the daemon binds.
+/// The daemon's SSH agent socket path — resolved identically to where the
+/// daemon binds it (immurok_common::paths).
 fn resolved_agent_sock() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
-        });
-    runtime
-        .join("immurok")
-        .join(immurok_common::protocol::AGENT_SOCKET_NAME)
+    crate::paths::agent_socket()
 }
 
 /// Apply the toggle state using environment-resolved HOME + agent socket.
