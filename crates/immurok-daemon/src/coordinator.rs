@@ -116,6 +116,13 @@ pub struct Coordinator {
     /// 会话的第一条响应里就说了，这个标志把那句话保存下来供 UI 使用。
     pub device_reports_unpaired: AtomicBool,
 
+    /// BlueZ 报着设备 Connected，但系统层配对从来没做成（既没 bond，也没解析
+    /// 出服务）。这是 wait_for_device_connected 唯一走不出去的死局：轮询要
+    /// ServicesResolved、主动连接要 Paired、D-Bus 监听要属性发生变化 —— 三个
+    /// 条件在这个稳态下同时不满足。由 ble.rs 的重连循环维护，供 UI 把「设备
+    /// 就在那儿连着，但我们碰不到它」说清楚，而不是只报一个 Disconnected。
+    pub link_unbonded: AtomicBool,
+
     pub challenge_verified: AtomicBool,
     pub is_connected: AtomicBool,
     pub screen_locked: AtomicBool,
@@ -206,6 +213,7 @@ impl Coordinator {
             device_status: RwLock::new(None),
             is_device_verified: AtomicBool::new(false),
             device_reports_unpaired: AtomicBool::new(false),
+            link_unbonded: AtomicBool::new(false),
             challenge_verified: AtomicBool::new(false),
             is_connected: AtomicBool::new(false),
             screen_locked: AtomicBool::new(false),

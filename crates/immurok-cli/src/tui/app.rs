@@ -340,6 +340,9 @@ pub struct App {
     /// 设备自己说它没和本机配对（工厂复位 / 槽被清）。与 `paired` 不同 ——
     /// 那个来自本地 pairing.json，在这种情况下会一直显示已配对。
     pub device_unpaired: bool,
+    /// BlueZ 说设备 Connected，但系统层没 bond，daemon 因此碰不到它。
+    /// 与 `connected` 一起看才有意义：那一项是 false，而设备就在那儿连着。
+    pub link_unbonded: bool,
     /// Whether the daemon is privilege-separated. `None` = not probed yet or
     /// daemon unreachable.
     pub isolated: Option<bool>,
@@ -436,6 +439,7 @@ impl App {
             log_lines: VecDeque::with_capacity(LOG_BUFFER_CAP),
             log_scroll: 0,
             device_unpaired: false,
+            link_unbonded: false,
             isolated: None,
             log_stream: None,
             action_rx,
@@ -538,6 +542,8 @@ impl App {
                 self.fw_version = parts[4].to_string();
                 // 第 6 段是设备自己说的「我没和你配对」（老 daemon 没有这段）。
                 self.device_unpaired = parts.get(5) == Some(&"1");
+                // 第 7 段：系统层没 bond，daemon 一条路都走不通。
+                self.link_unbonded = parts.get(6) == Some(&"1");
             }
         } else {
             self.daemon_ok = false;

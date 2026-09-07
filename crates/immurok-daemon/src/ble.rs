@@ -277,6 +277,9 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
     let connect_driver = async {
         let mut idle_secs = BLE_ACTIVE_RECONNECT_INTERVAL_SECS;
         let mut burst_left: u32 = 0;
+        // Warn once per spell, not once per poll: the loop below runs every
+        // 8-60s and the condition it reports persists until a human fixes it.
+        let mut warned_unbonded = false;
         loop {
             while coordinator.is_suspending.load(Ordering::Relaxed) {
                 coordinator.resume_notify.notified().await;
@@ -291,6 +294,31 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
                 info!("Device connected (active connect)");
                 return;
             }
+            // Neither path could proceed. Distinguish "device is away", which
+            // is normal and needs no comment, from the unbonded dead end, which
+            // needs saying out loud — see diagnose_unbonded_link().
+            match diagnose_unbonded_link().await {
+                Some(addr) => {
+                    coordinator.link_unbonded.store(true, Ordering::Relaxed);
+                    if !warned_unbonded {
+                        warned_unbonded = true;
+                        warn!(
+                            "{addr} is connected but not bonded — BlueZ reports \
+                             Paired=false and ServicesResolved=false, so neither the \
+                             poll nor an active connect can reach it and this will not \
+                             recover on its own. Pair the device at the OS level; on a \
+                             desktop with no Bluetooth applet that needs a pairing agent \
+                             running to answer the device's confirmation request \
+                             (a DisplayYesNo-capable one — NoInputNoOutput is refused)."
+                        );
+                    }
+                }
+                None => {
+                    coordinator.link_unbonded.store(false, Ordering::Relaxed);
+                    warned_unbonded = false;
+                }
+            }
+
             let wait_secs = if burst_left > 0 {
                 burst_left -= 1;
                 BLE_RESUME_BURST_INTERVAL_SECS
@@ -410,6 +438,42 @@ pub async fn cancel_pending_connect() {
         if !name_match { continue; }
         cancel_connect_on(&device).await;
     }
+}
+
+/// The one dead end `wait_for_device_connected` cannot get itself out of.
+///
+/// `check_immurok_connected` requires ServicesResolved, `try_active_connect`
+/// requires Paired, and the PropertiesChanged watcher only fires on a *change*.
+/// A device that BlueZ holds at Connected=true while OS-level pairing has never
+/// succeeded satisfies none of the three, and the state has stopped changing,
+/// so all we do from then on is poll forever.
+///
+/// That is worth telling the user about, because every system-level view — the
+/// OS Bluetooth panel, `bluetoothctl devices Connected`, the device's own LED —
+/// says the device is fine. Without this check the daemon's only output is a
+/// bare "Disconnected" that flatly contradicts the OS, which is not something
+/// anyone can act on.
+///
+/// Returns the address when that is the state we are in, `None` otherwise
+/// (including the ordinary case of the device simply being away).
+async fn diagnose_unbonded_link() -> Option<bluer::Address> {
+    let session = bluer::Session::new().await.ok()?;
+    let adapter = session.default_adapter().await.ok()?;
+    for addr in adapter.device_addresses().await.ok()? {
+        let Ok(device) = adapter.device(addr) else { continue };
+        if !device.is_connected().await.unwrap_or(false) { continue; }
+        let name_match = device.name().await.ok().flatten()
+            .map(|n| n.to_lowercase().starts_with(DEVICE_NAME_PREFIX))
+            .unwrap_or(false);
+        if !name_match { continue; }
+        // Either of these being true means we are not in the dead end: a
+        // bonded device can be reached by an active connect, and a resolved
+        // one is picked up by the very next poll.
+        if device.is_paired().await.unwrap_or(false) { continue; }
+        if device.is_services_resolved().await.unwrap_or(false) { continue; }
+        return Some(addr);
+    }
+    None
 }
 
 /// Check if any immurok device is connected with services resolved (HID keyboard ready).
@@ -675,6 +739,8 @@ async fn connect_and_serve(
     }
 
     coordinator.is_connected.store(true, Ordering::Relaxed);
+    // Whatever the link looked like before, we are talking to the device now.
+    coordinator.link_unbonded.store(false, Ordering::Relaxed);
     coordinator.is_device_verified.store(false, Ordering::Relaxed);
     coordinator.challenge_verified.store(false, Ordering::Relaxed);
 

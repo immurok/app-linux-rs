@@ -500,6 +500,7 @@ async fn handle_status(coord: &Arc<Coordinator>) -> Response {
         battery,
         version,
         device_unpaired: coord.device_reports_unpaired.load(Ordering::Relaxed),
+        link_unbonded: coord.link_unbonded.load(Ordering::Relaxed),
     }
 }
 

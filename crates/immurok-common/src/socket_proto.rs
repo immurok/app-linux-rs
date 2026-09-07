@@ -43,7 +43,11 @@
 //! | Deny        | `DENY:message`                                    |
 //! | Retry       | `RETRY:remaining`                                 |
 //! | Error       | `ERROR:message`                                   |
-//! | Status      | `STATUS:connected(0/1):name:battery:version`      |
+//! | Status      | `STATUS:conn:name:battery:version:unpaired:unbonded` |
+//!
+//! `Status` grows by appending. Clients index the fields they know and ignore
+//! the rest, so a new field never breaks an older CLI talking to a newer
+//! daemon — `unpaired` and `unbonded` were both added that way.
 
 use std::fmt;
 
@@ -134,6 +138,12 @@ pub enum Response {
         /// 设备自己说它没和本机配对（工厂复位 / 槽被清）。主机的 pairing.json
         /// 还在时，这是唯一能戳破「Paired: Yes」假象的信息。
         device_unpaired: bool,
+        /// BlueZ 报着这台设备 Connected，却既没 bond、也没解析出服务 —— 也就是
+        /// 系统层配对从来没做成。此时 daemon 的三条恢复路径同时失效（见
+        /// ble.rs 的 diagnose_unbonded_link），只能干等，而操作系统的每个界面
+        /// 都显示设备已连接。少了这一段，UI 只能报一个跟系统说法矛盾的
+        /// 「Disconnected」，用户拿它没法做任何事。
+        link_unbonded: bool,
     },
 }
 
@@ -362,11 +372,16 @@ pub fn serialize_response(resp: &Response) -> String {
             battery,
             version,
             device_unpaired,
+            link_unbonded,
         } => {
             let conn_flag = if *connected { 1u8 } else { 0u8 };
-            // device_unpaired 追加在末尾：老客户端按下标取前四项，不受影响。
+            // device_unpaired / link_unbonded 一律追加在末尾：老客户端按下标
+            // 取自己认识的那几项，多出来的段落对它们不存在。
             let unpaired_flag = if *device_unpaired { 1u8 } else { 0u8 };
-            format!("STATUS:{conn_flag}:{name}:{battery}:{version}:{unpaired_flag}")
+            let unbonded_flag = if *link_unbonded { 1u8 } else { 0u8 };
+            format!(
+                "STATUS:{conn_flag}:{name}:{battery}:{version}:{unpaired_flag}:{unbonded_flag}"
+            )
         }
     }
 }
@@ -461,9 +476,10 @@ mod tests {
             battery: 85,
             version: "v1.0.0".to_string(),
             device_unpaired: false,
+            link_unbonded: false,
         };
         let s = serialize_response(&resp);
-        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0:0");
+        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0:0:0");
 
         // disconnected variant
         let resp_off = Response::Status {
@@ -472,9 +488,10 @@ mod tests {
             battery: 0,
             version: String::new(),
             device_unpaired: false,
+            link_unbonded: false,
         };
         let s_off = serialize_response(&resp_off);
-        assert_eq!(s_off, "STATUS:0::0::0");
+        assert_eq!(s_off, "STATUS:0::0::0:0");
 
         // 设备自报未配对：新字段追加在末尾，前四段与老格式逐字节一致 ——
         // 老客户端按下标取值，不会因为多一段而错乱。
@@ -484,10 +501,25 @@ mod tests {
             battery: 85,
             version: "v1.0.0".to_string(),
             device_unpaired: true,
+            link_unbonded: false,
         };
         let s_unpaired = serialize_response(&resp_unpaired);
-        assert_eq!(s_unpaired, "STATUS:1:immurok-AB12:85:v1.0.0:1");
+        assert_eq!(s_unpaired, "STATUS:1:immurok-AB12:85:v1.0.0:1:0");
         assert!(s_unpaired.starts_with("STATUS:1:immurok-AB12:85:v1.0.0"));
+
+        // 系统层没 bond：daemon 认为未连接，但设备就在那儿连着。前五段与
+        // 老格式逐字节一致，只有末尾多一段 —— 老 CLI 读不到，也不会读错。
+        let resp_unbonded = Response::Status {
+            connected: false,
+            name: String::new(),
+            battery: 0,
+            version: String::new(),
+            device_unpaired: false,
+            link_unbonded: true,
+        };
+        let s_unbonded = serialize_response(&resp_unbonded);
+        assert_eq!(s_unbonded, "STATUS:0::0::0:1");
+        assert!(s_unbonded.starts_with("STATUS:0::0::0"));
     }
 
     #[test]
