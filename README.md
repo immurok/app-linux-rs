@@ -12,19 +12,33 @@ The immurok Linux client, verified on **Arch / Fedora 38+ / Debian 12+ (incl. Ub
 
 > ⚠️ This project does **not** support musl libc distros (Alpine / Void musl) — the PAM module depends on glibc.
 
+## Quick install
+
+`scripts/install.sh` does sections 1-3 below — dependencies, build, install —
+in one command, leaving only the steps that need the device in your hand (§4).
+Sections 1-3 stay the reference for doing it by hand.
+
+```bash
+git clone https://github.com/immurok/app-linux-rs
+cd app-linux-rs
+./scripts/install.sh              # --dry-run first if you want to see the commands
+```
+
+Expect two sudo prompts: one for the package manager, one for `make install`.
+
 ## 1. Install dependencies
 
 ### Arch / Manjaro / EndeavourOS
 
 ```bash
 sudo pacman -S --needed rust gcc pkgconf dbus pam bluez bluez-utils \
-  gtk4 libadwaita python-gobject polkit
-
-# python-dbus-fast is in the AUR
-yay -S python-dbus-fast
-# Or skip the AUR and use pip:
-pip install --user dbus-fast
+  gtk4 libadwaita python-gobject polkit python-dbus-fast
 ```
+
+`python-dbus-fast` is in the official `extra` repository — no AUR helper needed.
+Do not reach for `pip` here: Arch's system Python is marked externally managed
+(PEP 668), so `pip install --user` fails outright, and even if it succeeded the
+daemon could not use it (see the note under Debian below).
 
 ### Fedora 38+
 
@@ -46,13 +60,17 @@ sudo apt install gcc pkg-config libdbus-1-dev libpam0g-dev bluez \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# dbus-fast: not always in apt, use pip
-pip install --user dbus-fast
-# Or on Debian 12+ (PEP 668 enforced), use pipx:
-sudo apt install pipx && pipx install dbus-fast
+# dbus-fast
+sudo apt install python3-dbus-fast
 ```
 
-> Ubuntu 24.04+ ships `python3-dbus-fast` in apt, so you can skip pip.
+> `dbus_fast` has to be importable by the **system** `python3`. Since 0.6.0 the
+> daemon runs as the dedicated `immurok` system user with `ProtectHome=yes`, so
+> it cannot read your `$HOME` at all: `pip install --user` and `pipx` both land
+> somewhere the daemon can never import from. Ubuntu 24.04+ ships
+> `python3-dbus-fast`; on a release that does not package it, install it
+> system-wide (`sudo pip install --break-system-packages dbus-fast`), not into
+> your user site-packages.
 
 ## 2. Build
 
@@ -262,13 +280,17 @@ bluetoothctl remove <MAC>   # then: immurok-cli pair
 ### `dbus-fast` import fails on Debian / Ubuntu
 
 ```bash
-python3 -c 'import dbus_fast'   # should not error
-# If you get ModuleNotFoundError:
-pip install --user dbus-fast
-# If installed via pipx, add the script path to the daemon user's PATH
+/usr/bin/python3 -c 'import dbus_fast'   # should not error
+# If you get ModuleNotFoundError, install the distro package:
+sudo apt install python3-dbus-fast       # or the equivalent for your distro
 ```
 
-Note that `ble-notify-helper.py` uses `#!/usr/bin/python3`, i.e. the system python (not a venv), so a `pip install --user` lands in `~/.local/lib/python3.X/site-packages` where the system python can find it.
+Check it with `/usr/bin/python3` explicitly, not whatever `python3` your shell
+resolves to — a venv on your `PATH` proves nothing about what the daemon sees.
+`ble-notify-helper.py` is spawned by the daemon, which runs as the `immurok`
+system user under `ProtectHome=yes`, so the module must be installed
+system-wide. A `pip install --user` or `pipx` install goes into your own home
+directory, which that daemon cannot read.
 
 ### GTK dialog doesn't grab focus under Wayland
 
