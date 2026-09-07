@@ -23,16 +23,35 @@ pub fn run() {
         let name = parts[2];
         let battery = parts[3];
         let version = parts[4];
+        // 第 7 段：BlueZ 说设备 Connected，但系统层配对从没做成（老 daemon 没有
+        // 这一段）。不点明的话，这里只会报一个跟操作系统说法直接矛盾的
+        // Disconnected —— 那是用户唯一无法据以行动的状态。
+        let link_unbonded = parts.get(6) == Some(&"1");
 
         println!("Device:     {}", if name.is_empty() { "-" } else { name });
         println!(
             "Status:     {}",
             if connected {
                 "\x1b[32mConnected\x1b[0m"
+            } else if link_unbonded {
+                "\x1b[31mDisconnected\x1b[0m \x1b[33m(connected to the OS, not bonded)\x1b[0m"
             } else {
                 "\x1b[31mDisconnected\x1b[0m"
             }
         );
+        if link_unbonded {
+            println!(
+                "\x1b[31m⚠ The device is connected to this computer but was never bonded.\x1b[0m"
+            );
+            println!("  BlueZ reports Paired=false and ServicesResolved=false. That blocks every");
+            println!("  route the daemon has to the device, and it will not recover on its own —");
+            println!("  which is why this line says Disconnected while your OS says connected.");
+            println!("  Pair the device at the OS level first. On a desktop with no Bluetooth");
+            println!("  applet, a pairing agent must be running to answer its confirmation:");
+            println!("    \x1b[1mbt-agent -c DisplayYesNo &\x1b[0m");
+            println!("    \x1b[1mbluetoothctl pair <address>\x1b[0m");
+            println!("  It has to be DisplayYesNo — the device refuses NoInputNoOutput.");
+        }
         println!(
             "Battery:    {}",
             if battery == "0" && !connected {

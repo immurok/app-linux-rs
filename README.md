@@ -12,19 +12,38 @@ The immurok Linux client, verified on **Arch / Fedora 38+ / Debian 12+ (incl. Ub
 
 > ⚠️ This project does **not** support musl libc distros (Alpine / Void musl) — the PAM module depends on glibc.
 
+## Quick install
+
+`scripts/install.sh` does sections 1-3 below — dependencies, build, install —
+in one command, leaving only the steps that need the device in your hand (§4).
+Sections 1-3 stay the reference for doing it by hand.
+
+```bash
+git clone https://github.com/immurok/app-linux-rs
+cd app-linux-rs
+./scripts/install.sh              # --dry-run first if you want to see the commands
+```
+
+Expect two sudo prompts: one for the package manager, one for `make install`.
+
 ## 1. Install dependencies
 
 ### Arch / Manjaro / EndeavourOS
 
 ```bash
-sudo pacman -S --needed rust gcc pkgconf dbus pam bluez bluez-utils \
-  gtk4 libadwaita python-gobject polkit
-
-# python-dbus-fast is in the AUR
-yay -S python-dbus-fast
-# Or skip the AUR and use pip:
-pip install --user dbus-fast
+sudo pacman -Syu --needed rust gcc pkgconf dbus pam bluez bluez-utils \
+  gtk4 libadwaita python-gobject polkit python-dbus-fast
 ```
+
+`-Syu` rather than `-S`: Arch does not support partial upgrades, and on a sync
+database more than a few days old `pacman -S` fails with a 404 on whichever
+transitive dependency the mirror has already rotated out (`python-dbus-fast`
+pulls in `cython`, which pulls in `python-numpy`).
+
+`python-dbus-fast` is in the official `extra` repository — no AUR helper needed.
+Do not reach for `pip` here: Arch's system Python is marked externally managed
+(PEP 668), so `pip install --user` fails outright, and even if it succeeded the
+daemon could not use it (see the note under Debian below).
 
 ### Fedora 38+
 
@@ -46,13 +65,17 @@ sudo apt install gcc pkg-config libdbus-1-dev libpam0g-dev bluez \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# dbus-fast: not always in apt, use pip
-pip install --user dbus-fast
-# Or on Debian 12+ (PEP 668 enforced), use pipx:
-sudo apt install pipx && pipx install dbus-fast
+# dbus-fast
+sudo apt install python3-dbus-fast
 ```
 
-> Ubuntu 24.04+ ships `python3-dbus-fast` in apt, so you can skip pip.
+> `dbus_fast` has to be importable by the **system** `python3`. Since 0.6.0 the
+> daemon runs as the dedicated `immurok` system user with `ProtectHome=yes`, so
+> it cannot read your `$HOME` at all: `pip install --user` and `pipx` both land
+> somewhere the daemon can never import from. Ubuntu 24.04+ ships
+> `python3-dbus-fast`; on a release that does not package it, install it
+> system-wide (`sudo pip install --break-system-packages dbus-fast`), not into
+> your user site-packages.
 
 ## 2. Build
 
@@ -68,7 +91,8 @@ make              # Equivalent to `make build pam` (build runs check-deps automa
 > runtime deps (`dbus_fast` / PyGObject+Gtk4 / bluez). `make` runs it automatically before building.
 
 Artifacts:
-- `target/release/immurok-daemon` — main daemon
+- `target/release/immurok-daemon` — main daemon (runs as the `immurok` system user)
+- `target/release/immurok-session-agent` — per-session agent: dialogs, notifications, `~/.ssh/config`
 - `target/release/immurok-cli` — interactive TUI + configuration / pairing CLI
 - `target/release/imk` — agent command wrapper
 - `pam/pam_immurok.so` — PAM module
@@ -83,22 +107,38 @@ make install
 
 What this step does:
 
+Everything that needs root is funnelled through a single
+`scripts/install-root.sh` call, so you are asked for a password once.
+
 | File | Path | Needs sudo |
 |------|------|------------|
-| `immurok-daemon` / `imk` / `immurok-cli` | `~/.local/bin/` | No |
-| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `~/.local/bin/` | No |
+| `immurok-daemon` / `immurok-session-agent` / `immurok-cli` / `imk` | `/usr/local/bin/` (`$(PREFIX)/bin`) | Yes |
+| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `/usr/local/bin/` | Yes |
 | `pam_immurok.so` | `/usr/lib64/security/` (Fedora) / `/lib/x86_64-linux-gnu/security/` (Debian) / `/usr/lib/security/` (Arch) | Yes |
 | PAM service config | `/etc/pam.d/sudo` / `/etc/pam.d/polkit-1` / `/etc/pam.d/gdm-password` | Yes |
 | polkit policy | `/usr/share/polkit-1/actions/com.immurok.pam-helper.policy` | Yes |
-| systemd polkit overrides | `/etc/systemd/system/polkit.service.d/immurok.conf` | Yes |
-| systemd user service | `~/.config/systemd/user/immurok-daemon.service` | No |
+| polkit rule (logind screen lock) | `/etc/polkit-1/rules.d/49-immurok.rules` | Yes |
+| BlueZ D-Bus policy | `/etc/dbus-1/system.d/immurok.conf` | Yes |
+| systemd **system** service | `/etc/systemd/system/immurok-daemon.service` | Yes |
+| systemd user service (session agent) | `/etc/systemd/user/immurok-session-agent.service` | Yes |
+| `tmpfiles.d` entry for `/run/immurok` | `/etc/tmpfiles.d/immurok.conf` | Yes |
+| daemon state (pairing key, settings) | `/var/lib/immurok/` (`0700`, owned by `immurok`) | Yes |
+| daemon log | `/var/log/immurok/daemon.log` | Yes |
 
-> No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the Makefile skips that entry. For login-screen fingerprint unlock on SDDM: `sudo immurok-pam-helper add sddm`.
+The binaries deliberately go to a root-owned directory rather than
+`~/.local/bin`: the daemon runs as a dedicated system user, and a binary sitting
+in a directory you can write is a binary anyone who compromises your account can
+replace. `make install` removes the copies left in `~/.local/bin` by pre-0.6.0
+installs, along with the `PATH` line they added to your shell rc.
 
-After `make install` completes, the daemon should already be running:
+> No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the helper skips that entry. Login-screen unlock on SDDM has to be wired up by hand; see [KDE](#kde-fedora-kde--kubuntu) below (`immurok-pam-helper` only accepts `sudo`, `polkit-1` and `gdm-password`).
+
+After `make install` completes, the daemon should already be running. It is a
+system service now, so there is no `--user`:
 
 ```bash
-systemctl --user status immurok-daemon
+systemctl status immurok-daemon                # the daemon, as user `immurok`
+systemctl --user status immurok-session-agent  # dialogs / notifications, as you
 ```
 
 ## 4. First-time setup
@@ -125,6 +165,42 @@ Number keys switch pages, `?` shows the full key reference, `q` quits.
 The one-shot CLI subcommands below do the same things — use them for scripting.
 
 ### 4.2 Pair the device
+
+Pairing happens at two levels, in this order. `immurok-cli pair` is only the
+second one — it performs the application handshake over an already-established
+GATT link and never touches BlueZ, so a device your OS has not bonded cannot be
+paired with it.
+
+**First, bond the device with your operating system.** On GNOME or KDE, use the
+Bluetooth panel as you would for any keyboard; the desktop supplies the pairing
+agent. On a bare compositor (Hyprland, sway, river) there is usually no
+Bluetooth applet and therefore no agent, and you have to run one yourself —
+otherwise BlueZ has nobody to answer the device's confirmation request and logs
+`No agent available for request type 2` on a loop:
+
+```bash
+bt-agent -c DisplayYesNo &            # from bluez-tools; confirm when prompted
+bluetoothctl pair <address>
+bluetoothctl trust <address>
+bluetoothctl connect <address>
+
+# Must be true before going on — this is the flag everything else depends on:
+busctl get-property org.bluez /org/bluez/hci0/dev_<ADDRESS_> \
+    org.bluez.Device1 ServicesResolved
+```
+
+> The capability matters: the device requires authenticated pairing, so an agent
+> advertising `NoInputNoOutput` is refused with
+> `org.bluez.Error.AuthenticationCanceled`. BlueZ also treats such an agent as
+> *no* agent for a confirmation request, so the "No agent available" line keeps
+> printing while one is registered. Use `DisplayYesNo`.
+
+Once `ServicesResolved` is true, the daemon picks the device up within one poll
+interval (60 s at most) and logs `BLE session active`. Confirm with
+`immurok-cli status` — if it still reports *Disconnected (connected to the OS,
+not bonded)*, the bond did not take.
+
+**Then do the application pairing:**
 
 ```bash
 # Power on / hold the device button to enter pairing mode (LED slowly blinks blue)
@@ -180,7 +256,7 @@ Notes:
 ### 4.6 Daemon management
 
 ```bash
-immurok-cli daemon restart      # systemctl --user restart + wait for the socket
+immurok-cli daemon restart      # restarts the system unit and waits for the socket
 ```
 
 Before the device is paired, only `fw`/`ota` (firmware update),
@@ -196,6 +272,10 @@ sudo -k && sudo whoami
 ```
 
 If it works, after touching the sensor the terminal immediately prints `root` (the identity sudo elevated to), with no password prompt.
+
+`immurok-cli settings` also reports whether the daemon is really isolated —
+running as `immurok` rather than as you. If it is not, that line is shown in red
+at the top.
 
 Test `imk run --agent`:
 
@@ -224,6 +304,10 @@ find /usr/lib* /lib* -name 'pam_*.so' 2>/dev/null | head -5
 sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 ```
 
+> On a `usr`-merged distro where `/lib` is a symlink to `/usr/lib` (Arch, among
+> others) the Makefile's probe stops at `/lib/security` — the same directory as
+> `/usr/lib/security`. That is expected, not a misinstall.
+
 ### sudo asks for a password instead of popping the fingerprint dialog
 
 - The daemon isn't running: `systemctl --user start immurok-daemon`
@@ -233,20 +317,28 @@ sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 ### The polkit dialog doesn't appear
 
 ```bash
-# Check whether the polkit override took effect
-systemctl show polkit | grep BindPaths
-# Should show BindPaths=/run/user
+# The socket the PAM module connects to must exist and belong to the daemon user
+ls -ld /run/immurok /run/immurok/pam.sock
+# Directory should be immurok-owned and not group/world-writable
 
-# polkitd usually fails because ProtectHome=yes blocks access to /run/user
-# The Makefile writes the override, but it needs systemctl daemon-reload + restart
-sudo systemctl daemon-reload && sudo systemctl restart polkit
+systemctl status immurok-daemon        # is the daemon up at all?
+sudo grep pam_immurok /etc/pam.d/polkit-1
 ```
+
+> Pre-0.6.0 this needed a systemd drop-in adding `BindPaths=/run/user` to
+> `polkit.service`, because the socket lived under `/run/user/<uid>` where
+> polkitd's `ProtectHome=yes` hid it. The socket is now at a fixed
+> `/run/immurok/pam.sock`, so that drop-in is obsolete and `make install`
+> deletes it. If `systemctl show polkit | grep BindPaths` still shows
+> `/run/user`, something re-created it — remove
+> `/etc/systemd/system/polkit.service.d/immurok.conf` and `daemon-reload`.
 
 ### BLE can't find the device
 
 ```bash
-bluetoothctl scan le         # should list "immurok IK-1"
-grep BLE ~/.immurok/logs.txt # daemon writes its own log file, not the journal
+bluetoothctl scan le                       # should list "immurok IK-1"
+sudo grep BLE /var/log/immurok/daemon.log  # the daemon's own log file
+journalctl -u immurok-daemon               # ... the unit's stderr goes here
 ```
 
 ### Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)
@@ -262,13 +354,17 @@ bluetoothctl remove <MAC>   # then: immurok-cli pair
 ### `dbus-fast` import fails on Debian / Ubuntu
 
 ```bash
-python3 -c 'import dbus_fast'   # should not error
-# If you get ModuleNotFoundError:
-pip install --user dbus-fast
-# If installed via pipx, add the script path to the daemon user's PATH
+/usr/bin/python3 -c 'import dbus_fast'   # should not error
+# If you get ModuleNotFoundError, install the distro package:
+sudo apt install python3-dbus-fast       # or the equivalent for your distro
 ```
 
-Note that `ble-notify-helper.py` uses `#!/usr/bin/python3`, i.e. the system python (not a venv), so a `pip install --user` lands in `~/.local/lib/python3.X/site-packages` where the system python can find it.
+Check it with `/usr/bin/python3` explicitly, not whatever `python3` your shell
+resolves to — a venv on your `PATH` proves nothing about what the daemon sees.
+`ble-notify-helper.py` is spawned by the daemon, which runs as the `immurok`
+system user under `ProtectHome=yes`, so the module must be installed
+system-wide. A `pip install --user` or `pipx` install goes into your own home
+directory, which that daemon cannot read.
 
 ### GTK dialog doesn't grab focus under Wayland
 
@@ -281,13 +377,20 @@ cd app-linux-rs
 make uninstall
 ```
 
-This stops the service and removes the PAM config, polkit policy, and override, but **keeps** `~/.immurok/` (pairing keys, settings, logs).
+This stops the service and removes the binaries, the PAM module and its service
+configs, the polkit policy and rule, the D-Bus policy, both systemd units and
+any leftover pre-0.6.0 drop-ins — but **keeps** `/var/lib/immurok/` (pairing
+key and settings).
 
-To wipe everything:
+To drop that as well, together with the `immurok` system user:
 
 ```bash
-rm -rf ~/.immurok
+make uninstall PURGE=1
 ```
+
+Firmware downloads are cached separately under `~/.immurok/fwupdate/` — the CLI
+fetches them as you and pushes them over the socket — and neither form of
+uninstall touches them; `rm -rf ~/.immurok` clears that cache.
 
 ## Notes per desktop environment
 

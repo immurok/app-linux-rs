@@ -39,15 +39,30 @@ async def start_notify_with_retry(iface, label, retries=5, delay=0.3):
     exception crash the whole helper: a crash is read upstream as a device
     disconnect and triggers a reconnect loop.
     """
+    last_err = None
     for attempt in range(1, retries + 1):
         try:
             await iface.call_start_notify()
             return True
         except Exception as e:
+            last_err = e
             sys.stderr.write(f"StartNotify {label} attempt {attempt}/{retries}: {e}\n")
             sys.stderr.flush()
             if attempt < retries:
                 await asyncio.sleep(delay)
+
+    # 0x0e surviving every attempt is not the race this retry exists for. An
+    # unbonded link fails every encrypted operation the same way, and the
+    # README only attributes 0x0e to a stale GATT cache — so say the other
+    # possibility out loud instead of leaving the reader with "unlikely error".
+    if "0x0e" in str(last_err):
+        sys.stderr.write(
+            f"StartNotify {label} failed all {retries} attempts with ATT 0x0e. That is "
+            "not the CCCD race this retry handles — it is also what an unbonded link "
+            "looks like. Check Paired/Bonded in `bluetoothctl info <address>` before "
+            "assuming a stale GATT cache.\n"
+        )
+        sys.stderr.flush()
     return False
 
 

@@ -189,6 +189,13 @@ fn tier_of(line: &str) -> Tier {
     }
 }
 
+/// Requests the CLI and TUI issue on a timer. They change nothing and decide
+/// nothing, so they are the ones that must not crowd the log.
+fn is_routine_read(line: &str) -> bool {
+    matches!(line, "STATUS" | "PAIR:STATUS" | "GET:INFO" | "GET:SETTINGS")
+        || line.starts_with("KEY:CACHE:")
+}
+
 /// Decide whether `peer_uid` may issue a request of this tier.
 ///
 /// Management is for whoever is logged in at this machine right now — the
@@ -246,7 +253,16 @@ async fn handle_client(
 
     let raw = String::from_utf8_lossy(&buf[..n]);
     let line = raw.trim_matches(|c: char| c == '\0' || c == '\n' || c == '\r' || c == ' ');
-    info!("Socket request: {}", line);
+    // Routine reads go to debug. The TUI polls six of them every two seconds,
+    // which at info fills the 500-line SUBSCRIBE:LOG ring buffer in about three
+    // minutes — so with the TUI open, `immurok-cli logs` shows nothing but
+    // "Socket request: STATUS" exactly when a BLE problem needs diagnosing.
+    // Anything that changes state or asks for an authorization stays at info.
+    if is_routine_read(line) {
+        debug!("Socket request: {}", line);
+    } else {
+        info!("Socket request: {}", line);
+    }
 
     // Authorize per command, not per connection: the socket is machine-wide,
     // so a plain STATUS and a KEY:WRITE arriving on it are very different
@@ -500,6 +516,7 @@ async fn handle_status(coord: &Arc<Coordinator>) -> Response {
         battery,
         version,
         device_unpaired: coord.device_reports_unpaired.load(Ordering::Relaxed),
+        link_unbonded: coord.link_unbonded.load(Ordering::Relaxed),
     }
 }
 

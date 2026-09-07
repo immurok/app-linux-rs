@@ -83,7 +83,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     } else if !app.connected {
         spans.push(Span::styled("○ Disconnected", Style::default().fg(ERR)));
-        if app.paired {
+        // 「Disconnected」而操作系统同时显示设备已连接，是用户唯一无从下手的
+        // 状态 —— 直接把真正的拦路条件写出来，别让人去猜。
+        if app.link_unbonded {
+            spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                "NOT BONDED — pair the device in your OS Bluetooth settings",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ));
+        } else if app.paired {
             spans.push(Span::styled("  ·  paired", Style::default().fg(DIM)));
         } else {
             spans.push(Span::styled("  ·  not paired", Style::default().fg(WARN)));

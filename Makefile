@@ -32,7 +32,7 @@ PAM_DIR := $(shell \
     elif [ -d /lib/security ]; then echo /lib/security; \
     else echo /usr/lib/security; fi)
 
-.PHONY: all build pam install uninstall clean check-deps
+.PHONY: all build pam install uninstall clean check-deps print-bindir
 
 all: build pam
 
@@ -91,6 +91,10 @@ uninstall:
 		fi; \
 	done
 	@echo "=== Done$(if $(PURGE), (含 /var/lib/immurok), （/var/lib/immurok 保留，PURGE=1 可一并删除）) ==="
+
+# 供 scripts/install.sh 报路径用（BIN_DIR 跟着 PREFIX 走，不该在脚本里写死）
+print-bindir:
+	@echo $(BIN_DIR)
 
 clean:
 	$(CARGO) clean

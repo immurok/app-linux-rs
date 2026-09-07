@@ -74,7 +74,7 @@ pub enum Commands {
     #[command(subcommand)]
     Pam(PamCommands),
 
-    /// Tail daemon logs (~/.immurok/logs.txt)
+    /// Tail daemon logs (/var/log/immurok/daemon.log, streamed over the socket)
     Logs,
 
     /// Interactive TUI panel
