@@ -166,6 +166,42 @@ The one-shot CLI subcommands below do the same things — use them for scripting
 
 ### 4.2 Pair the device
 
+Pairing happens at two levels, in this order. `immurok-cli pair` is only the
+second one — it performs the application handshake over an already-established
+GATT link and never touches BlueZ, so a device your OS has not bonded cannot be
+paired with it.
+
+**First, bond the device with your operating system.** On GNOME or KDE, use the
+Bluetooth panel as you would for any keyboard; the desktop supplies the pairing
+agent. On a bare compositor (Hyprland, sway, river) there is usually no
+Bluetooth applet and therefore no agent, and you have to run one yourself —
+otherwise BlueZ has nobody to answer the device's confirmation request and logs
+`No agent available for request type 2` on a loop:
+
+```bash
+bt-agent -c DisplayYesNo &            # from bluez-tools; confirm when prompted
+bluetoothctl pair <address>
+bluetoothctl trust <address>
+bluetoothctl connect <address>
+
+# Must be true before going on — this is the flag everything else depends on:
+busctl get-property org.bluez /org/bluez/hci0/dev_<ADDRESS_> \
+    org.bluez.Device1 ServicesResolved
+```
+
+> The capability matters: the device requires authenticated pairing, so an agent
+> advertising `NoInputNoOutput` is refused with
+> `org.bluez.Error.AuthenticationCanceled`. BlueZ also treats such an agent as
+> *no* agent for a confirmation request, so the "No agent available" line keeps
+> printing while one is registered. Use `DisplayYesNo`.
+
+Once `ServicesResolved` is true, the daemon picks the device up within one poll
+interval (60 s at most) and logs `BLE session active`. Confirm with
+`immurok-cli status` — if it still reports *Disconnected (connected to the OS,
+not bonded)*, the bond did not take.
+
+**Then do the application pairing:**
+
 ```bash
 # Power on / hold the device button to enter pairing mode (LED slowly blinks blue)
 immurok-cli pair               # or: press `p` in the TUI
