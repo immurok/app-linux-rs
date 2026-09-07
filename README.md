@@ -86,7 +86,8 @@ make              # Equivalent to `make build pam` (build runs check-deps automa
 > runtime deps (`dbus_fast` / PyGObject+Gtk4 / bluez). `make` runs it automatically before building.
 
 Artifacts:
-- `target/release/immurok-daemon` — main daemon
+- `target/release/immurok-daemon` — main daemon (runs as the `immurok` system user)
+- `target/release/immurok-session-agent` — per-session agent: dialogs, notifications, `~/.ssh/config`
 - `target/release/immurok-cli` — interactive TUI + configuration / pairing CLI
 - `target/release/imk` — agent command wrapper
 - `pam/pam_immurok.so` — PAM module
@@ -101,22 +102,38 @@ make install
 
 What this step does:
 
+Everything that needs root is funnelled through a single
+`scripts/install-root.sh` call, so you are asked for a password once.
+
 | File | Path | Needs sudo |
 |------|------|------------|
-| `immurok-daemon` / `imk` / `immurok-cli` | `~/.local/bin/` | No |
-| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `~/.local/bin/` | No |
+| `immurok-daemon` / `immurok-session-agent` / `immurok-cli` / `imk` | `/usr/local/bin/` (`$(PREFIX)/bin`) | Yes |
+| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `/usr/local/bin/` | Yes |
 | `pam_immurok.so` | `/usr/lib64/security/` (Fedora) / `/lib/x86_64-linux-gnu/security/` (Debian) / `/usr/lib/security/` (Arch) | Yes |
 | PAM service config | `/etc/pam.d/sudo` / `/etc/pam.d/polkit-1` / `/etc/pam.d/gdm-password` | Yes |
 | polkit policy | `/usr/share/polkit-1/actions/com.immurok.pam-helper.policy` | Yes |
-| systemd polkit overrides | `/etc/systemd/system/polkit.service.d/immurok.conf` | Yes |
-| systemd user service | `~/.config/systemd/user/immurok-daemon.service` | No |
+| polkit rule (logind screen lock) | `/etc/polkit-1/rules.d/49-immurok.rules` | Yes |
+| BlueZ D-Bus policy | `/etc/dbus-1/system.d/immurok.conf` | Yes |
+| systemd **system** service | `/etc/systemd/system/immurok-daemon.service` | Yes |
+| systemd user service (session agent) | `/etc/systemd/user/immurok-session-agent.service` | Yes |
+| `tmpfiles.d` entry for `/run/immurok` | `/etc/tmpfiles.d/immurok.conf` | Yes |
+| daemon state (pairing key, settings) | `/var/lib/immurok/` (`0700`, owned by `immurok`) | Yes |
+| daemon log | `/var/log/immurok/daemon.log` | Yes |
 
-> No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the Makefile skips that entry. For login-screen fingerprint unlock on SDDM: `sudo immurok-pam-helper add sddm`.
+The binaries deliberately go to a root-owned directory rather than
+`~/.local/bin`: the daemon runs as a dedicated system user, and a binary sitting
+in a directory you can write is a binary anyone who compromises your account can
+replace. `make install` removes the copies left in `~/.local/bin` by pre-0.6.0
+installs, along with the `PATH` line they added to your shell rc.
 
-After `make install` completes, the daemon should already be running:
+> No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the helper skips that entry. Login-screen unlock on SDDM has to be wired up by hand; see [KDE](#kde-fedora-kde--kubuntu) below (`immurok-pam-helper` only accepts `sudo`, `polkit-1` and `gdm-password`).
+
+After `make install` completes, the daemon should already be running. It is a
+system service now, so there is no `--user`:
 
 ```bash
-systemctl --user status immurok-daemon
+systemctl status immurok-daemon                # the daemon, as user `immurok`
+systemctl --user status immurok-session-agent  # dialogs / notifications, as you
 ```
 
 ## 4. First-time setup
@@ -198,7 +215,7 @@ Notes:
 ### 4.6 Daemon management
 
 ```bash
-immurok-cli daemon restart      # systemctl --user restart + wait for the socket
+immurok-cli daemon restart      # restarts the system unit and waits for the socket
 ```
 
 Before the device is paired, only `fw`/`ota` (firmware update),
@@ -214,6 +231,10 @@ sudo -k && sudo whoami
 ```
 
 If it works, after touching the sensor the terminal immediately prints `root` (the identity sudo elevated to), with no password prompt.
+
+`immurok-cli settings` also reports whether the daemon is really isolated —
+running as `immurok` rather than as you. If it is not, that line is shown in red
+at the top.
 
 Test `imk run --agent`:
 
@@ -242,6 +263,10 @@ find /usr/lib* /lib* -name 'pam_*.so' 2>/dev/null | head -5
 sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 ```
 
+> On a `usr`-merged distro where `/lib` is a symlink to `/usr/lib` (Arch, among
+> others) the Makefile's probe stops at `/lib/security` — the same directory as
+> `/usr/lib/security`. That is expected, not a misinstall.
+
 ### sudo asks for a password instead of popping the fingerprint dialog
 
 - The daemon isn't running: `systemctl --user start immurok-daemon`
@@ -251,20 +276,28 @@ sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 ### The polkit dialog doesn't appear
 
 ```bash
-# Check whether the polkit override took effect
-systemctl show polkit | grep BindPaths
-# Should show BindPaths=/run/user
+# The socket the PAM module connects to must exist and belong to the daemon user
+ls -ld /run/immurok /run/immurok/pam.sock
+# Directory should be immurok-owned and not group/world-writable
 
-# polkitd usually fails because ProtectHome=yes blocks access to /run/user
-# The Makefile writes the override, but it needs systemctl daemon-reload + restart
-sudo systemctl daemon-reload && sudo systemctl restart polkit
+systemctl status immurok-daemon        # is the daemon up at all?
+sudo grep pam_immurok /etc/pam.d/polkit-1
 ```
+
+> Pre-0.6.0 this needed a systemd drop-in adding `BindPaths=/run/user` to
+> `polkit.service`, because the socket lived under `/run/user/<uid>` where
+> polkitd's `ProtectHome=yes` hid it. The socket is now at a fixed
+> `/run/immurok/pam.sock`, so that drop-in is obsolete and `make install`
+> deletes it. If `systemctl show polkit | grep BindPaths` still shows
+> `/run/user`, something re-created it — remove
+> `/etc/systemd/system/polkit.service.d/immurok.conf` and `daemon-reload`.
 
 ### BLE can't find the device
 
 ```bash
-bluetoothctl scan le         # should list "immurok IK-1"
-grep BLE ~/.immurok/logs.txt # daemon writes its own log file, not the journal
+bluetoothctl scan le                       # should list "immurok IK-1"
+sudo grep BLE /var/log/immurok/daemon.log  # the daemon's own log file
+journalctl -u immurok-daemon               # ... the unit's stderr goes here
 ```
 
 ### Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)
@@ -303,13 +336,20 @@ cd app-linux-rs
 make uninstall
 ```
 
-This stops the service and removes the PAM config, polkit policy, and override, but **keeps** `~/.immurok/` (pairing keys, settings, logs).
+This stops the service and removes the binaries, the PAM module and its service
+configs, the polkit policy and rule, the D-Bus policy, both systemd units and
+any leftover pre-0.6.0 drop-ins — but **keeps** `/var/lib/immurok/` (pairing
+key and settings).
 
-To wipe everything:
+To drop that as well, together with the `immurok` system user:
 
 ```bash
-rm -rf ~/.immurok
+make uninstall PURGE=1
 ```
+
+Firmware downloads are cached separately under `~/.immurok/fwupdate/` — the CLI
+fetches them as you and pushes them over the socket — and neither form of
+uninstall touches them; `rm -rf ~/.immurok` clears that cache.
 
 ## Notes per desktop environment
 
