@@ -5,10 +5,14 @@
 # for your distro, instead of failing cryptically halfway through cargo, the
 # C compile, or the running daemon.
 #
-# Usage: check-deps.sh [build|all]       (default: all)
-#   build  check build-critical items only; exit 1 if any are missing
-#   all    build-critical + runtime items; build missing -> exit 1,
-#          runtime missing -> warn only
+# Usage: check-deps.sh [build|all|deps-cmd]       (default: all)
+#   build     check build-critical items only; exit 1 if any are missing
+#   all       build-critical + runtime items; build missing -> exit 1,
+#             runtime missing -> warn only
+#   deps-cmd  print the package-manager command that installs every dependency
+#             for this distro, then exit. Used by scripts/install.sh so the
+#             installer and this preflight can never disagree about package
+#             names. Exits 1 without printing on an unrecognised distro.
 #
 # Environment:
 #   CARGO=<path>   override cargo path (the Makefile passes the detected one)
@@ -35,11 +39,13 @@ elif command -v pacman >/dev/null 2>&1; then PM="pacman"; INSTALL="sudo pacman -
 else PM="unknown"; INSTALL="(install with your package manager)"
 fi
 
-# Per-distro package names
+# Per-distro package names. Names only, nothing else — `deps-cmd` feeds these
+# straight to the package manager. Anything that is not a package name belongs
+# in note(); an empty result means "no package for this distro" (see rust:apt).
 pkg() {
   case "$1:$PM" in
     rust:dnf)        echo "rust cargo";;
-    rust:apt)        echo "(install via rustup: https://rustup.rs)";;
+    rust:apt)        echo "";;
     rust:pacman)     echo "rust";;
     cc:dnf|cc:apt|cc:pacman) echo "gcc";;
     pkgconfig:dnf)   echo "pkgconf-pkg-config";;
@@ -52,23 +58,59 @@ pkg() {
     pam:apt)         echo "libpam0g-dev";;
     pam:pacman)      echo "pam";;
     dbusfast:dnf)    echo "python3-dbus-fast";;
-    dbusfast:apt)    echo "python3-dbus-fast  (or: pip install --user dbus-fast)";;
-    dbusfast:pacman) echo "python-dbus-fast  (AUR; or: pip install --user dbus-fast)";;
+    dbusfast:apt)    echo "python3-dbus-fast";;
+    dbusfast:pacman) echo "python-dbus-fast";;
     gtk:dnf)         echo "python3-gobject gtk4 libadwaita";;
     gtk:apt)         echo "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1";;
     gtk:pacman)      echo "python-gobject gtk4 libadwaita";;
     bluez:dnf)       echo "bluez";;
     bluez:apt)       echo "bluez";;
     bluez:pacman)    echo "bluez bluez-utils";;
-    *) echo "?";;
+    *) echo "";;
+  esac
+}
+
+# Every dependency key, in the order deps-cmd emits them.
+ALL_KEYS="rust cc pkgconfig dbus pam dbusfast gtk bluez"
+
+# Caveats that are not package names.
+#
+# There is deliberately no `pip install --user dbus-fast` advice here any more.
+# Since 0.6.0 the daemon runs as the dedicated `immurok` system user with
+# ProtectHome=yes (packaging/immurok-daemon.service), so it cannot read your
+# $HOME at all — a --user install lands in ~/.local/lib/pythonX.Y/site-packages
+# where the daemon that spawns ble-notify-helper.py can never import it.
+# dbus_fast has to be visible to the system python3, i.e. a distro package.
+note() {
+  case "$1:$PM" in
+    rust:apt) echo "the apt rust is usually too old — install via rustup: https://rustup.rs";;
+    dbusfast:apt) echo "Ubuntu 24.04+ ships it; on older releases it must be installed system-wide, not with pip --user";;
+    *) echo "";;
   esac
 }
 
 FATAL=0
 WARN=0
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
-bad()  { printf '  \033[31m✗\033[0m %-26s missing -> %s %s\n' "$1" "$INSTALL" "$(pkg "$2")"; }
-warn() { printf '  \033[33m!\033[0m %-26s missing -> %s %s\n' "$1" "$INSTALL" "$(pkg "$2")"; }
+# "<install command> <packages>  (caveat)" — either half may be absent.
+hint() {
+  local names caveat out=""
+  names="$(pkg "$1")"; caveat="$(note "$1")"
+  [ -n "$names" ] && out="$INSTALL $names"
+  [ -n "$caveat" ] && out="${out:+$out  }($caveat)"
+  printf '%s' "$out"
+}
+bad()  { printf '  \033[31m✗\033[0m %-26s missing -> %s\n' "$1" "$(hint "$2")"; }
+warn() { printf '  \033[33m!\033[0m %-26s missing -> %s\n' "$1" "$(hint "$2")"; }
+
+# deps-cmd — emit the install command and stop. Must come before any output.
+if [ "$MODE" = deps-cmd ]; then
+  [ "$PM" = unknown ] && exit 1
+  # shellcheck disable=SC2086  # ALL_KEYS is a deliberate word list
+  names=$(for k in $ALL_KEYS; do pkg "$k"; done | tr ' ' '\n' | sed '/^$/d' | awk '!seen[$0]++' | tr '\n' ' ')
+  echo "$INSTALL ${names% }"
+  exit 0
+fi
 
 echo "=== immurok dependency preflight (package manager: $PM) ==="
 echo "[build-critical]"
