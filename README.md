@@ -31,9 +31,14 @@ Expect two sudo prompts: one for the package manager, one for `make install`.
 ### Arch / Manjaro / EndeavourOS
 
 ```bash
-sudo pacman -S --needed rust gcc pkgconf dbus pam bluez bluez-utils \
+sudo pacman -Syu --needed rust gcc pkgconf dbus pam bluez bluez-utils \
   gtk4 libadwaita python-gobject polkit python-dbus-fast
 ```
+
+`-Syu` rather than `-S`: Arch does not support partial upgrades, and on a sync
+database more than a few days old `pacman -S` fails with a 404 on whichever
+transitive dependency the mirror has already rotated out (`python-dbus-fast`
+pulls in `cython`, which pulls in `python-numpy`).
 
 `python-dbus-fast` is in the official `extra` repository — no AUR helper needed.
 Do not reach for `pip` here: Arch's system Python is marked externally managed

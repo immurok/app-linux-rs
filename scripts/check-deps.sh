@@ -35,7 +35,15 @@ PY_SYS="/usr/bin/python3" # immurok-auth-dialog:  #!/usr/bin/python3
 # ── Detect package manager (for install hints) ──
 if   command -v dnf    >/dev/null 2>&1; then PM="dnf";    INSTALL="sudo dnf install"
 elif command -v apt    >/dev/null 2>&1; then PM="apt";    INSTALL="sudo apt install"
-elif command -v pacman >/dev/null 2>&1; then PM="pacman"; INSTALL="sudo pacman -S --needed"
+# -Syu, not -S: Arch does not support partial upgrades. With a sync database
+# even a few days old, `pacman -S <pkg>` asks the mirror for the exact package
+# versions that database names, and a mirror that has since moved on has
+# deleted them — the install dies on a 404 for some unrelated transitive
+# dependency (python-dbus-fast -> cython -> python-numpy is the one that
+# surfaced this). Refreshing as part of the same transaction is the documented
+# fix. It does mean installing dependencies can upgrade the system, which is
+# why install.sh prints this command and asks before running it.
+elif command -v pacman >/dev/null 2>&1; then PM="pacman"; INSTALL="sudo pacman -Syu --needed"
 else PM="unknown"; INSTALL="(install with your package manager)"
 fi
 

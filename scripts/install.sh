@@ -66,6 +66,9 @@ else
     exit 1
   else
     echo "$DEPS_CMD"
+    case "$DEPS_CMD" in
+      *" -Syu "*) echo "${DIM}(-Syu also upgrades installed packages: Arch does not support partial upgrades.)${OFF}";;
+    esac
     if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
       read -r -p "Run this? [Y/n] " reply
       case "$reply" in [nN]*) echo "skipped"; DEPS_CMD="";; esac
