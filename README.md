@@ -1,6 +1,6 @@
 # immurok — Linux Companion App
 
-The immurok Linux client, verified on **Arch / Fedora 38+ / Debian 12+ (incl. Ubuntu 22.04+) / KDE & GNOME**. This document covers dependencies and install steps for the three distro families, plus common troubleshooting.
+The immurok Linux client, verified on **Arch / Fedora 43+ / Debian 12+ / Ubuntu 24.04+ / KDE & GNOME**. Ubuntu 22.04 has no packaged dbus-fast and is source-install only (see section 1). This document covers dependencies and install steps for the three distro families, plus common troubleshooting.
 
 ## Requirements
 
@@ -12,27 +12,60 @@ The immurok Linux client, verified on **Arch / Fedora 38+ / Debian 12+ (incl. Ub
 
 > ⚠️ This project does **not** support musl libc distros (Alpine / Void musl) — the PAM module depends on glibc.
 
+## 0. Install from a package (recommended)
+
+Prebuilt packages for **Debian 12+ / Ubuntu 24.04+ / Fedora 43+ / Arch**, amd64 and arm64,
+are attached to every [GitHub Release](https://github.com/immurok/app-linux-rs/releases).
+
+```bash
+# Debian / Ubuntu
+sudo apt install ./immurok_<version>-1_amd64.deb
+# Fedora
+sudo dnf install ./immurok-<version>-1.x86_64.rpm
+# Arch
+sudo pacman -U immurok-<version>-1-x86_64.pkg.tar.zst
+```
+
+The package starts `immurok-daemon`, enables the session agent for every user and registers
+the settings app to autostart. Two things are left to you:
+
+1. **Pair** — open *immurok* from the app menu, or run `immurok-cli pair`.
+2. **Enable the PAM hooks** on the PAM page (or `immurok-cli pam install sudo`). The package
+   deliberately does not touch `/etc/pam.d` on its own.
+
+Upgrading is `apt install ./new.deb` / `dnf install ./new.rpm` / `pacman -U new.pkg.tar.zst`
+again; the daemon is restarted for you.
+
+> A package install and a source install (`make install`, section 3) cannot coexist: both
+> ship `pam_immurok.so` and the polkit policy at the same paths, and `/usr/local` shadows
+> `/usr`. If you installed from source before, run `make uninstall` in that checkout first
+> — pairing data in `/var/lib/immurok` survives, only the PAM hooks need re-enabling.
+> The package refuses to install while a source install is present (on Arch, `pacman`
+> reports the file conflict instead).
+
+Sections 1–3 below are for building from source.
+
 ## 1. Install dependencies
 
 ### Arch / Manjaro / EndeavourOS
 
 ```bash
 sudo pacman -S --needed rust gcc pkgconf dbus pam bluez bluez-utils \
-  gtk4 libadwaita python-gobject polkit
+  gtk4 libadwaita python-gobject polkit python-dbus-fast
 
-# python-dbus-fast is in the AUR
-yay -S python-dbus-fast
-# Or skip the AUR and use pip:
-pip install --user dbus-fast
+# gtk4/libadwaita above already include the dev headers Arch needs to build
+# immurok-gui (optional — only needed to build the GUI, daemon/CLI/TUI don't
+# need it)
 ```
 
-### Fedora 38+
+### Fedora 43+
 
 ```bash
 sudo dnf install rust cargo gcc pkgconf-pkg-config dbus-devel pam-devel \
   bluez bluez-libs \
   gtk4 libadwaita python3-gobject \
-  python3-dbus-fast polkit
+  python3-dbus-fast polkit \
+  gtk4-devel libadwaita-devel   # optional: only needed to build immurok-gui
 ```
 
 ### Debian 12+ / Ubuntu 22.04+
@@ -40,7 +73,8 @@ sudo dnf install rust cargo gcc pkgconf-pkg-config dbus-devel pam-devel \
 ```bash
 sudo apt install gcc pkg-config libdbus-1-dev libpam0g-dev bluez \
   libgtk-4-1 libadwaita-1-0 python3-gi \
-  policykit-1
+  policykit-1 \
+  libgtk-4-dev libadwaita-1-dev   # optional: only needed to build immurok-gui
 
 # Rust: the apt version is usually too old, prefer rustup
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -85,23 +119,49 @@ What this step does:
 
 | File | Path | Needs sudo |
 |------|------|------------|
-| `immurok-daemon` / `imk` / `immurok-cli` | `~/.local/bin/` | No |
-| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `~/.local/bin/` | No |
+| `immurok-daemon` / `imk` / `immurok-cli` | `/usr/local/bin/` | Yes |
+| `immurok-auth-dialog` / `immurok-pam-helper` / `ble-notify-helper.py` | `/usr/local/bin/` | Yes |
 | `pam_immurok.so` | `/usr/lib64/security/` (Fedora) / `/lib/x86_64-linux-gnu/security/` (Debian) / `/usr/lib/security/` (Arch) | Yes |
 | PAM service config | `/etc/pam.d/sudo` / `/etc/pam.d/polkit-1` / `/etc/pam.d/gdm-password` | Yes |
 | polkit policy | `/usr/share/polkit-1/actions/com.immurok.pam-helper.policy` | Yes |
-| systemd polkit overrides | `/etc/systemd/system/polkit.service.d/immurok.conf` | Yes |
-| systemd user service | `~/.config/systemd/user/immurok-daemon.service` | No |
+| systemd system unit | `/etc/systemd/system/immurok-daemon.service` | Yes |
+| session agent | `/etc/systemd/user/immurok-session-agent.service` | Yes |
 
 > No `/etc/pam.d/gdm-password` (KDE / SDDM setups) is fine — the Makefile skips that entry. For login-screen fingerprint unlock on SDDM: `sudo immurok-pam-helper add sddm`.
 
 After `make install` completes, the daemon should already be running:
 
 ```bash
-systemctl --user status immurok-daemon
+systemctl status immurok-daemon
 ```
 
 ## 4. First-time setup
+
+### 4.0 The GUI (optional)
+
+`immurok-gui` opens the graphical settings window (also in your app menu as
+"immurok"). It stays resident after login so the quick-fill panel is one key
+away: bind `immurok-gui --quick-fill` to a shortcut in your desktop's keyboard
+settings, press it in any text field, pick an OTP, touch the device. Phase 1
+copies the code to the clipboard (cleared after 30 s); direct typing arrives in
+0.9.
+
+The **Fingerprints** page mirrors the macOS app: one card per enrolled
+finger (click the name to rename it — names are stored locally in
+`~/.config/immurok/gui.json`, the device only knows slot numbers), "+" to
+enroll with the six-step guide, a hover-revealed delete button, "Test
+Fingerprint", and — on firmware with two-host support — "Add switch
+fingerprint" for the finger that only switches between your two computers.
+The **Two Hosts** group on the Device page shows both host slots, marks this
+computer, and lets you pair / unpair here or unbind the other computer
+(one touch of an enrolled finger on the device confirms it).
+
+The **PAM** page shows whether the immurok line is installed for sudo,
+polkit and the login screen, with Install / Remove / Repair buttons (polkit
+asks for your password). The **Firmware** page checks immurok.com for a
+newer firmware and runs the OTA update with a progress bar — the window
+refuses to close while an update is running. The **Logs** page tails the
+daemon log live with error / warning colouring; scroll up to pause.
 
 ### 4.1 The TUI (recommended)
 
@@ -180,13 +240,56 @@ Notes:
 ### 4.6 Daemon management
 
 ```bash
-immurok-cli daemon restart      # systemctl --user restart + wait for the socket
+sudo systemctl restart immurok-daemon   # restart the system daemon
 ```
 
+`immurok-cli daemon restart` is not recommended right now: it still
+targets the old per-user unit, not the system daemon installed by the
+package (a Rust fix is pending). Use `systemctl` above instead.
+
 Before the device is paired, only `fw`/`ota` (firmware update),
-`daemon restart`, `pair`, `status` and `logs` are available — everything
-else exits with a hint to pair first. The TUI opens normally but gates
-device-facing actions the same way.
+`pair`, `status` and `logs` are available — everything else exits with
+a hint to pair first. The TUI opens normally but gates device-facing
+actions the same way.
+
+### 4.7 Password managers (1Password / Bitwarden / KeePassXC)
+
+No extra immurok setup: all three apps offer "system authentication" unlock on
+Linux, which goes through polkit → `/etc/pam.d/polkit-1` → `pam_immurok`. With
+the PAM hook installed (§3) and the polkit toggle on (§4.4), a touch unlocks the
+vault. Your master password never touches immurok.
+
+Turn it on inside the app:
+
+| App | Where |
+|---|---|
+| 1Password 8 | Settings → Security → **Unlock using system authentication service** |
+| Bitwarden desktop | File → Settings → Security → **Unlock with system authentication** |
+| KeePassXC ≥ 2.8 | Database unlock screen → **Quick Unlock** (polkit) |
+
+Notes:
+
+- You still log in with the master password once after starting the app;
+  system authentication only covers subsequent *unlocks*. The polkit actions
+  use `auth_self`, so every unlock asks for a touch.
+- **Flatpak Bitwarden** can't install its polkit action from inside the
+  sandbox — install it yourself (official instructions:
+  <https://bitwarden.com/help/biometrics/>):
+
+  ```bash
+  curl -fsSL -o /tmp/com.bitwarden.Bitwarden.policy \
+    https://raw.githubusercontent.com/bitwarden/clients/main/apps/desktop/resources/com.bitwarden.desktop.policy
+  sudo install -o root -g root -m 0644 /tmp/com.bitwarden.Bitwarden.policy \
+    /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
+  # Fedora / SELinux only:
+  sudo chcon system_u:object_r:usr_t:s0 /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
+  ```
+
+  The .deb / .rpm / AppImage builds ship the file themselves. KeePassXC's
+  Quick Unlock policy is also a manual copy at the moment — see the
+  KeePassXC release notes for your version.
+- immurok does not ship these policy files: they belong to the apps and the
+  native packages install the same paths.
 
 ## 5. Verify
 
@@ -226,27 +329,34 @@ sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 
 ### sudo asks for a password instead of popping the fingerprint dialog
 
-- The daemon isn't running: `systemctl --user start immurok-daemon`
+- The daemon isn't running: `sudo systemctl start immurok-daemon`
 - The device isn't connected: `immurok-cli status` should show `Status: Connected`
 - PAM doesn't have immurok: `sudo grep pam_immurok /etc/pam.d/sudo`; if empty, run `immurok-cli pam install sudo` (a wrapper around `sudo immurok-pam-helper add sudo`)
 
+### A password manager asks for its master password instead of a fingerprint
+
+The app never reached immurok — it went through polkit and polkit fell back to
+your login password.
+
+- `immurok-cli pam check` must not report `polkit-1` missing; if it does, `immurok-cli pam install polkit-1`
+- `immurok-cli settings` must show polkit on; if not, `immurok-cli set polkit on`
+- Flatpak Bitwarden: the polkit action file must exist, see §4.7
+- The "system authentication" option is off inside the app, or the app was
+  started before the policy file was installed — restart it
+
 ### The polkit dialog doesn't appear
 
-```bash
-# Check whether the polkit override took effect
-systemctl show polkit | grep BindPaths
-# Should show BindPaths=/run/user
-
-# polkitd usually fails because ProtectHome=yes blocks access to /run/user
-# The Makefile writes the override, but it needs systemctl daemon-reload + restart
-sudo systemctl daemon-reload && sudo systemctl restart polkit
-```
+Source installs no longer write a polkit override (the daemon's socket lives in
+`/run/immurok`, which polkit's default sandbox can already see). If a stale
+`/etc/systemd/system/polkit.service.d/immurok.conf` from an old version is still
+present, remove it and `sudo systemctl restart polkit`.
 
 ### BLE can't find the device
 
 ```bash
 bluetoothctl scan le         # should list "immurok IK-1"
-grep BLE ~/.immurok/logs.txt # daemon writes its own log file, not the journal
+immurok-cli logs | grep BLE  # daemon log lives in /var/log/immurok (0640, daemon-owned);
+                              # the CLI reads it over the socket, not the journal
 ```
 
 ### Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)
@@ -281,13 +391,27 @@ cd app-linux-rs
 make uninstall
 ```
 
-This stops the service and removes the PAM config, polkit policy, and override, but **keeps** `~/.immurok/` (pairing keys, settings, logs).
+This stops the service and removes the PAM config and polkit policy, but **keeps**
+`/var/lib/immurok` (pairing keys, settings, key caches).
 
-To wipe everything:
+To also purge that state, pass `PURGE=1` on the same run instead:
 
 ```bash
-rm -rf ~/.immurok
+make uninstall PURGE=1
 ```
+
+### Package install
+
+```bash
+sudo apt remove immurok      # or: sudo apt purge immurok   (also deletes /var/lib/immurok and /var/log/immurok)
+sudo dnf remove immurok
+sudo pacman -R immurok
+```
+
+Removing the package takes the PAM hooks out of `/etc/pam.d` and stops the daemon. On
+Fedora and Arch the pairing data is kept; to wipe it run
+`sudo immurok-pam-helper purge-daemon --purge-state` **before** removing the package, or
+`sudo rm -rf /var/lib/immurok /var/log/immurok` afterwards.
 
 ## Notes per desktop environment
 

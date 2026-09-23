@@ -3,6 +3,99 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
+## Unreleased
+
+### Added
+
+- gui: sidebar navigation; Features moved to its own page; bundled fingerprint icon
+- gui: sidebar device card, consistent icons, Firmware folded into Device, actionable empty states, header-placed actions
+- gui(keys): add SSH (generate/import), OTP (single + file import), API entries; capacity and empty states; inline OTP code with Copy
+- client: OTP/SSH parsing shared via immurok-client (keys_import / ssh_import); CLI/TUI use it
+- **Distribution packages.** `.deb` (Debian 12+ / Ubuntu 24.04+), `.rpm`
+  (Fedora 43+) and Arch `.pkg.tar.zst`, amd64 and arm64, built by GitHub
+  Actions on every `v*` tag and attached to the release together with
+  `SHA256SUMS`. One package installs the daemon, CLI/TUI, `imk`, the GTK
+  settings app, the session agent and the PAM module; the daemon is started,
+  the session agent enabled for every user and the settings app registered
+  to autostart. Pairing and enabling the PAM hooks stay manual by design.
+  `make package` builds the same three packages locally (needs nfpm and the
+  GTK 4 / libadwaita dev headers), `make verify-pkg DISTRO=…` installs one in
+  a distro container.
+- `make install` and a package install now refuse to coexist (each detects
+  the other); unit files reference `/usr/bin` and are rewritten for
+  `/usr/local` at install time.
+
+### Fixed
+
+- **`imk run --agent` commands longer than ~500 bytes were reported as
+  "rejected by user".** The daemon read a request into a 512-byte buffer;
+  the tail stayed in the socket, where the approval handler's disconnect
+  probe read it and cancelled the request before the dialog could wait for
+  a touch. The buffer is now the protocol maximum (`MAX_REQUEST_BYTES`,
+  64 KiB); a request that fills it answers `ERROR:TOO_LONG`, bytes after
+  the request line answer `ERROR:PROTOCOL`, and the disconnect-probe path
+  returns `ERROR:PROTOCOL` instead of `DENY:REJECTED`.
+- **Multi-line agent commands showed only their first line in the approval
+  dialog.** The socket protocol is line-based and `imk` sent the command
+  raw, so the user approved `sudo bash -c ` with the body hidden. `imk` now
+  escapes `\n`, `\r` and NUL to their visible two-character forms before
+  sending, and refuses oversized commands up front with a hint to wrap a
+  script file instead.
+
+## 0.9.0 — 2026-09-18
+
+### Added
+
+- **PAM, Firmware and Logs pages in `immurok-gui`**, matching the TUI:
+  per-service install state with pkexec-backed Install / Remove / Repair and
+  the daemon isolation banner; update-server check, direct / two-hop /
+  resumed plans and OTA progress (window locked while updating); live daemon
+  log tail with level colouring and pause-on-scroll. The Device page shows a
+  firmware-update hint after a silent 24 h-throttled check.
+- `immurok-client`: `fwupdate` (moved from the CLI) and `pam` modules shared
+  by CLI, TUI and GUI.
+
+## 0.8.0 — 2026-09-18
+
+### Added
+
+- **Fingerprints page in `immurok-gui`.** Enroll with the six-step guided
+  capture (the device's "too similar, shift your finger" reject is shown as
+  a nudge instead of a failure), delete, rename (local names in
+  `gui.json`), Test Fingerprint, and the host-switch finger (slot 5).
+- **Two Hosts group on the Device page.** Both host slots with a "This
+  computer" mark, Pair / Unpair, pairing progress text, and unbinding the
+  other computer after one fingerprint touch.
+- `immurok-client`: `fingerprint`, `enroll_session` (testable enrollment
+  state machine), `hosts` and `enroll_hint` (moved from the CLI) modules.
+- `immurok-common`: `EnrollEvent::Overlap` (0x06) and
+  `PairProgress::from_wire`.
+
+### Changed
+
+- The GUI's error texts for fingerprint-gate outcomes now match the
+  daemon's actual messages (timeout / cancelled / no match).
+
+## 0.7.0 — 2026-09-18
+
+### Added
+
+- **`immurok-gui` — a GTK4 / libadwaita settings app.** Same daemon socket as
+  the TUI, same one-request-per-connection protocol. Phase 1 ships the Device
+  page (status, feature toggles, pair / unpair) and the Keys page (OTP / API
+  reads through the device's fingerprint gate, SSH public key copy, delete).
+- **Quick-fill panel.** `immurok-gui --quick-fill` (bind it to a key in your
+  desktop's shortcut settings) pops a search list of your keys; pick one,
+  touch the device, and the value lands in the clipboard with a notification
+  and is cleared 30 s later. Typing straight into the focused field and
+  portal-registered hotkeys follow in 0.8.
+- `immurok-client` crate: the socket client shared by CLI, TUI and GUI.
+
+### Changed
+
+- `make` skips `immurok-gui` when GTK4 / libadwaita development headers are
+  missing, so daemon-only installs need no new dependencies.
+
 ## 0.6.0 — 2026-09-05
 
 ### Added

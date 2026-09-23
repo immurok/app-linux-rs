@@ -279,77 +279,42 @@ pub fn run() -> io::Result<()> {
     Ok(())
 }
 
-/// Locate `immurok-pam-helper` next to this binary or in PATH.
-fn find_pam_helper() -> Option<String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("immurok-pam-helper");
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-    }
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("immurok-pam-helper")
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 /// Run the PAM helper via pkexec for one or more services. Returns true on success.
-/// Success = pkexec exit 0 AND no ERROR: lines in helper stdout.
 fn run_pam_helper(action: &str, services: &[&str]) -> bool {
-    let helper = match find_pam_helper() {
-        Some(h) => h,
-        None => {
-            eprintln!("Error: immurok-pam-helper not found in PATH or next to this binary.");
-            return false;
-        }
+    use immurok_client::pam::{find_helper, run_helper, PamError};
+    let Some(helper) = find_helper() else {
+        eprintln!("Error: immurok-pam-helper not found in PATH or next to this binary.");
+        return false;
     };
-
     let svc_list = services.join(" ");
-    println!("Running: pkexec {} {} {}", helper, action, svc_list);
-
-    let mut args: Vec<&str> = vec![&helper, action];
-    args.extend_from_slice(services);
-
-    match std::process::Command::new("pkexec")
-        .args(&args)
-        .output()
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // 把 helper stdout 原样打印（TUI 此时已离开 alt-screen，能显示）
-            print!("{}", stdout);
-            if !output.status.success() {
-                // pkexec 自身失败（如用户取消授权 exit 126/127），helper 根本没跑
-                eprintln!(
-                    "\x1b[31mPAM helper failed (exit code: {})\x1b[0m",
-                    output.status.code().unwrap_or(-1)
-                );
-                return false;
+    println!("Running: pkexec {} {} {}", helper.display(), action, svc_list);
+    let verb = if action == "add" { "install" } else { "remove" };
+    match run_helper(action, services) {
+        Ok(report) => {
+            for l in &report.lines {
+                println!("{l}");
             }
-            if crate::commands::pam::helper_output_has_error(&stdout) {
-                eprintln!(
-                    "\x1b[31mPAM {} for '{}' failed (see ERROR lines above).\x1b[0m",
-                    if action == "add" { "install" } else { "remove" },
-                    svc_list
-                );
-                return false;
-            }
-            println!(
-                "\x1b[32mPAM {} for '{}' succeeded.\x1b[0m",
-                if action == "add" { "install" } else { "remove" },
-                svc_list
-            );
+            println!("\x1b[32mPAM {} for '{}' succeeded.\x1b[0m", verb, svc_list);
             true
+        }
+        Err(PamError::HelperFailed { code, lines }) => {
+            for l in &lines {
+                println!("{l}");
+            }
+            if code == 0 {
+                eprintln!("\x1b[31mPAM {} for '{}' failed (see ERROR lines above).\x1b[0m", verb, svc_list);
+            } else {
+                eprintln!("\x1b[31mPAM helper failed (exit code: {})\x1b[0m", code);
+            }
+            false
+        }
+        Err(PamError::AuthCancelled) => {
+            eprintln!("\x1b[31mPAM helper failed (exit code: 126)\x1b[0m");
+            false
+        }
+        Err(PamError::NoPolkitAgent) => {
+            eprintln!("\x1b[31mPAM helper failed (exit code: 127)\x1b[0m");
+            false
         }
         Err(e) => {
             eprintln!("Failed to run pkexec: {}", e);

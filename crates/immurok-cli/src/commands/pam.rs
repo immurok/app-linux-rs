@@ -5,18 +5,8 @@
 
 use crate::socket_client::DaemonClient;
 use immurok_common::pam::pam_line_present;
-
-/// 按 daemon 开关派生"应当配置 PAM 的服务"。
-pub fn desired_services(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
-    let mut v = Vec::new();
-    if sudo_on {
-        v.push("sudo");
-    }
-    if polkit_on {
-        v.push("polkit-1");
-    }
-    v
-}
+pub use immurok_client::pam::{desired_services, services_to_repair};
+use immurok_client::pam::{find_helper, run_helper as run_helper_shared, PamError};
 
 /// 从 daemon GET:SETTINGS 读取 (sudo_on, polkit_on)。失败时默认全开（保守：宁可提示也不漏）。
 fn fetch_toggles() -> (bool, bool) {
@@ -96,49 +86,6 @@ pub fn run_repair() {
     run_helper("add", &to_fix);
 }
 
-/// 找到 immurok-pam-helper（自身同目录优先，再 PATH）。
-fn find_helper() -> Option<String> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let c = dir.join("immurok-pam-helper");
-            if c.exists() {
-                return Some(c.to_string_lossy().to_string());
-            }
-        }
-    }
-    if let Ok(out) = std::process::Command::new("which")
-        .arg("immurok-pam-helper")
-        .output()
-    {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-/// helper 每服务打印一行；只要有任何 ERROR: 行即视为失败。
-pub fn helper_output_has_error(output: &str) -> bool {
-    output.lines().any(|l| l.trim_start().starts_with("ERROR:"))
-}
-
-/// 按开关派生 + 过滤"当前缺失"的待修复服务列表（含 gdm 尽力修：仅文件存在且缺行）。
-pub fn services_to_repair(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = desired_services(sudo_on, polkit_on)
-        .into_iter()
-        .filter(|s| !pam_line_present(s))
-        .collect();
-    if std::path::Path::new("/etc/pam.d/gdm-password").exists()
-        && !pam_line_present("gdm-password")
-    {
-        v.push("gdm-password");
-    }
-    v
-}
-
 /// 经 pkexec 跑 immurok-pam-helper，一次处理多个服务。
 pub fn run_helper(action: &str, services: &[&str]) {
     let helper = match find_helper() {
@@ -148,27 +95,32 @@ pub fn run_helper(action: &str, services: &[&str]) {
             std::process::exit(1);
         }
     };
-    println!("Running: pkexec {} {} {}", helper, action, services.join(" "));
-    let mut args = vec![helper.as_str(), action];
-    args.extend_from_slice(services);
-    match std::process::Command::new("pkexec").args(&args).output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // 把 helper stdout 原样打印给用户（保留可见性）
-            print!("{}", stdout);
-            if !output.status.success() {
-                // pkexec 自身失败（如用户取消授权 exit 126/127），helper 根本没跑
-                eprintln!(
-                    "\x1b[31mPAM helper failed (exit code: {})\x1b[0m",
-                    output.status.code().unwrap_or(-1)
-                );
-                std::process::exit(1);
-            }
-            if helper_output_has_error(&stdout) {
-                eprintln!("\x1b[31mPAM {} failed (see ERROR lines above).\x1b[0m", action);
-                std::process::exit(1);
+    println!("Running: pkexec {} {} {}", helper.display(), action, services.join(" "));
+    match run_helper_shared(action, services) {
+        Ok(report) => {
+            for l in &report.lines {
+                println!("{l}");
             }
             println!("\x1b[32mPAM {} done.\x1b[0m", action);
+        }
+        Err(PamError::HelperFailed { code, lines }) => {
+            for l in &lines {
+                println!("{l}");
+            }
+            if code == 0 {
+                eprintln!("\x1b[31mPAM {} failed (see ERROR lines above).\x1b[0m", action);
+            } else {
+                eprintln!("\x1b[31mPAM helper failed (exit code: {})\x1b[0m", code);
+            }
+            std::process::exit(1);
+        }
+        Err(PamError::AuthCancelled) => {
+            eprintln!("\x1b[31mPAM helper failed (exit code: 126)\x1b[0m");
+            std::process::exit(1);
+        }
+        Err(PamError::NoPolkitAgent) => {
+            eprintln!("\x1b[31mPAM helper failed (exit code: 127)\x1b[0m");
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Failed to run pkexec: {}", e);
@@ -180,6 +132,7 @@ pub fn run_helper(action: &str, services: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use immurok_client::pam::helper_output_has_error;
 
     #[test]
     fn derives_from_toggles() {

@@ -173,6 +173,15 @@ pub struct Coordinator {
     // straight to the helper, bypassing the command queue.
     pub gate_cancel: Notify,
 
+    // True exactly while the single BLE worker is parked in the
+    // `send_fp_gated_inner` wait loop, i.e. while there IS a waiter on
+    // `gate_cancel`. Callers must check it before `notify_one()`: Notify
+    // stores a permit when nobody is waiting, so a cancel fired outside a
+    // gate would silently kill the NEXT gate ("FP-gate cancelled" out of
+    // nowhere). Set/cleared by a drop guard inside send_fp_gated_inner, so
+    // every exit path (break, early return, error) clears it.
+    pub gate_active: AtomicBool,
+
     // Fires when systemd-logind reports PrepareForSleep(false), i.e. the
     // machine just resumed from suspend. The BLE wait-for-device loop
     // listens for this to kick an active Device.Connect() — Linux BlueZ
@@ -224,6 +233,7 @@ impl Coordinator {
             agent_claims: RwLock::new(std::collections::HashMap::new()),
             auth_dialog_cancel: Notify::new(),
             gate_cancel: Notify::new(),
+            gate_active: AtomicBool::new(false),
             resume_notify: Notify::new(),
             is_suspending: AtomicBool::new(false),
             state_dir,
@@ -558,6 +568,23 @@ impl Coordinator {
             .join(immurok_common::protocol::SETTINGS_FILE)
     }
 
+    /// Cancel the fingerprint gate the BLE worker is parked in, if any.
+    /// Returns true when the notification was actually delivered.
+    ///
+    /// The `gate_active` check is the whole point: `Notify::notify_one()`
+    /// with no waiter stores a permit, and that permit would cancel the
+    /// NEXT gate — a "FP-gate cancelled" out of nowhere. Callers that also
+    /// have a queued-BleCommand fallback should use it only when this
+    /// returns false.
+    pub fn cancel_active_gate(&self) -> bool {
+        if self.gate_active.load(Ordering::SeqCst) {
+            self.gate_cancel.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
     // Kept for symmetry with settings_path / external tooling; unused internally.
     #[allow(dead_code)]
     pub fn pairing_path(&self) -> std::path::PathBuf {
@@ -592,6 +619,30 @@ mod tests {
             // Claiming resets progress back to Idle.
             assert_eq!(coord.pair_progress().await, PairProgress::Idle);
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_active_gate_stores_no_permit_when_idle() {
+        let coord = new_coordinator();
+        // No gate running: nothing is signalled, and crucially no permit is
+        // left behind for the next gate to trip over.
+        assert!(!coord.cancel_active_gate());
+        let leaked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            coord.gate_cancel.notified(),
+        )
+        .await;
+        assert!(leaked.is_err(), "an idle GATE:CANCEL must not arm the next gate");
+
+        // Gate running: the waiting BLE worker is woken.
+        coord.gate_active.store(true, Ordering::SeqCst);
+        assert!(coord.cancel_active_gate());
+        let woken = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            coord.gate_cancel.notified(),
+        )
+        .await;
+        assert!(woken.is_ok(), "an active gate must receive the cancel");
     }
 
     #[tokio::test]

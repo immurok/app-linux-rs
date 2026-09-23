@@ -57,6 +57,9 @@ pkg() {
     gtk:dnf)         echo "python3-gobject gtk4 libadwaita";;
     gtk:apt)         echo "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1";;
     gtk:pacman)      echo "python-gobject gtk4 libadwaita";;
+    gtkdev:dnf)      echo "gtk4-devel libadwaita-devel";;
+    gtkdev:apt)      echo "libgtk-4-dev libadwaita-1-dev";;
+    gtkdev:pacman)   echo "gtk4 libadwaita";;
     bluez:dnf)       echo "bluez";;
     bluez:apt)       echo "bluez";;
     bluez:pacman)    echo "bluez bluez-utils";;
@@ -148,6 +151,13 @@ if "$PY_SYS" -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version(
   ok "PyGObject + Gtk4 + libadwaita  (auth dialog)"
 else
   warn "PyGObject/Gtk4/Adw" gtk; WARN=1
+fi
+
+# GTK4 + libadwaita 开发头 — immurok-gui（可选；缺则 Makefile 跳过 GUI）
+if pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+  ok "gtk4 + libadwaita dev headers  (immurok-gui)"
+else
+  warn "gtk4/libadwaita dev headers (GUI 将被跳过)" gtkdev; WARN=1
 fi
 
 # bluez runtime

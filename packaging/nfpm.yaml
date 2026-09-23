@@ -1,0 +1,116 @@
+# packaging/nfpm.yaml — 一份清单出 deb / rpm / archlinux（设计稿 §2、§4）。
+#
+# 从仓库根目录执行，先装配：
+#   packaging/stage.sh dist/stage
+#   set -a; . packaging/pkg-env.sh; set +a
+#   nfpm package -f packaging/nfpm.yaml -p deb -t dist/     # rpm / archlinux 同理
+# 或直接 `make package`。
+#
+# 依赖按 ldd 实测手写（nfpm 不扫 shlib）：daemon → libdbus-1 / libsystemd；
+# GUI → gtk4 / libadwaita；PAM .so → libpam；ble-notify-helper.py → dbus-fast；
+# immurok-auth-dialog → PyGObject + Gtk4 + Adw。包名写错由 CI verify 在真实
+# 发行版容器里安装时抓出来。
+name: immurok
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: admin
+priority: optional
+maintainer: immurok <support@immurok.com>
+vendor: immurok
+homepage: https://immurok.com
+license: Apache-2.0
+description: |
+  Wireless fingerprint key companion for Linux.
+  BLE daemon, PAM module, CLI/TUI, GTK settings app and the imk agent
+  command wrapper for the immurok fingerprint key.
+
+contents:
+  - src: dist/stage/root/usr/
+    dst: /usr/
+    type: tree
+  # 系统级自启动：用户删了它就是禁用，升级不复活
+  - src: dist/stage/root/etc/xdg/autostart/com.immurok.Settings.desktop
+    dst: /etc/xdg/autostart/com.immurok.Settings.desktop
+    type: config|noreplace
+  # type: license 是 RPM 专属标记（nfpm 对 deb/archlinux 会整条丢弃），
+  # 不带 type 就是普通文件，三家都能装进去。
+  - src: LICENSE
+    dst: /usr/share/licenses/immurok/LICENSE
+  # PAM 模块目录三家不同（设计稿 §3.1）
+  - src: pam/pam_immurok.so
+    dst: /usr/lib/${DEB_TRIPLET}/security/pam_immurok.so
+    packager: deb
+    expand: true
+  - src: pam/pam_immurok.so
+    dst: /usr/lib64/security/pam_immurok.so
+    packager: rpm
+  - src: pam/pam_immurok.so
+    dst: /usr/lib/security/pam_immurok.so
+    packager: archlinux
+
+scripts:
+  preinstall: dist/stage/scripts/preinstall.sh
+  postinstall: dist/stage/scripts/postinstall.sh
+  preremove: dist/stage/scripts/preremove.sh
+  postremove: dist/stage/scripts/postremove.sh
+
+archlinux:
+  packager: immurok <support@immurok.com>
+  scripts:
+    # nfpm 只把 postinstall 映射成 post_install；升级钩子要显式给，否则 Arch
+    # 升级后 daemon 不会重启（设计稿 §4.3）。preupgrade 不配：legacy 检测只在
+    # 全新安装有意义。
+    postupgrade: dist/stage/scripts/postinstall.sh
+
+rpm:
+  summary: Wireless fingerprint key companion for Linux
+  group: Applications/System
+
+overrides:
+  deb:
+    depends:
+      - python3
+      - python3-dbus-fast
+      - python3-gi
+      - gir1.2-gtk-4.0
+      - gir1.2-adw-1
+      - libgtk-4-1
+      - libadwaita-1-0
+      - libdbus-1-3
+      - libsystemd0
+      - libpam0g
+      - bluez
+      - polkitd | policykit-1
+      - pkexec
+      - libnotify-bin
+      - systemd
+      - dbus
+  rpm:
+    depends:
+      - python3
+      - python3-dbus-fast
+      - python3-gobject
+      - gtk4
+      - libadwaita
+      - dbus-libs
+      - systemd-libs
+      - pam
+      - bluez
+      - polkit
+      - libnotify
+      - systemd
+  archlinux:
+    depends:
+      - python
+      - python-dbus-fast
+      - python-gobject
+      - gtk4
+      - libadwaita
+      - dbus
+      - systemd-libs
+      - pam
+      - bluez
+      - polkit
+      - libnotify

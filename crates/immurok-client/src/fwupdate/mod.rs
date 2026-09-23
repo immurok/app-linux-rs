@@ -15,7 +15,7 @@ use immurok_common::fwupdate::manifest::{self, UpdateManifest};
 use immurok_common::fwupdate::planner::{self, UpdatePlan};
 use immurok_common::fwupdate::version::{normalize_semver, FirmwareVersion};
 
-use crate::socket_client::DaemonClient;
+use crate::DaemonClient;
 use error::FwUpdateError;
 use store::{FwStore, LastCheck, PendingHop};
 

@@ -2175,7 +2175,7 @@ impl App {
                 }
                 let secret: Vec<u8> = match flow.cat {
                     KeyTab::Otp => {
-                        match crate::commands::keys::base32_decode(&text) {
+                        match immurok_client::keys_import::base32_decode(&text) {
                             Some(b) if !b.is_empty() => {
                                 if b.len() > protocol::SECRET_LEN_OTP {
                                     self.set_msg_prompt(
@@ -2241,11 +2241,11 @@ impl App {
         );
 
         let add_cat = match cat {
-            KeyTab::Otp => crate::commands::keys::KeyAddCat::Otp,
-            KeyTab::Api => crate::commands::keys::KeyAddCat::Api,
+            KeyTab::Otp => immurok_client::keys_import::KeyAddCat::Otp,
+            KeyTab::Api => immurok_client::keys_import::KeyAddCat::Api,
             KeyTab::Ssh => unreachable!("SSH adds go through KEY:GENERATE"),
         };
-        let cmd = crate::commands::keys::build_key_add_cmd(add_cat, &name, &service, &secret);
+        let cmd = immurok_client::keys_import::build_key_add_cmd(add_cat, &name, &service, &secret);
         let label = cat.label();
         let tx = self.action_tx.clone();
         thread::spawn(move || {
@@ -2356,36 +2356,18 @@ impl App {
             MessageStyle::Yellow,
         );
 
-        // Build name payload (16 bytes, null-padded, copy ≤15 bytes).
-        let mut name_buf = vec![0u8; 16];
-        let nb = name.as_bytes();
-        let copy_len = nb.len().min(15);
-        name_buf[..copy_len].copy_from_slice(&nb[..copy_len]);
-        let hex_name = hex::encode(&name_buf);
-        let cmd = format!("KEY:GENERATE:{}", hex_name);
-
         let tx = self.action_tx.clone();
         thread::spawn(move || {
-            let result = (|| -> Result<String, String> {
-                let mut client = DaemonClient::connect()?;
-                client.send(&cmd)
-            })();
-            match result {
-                Ok(rsp) if rsp.starts_with("OK") => {
+            match immurok_client::keys::generate_ssh(&name) {
+                Ok(()) => {
                     let _ = tx.send(ActionResult::Message(
                         format!("SSH keypair '{}' generated.", name),
                         MessageStyle::Green,
                     ));
                 }
-                Ok(rsp) => {
-                    let _ = tx.send(ActionResult::Message(
-                        format!("Generate failed: {}", rsp),
-                        MessageStyle::Red,
-                    ));
-                }
                 Err(e) => {
                     let _ = tx.send(ActionResult::Message(
-                        format!("Generate error: {}", e),
+                        format!("Generate failed: {}", e),
                         MessageStyle::Red,
                     ));
                 }

@@ -44,6 +44,9 @@ rm -f "$BIN_DIR/immurok-auth-dialog" "$BIN_DIR/immurok-pam-helper"
 rm -f "$BIN_DIR/immurok-session-agent"
 rm -f /etc/systemd/user/immurok-session-agent.service
 rm -f "$BIN_DIR/ble-notify-helper.py"
+rm -f "$BIN_DIR/immurok-gui"
+rm -f /usr/local/share/applications/com.immurok.Settings.desktop
+rm -f /usr/local/share/dbus-1/services/com.immurok.Settings.service
 systemctl daemon-reload 2>/dev/null
 
 # override 清掉后重启一次 polkit，让沙箱回到发行版默认 —— 同时这就是

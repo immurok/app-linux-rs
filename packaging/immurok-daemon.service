@@ -9,7 +9,7 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/immurok-daemon
+ExecStart=/usr/bin/immurok-daemon
 User=immurok
 Group=immurok
 # BlueZ 授权来自 packaging/dbus/immurok.conf。不写 SupplementaryGroups=

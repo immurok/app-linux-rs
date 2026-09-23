@@ -1,0 +1,153 @@
+name: Release
+
+# 打 tag 发版：  git tag v0.9.0 && git push origin v0.9.0
+# 手动 dry run（Actions → Release → Run workflow）：只构建 + 验证，产物作 artifact，不发 Release。
+#
+# 一次构建（debian:12，glibc 2.36 是目标里最老的）→ nfpm 出 deb / rpm / archlinux
+# → 在四个发行版容器里真实安装验证 → 挂 Release。
+# 设计稿：docs/superpowers/specs/2026-09-21-linux-packaging-design.md
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: 2.47.0
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Version from Cargo.toml must match the tag; CHANGELOG must have the section
+        id: ver
+        run: |
+          set -euo pipefail
+          V=$(grep -m1 '^version' crates/immurok-daemon/Cargo.toml | cut -d'"' -f2)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            [ "$TAG" = "$V" ] || { echo "tag v$TAG != Cargo version $V"; exit 1; }
+            grep -q "^## $V" CHANGELOG.md || { echo "CHANGELOG.md has no '## $V' section (rename 'Unreleased' before tagging)"; exit 1; }
+          else
+            grep -q "^## $V" CHANGELOG.md || echo "::warning::CHANGELOG.md has no '## $V' section yet (fine for a dry run; required before tagging)"
+          fi
+          echo "version $V ok"
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: debian:12
+    steps:
+      - name: Build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config libdbus-1-dev libpam0g-dev libgtk-4-dev libadwaita-1-dev \
+            curl ca-certificates git
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - name: Build + test
+        run: |
+          set -euo pipefail
+          cargo build --release --workspace --locked
+          cargo test --release --workspace --locked
+          make -C pam
+          make -C pam test
+          bash scripts/test-stage.sh
+          bash scripts/test-pkg-scripts.sh
+      - name: nfpm
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in amd64) A=x86_64 ;; arm64) A=arm64 ;; esac
+          BASE="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}"
+          TARBALL="nfpm_${NFPM_VERSION}_Linux_${A}.tar.gz"
+          curl -sSLo "/tmp/$TARBALL" "$BASE/$TARBALL"
+          curl -sSL "$BASE/checksums.txt" | grep " $TARBALL\$" > /tmp/nfpm.sha256
+          (cd /tmp && sha256sum -c nfpm.sha256)
+          tar -xzf "/tmp/$TARBALL" -C /usr/local/bin nfpm
+          nfpm --version
+      - name: Package
+        run: |
+          set -euo pipefail
+          bash packaging/stage.sh dist/stage
+          set -a; . packaging/pkg-env.sh; set +a
+          for f in deb rpm archlinux; do nfpm package -f packaging/nfpm.yaml -p $f -t dist/; done
+          cp packaging/verify.sh dist/
+          ls -l dist/*.deb dist/*.rpm dist/*.pkg.tar.zst
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/verify.sh
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        image: ['debian:12', 'ubuntu:24.04', 'fedora:43', 'archlinux:latest']
+        exclude:
+          # 官方 archlinux 镜像只有 x86_64（Arch Linux ARM 是另一个项目）
+          - arch: arm64
+            image: 'archlinux:latest'
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist
+      - name: Install / assert / remove
+        run: sh dist/verify.sh dist
+
+  release:
+    if: github.event_name == 'push'
+    needs: [preflight, build, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums + release notes
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum *.deb *.rpm *.pkg.tar.zst > SHA256SUMS && cat SHA256SUMS && cd ..
+          V="${{ needs.preflight.outputs.version }}"
+          awk -v v="$V" '/^## /{p = ($2 == v)} p' CHANGELOG.md > notes.md
+          cat notes.md
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: v${{ needs.preflight.outputs.version }}
+          body_path: notes.md
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS

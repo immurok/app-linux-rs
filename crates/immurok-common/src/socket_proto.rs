@@ -119,6 +119,14 @@ pub enum Request {
 
 // ── Response ──────────────────────────────────────────────────
 
+/// Upper bound on one request line over the daemon socket, in bytes.
+/// The daemon reads a request in a single buffer of this size; a client
+/// (imk) refuses to send anything longer instead of letting the daemon
+/// truncate it. 64 KiB is far above any real `imk run --agent` command
+/// while still bounding what an unprivileged local client can make the
+/// daemon buffer.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 /// All responses the daemon can send back to the client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {

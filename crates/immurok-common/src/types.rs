@@ -80,6 +80,8 @@ pub enum EnrollEvent {
     Captured { current: u8, total: u8 },
     Processing,
     LiftFinger,
+    /// Frame too similar to the previous one; progress does not advance.
+    Overlap,
     Complete,
     Failed,
 }
@@ -92,6 +94,7 @@ impl EnrollEvent {
             0x02 => Self::Processing,
             0x03 => Self::LiftFinger,
             0x04 => Self::Complete,
+            0x06 => Self::Overlap,
             _ => Self::Failed,
         }
     }
@@ -126,6 +129,18 @@ impl PairProgress {
             Self::Done => "DONE",
             Self::Failed => "FAILED",
         }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "IDLE" => Self::Idle,
+            "WAIT_FP" => Self::WaitFp,
+            "WAIT_BUTTON" => Self::WaitButton,
+            "ECDH" => Self::Ecdh,
+            "DONE" => Self::Done,
+            "FAILED" => Self::Failed,
+            _ => return None,
+        })
     }
 }
 
@@ -171,5 +186,32 @@ mod tests {
             fp_bitmap_display(0b0010_0001),
             "[■] [ ] [ ] [ ] [ ] [■]"
         );
+    }
+}
+
+#[cfg(test)]
+mod enroll_overlap_tests {
+    use super::*;
+
+    #[test]
+    fn overlap_is_its_own_event_not_a_failure() {
+        assert_eq!(EnrollEvent::from_notification(0x06, 2, 6), EnrollEvent::Overlap);
+        assert_eq!(EnrollEvent::from_notification(0x04, 6, 6), EnrollEvent::Complete);
+        assert_eq!(EnrollEvent::from_notification(0x7f, 0, 6), EnrollEvent::Failed);
+    }
+
+    #[test]
+    fn pair_progress_wire_roundtrip() {
+        for p in [
+            PairProgress::Idle,
+            PairProgress::WaitFp,
+            PairProgress::WaitButton,
+            PairProgress::Ecdh,
+            PairProgress::Done,
+            PairProgress::Failed,
+        ] {
+            assert_eq!(PairProgress::from_wire(p.as_wire()), Some(p));
+        }
+        assert_eq!(PairProgress::from_wire("BOGUS"), None);
     }
 }

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=immurok quick-fill
+Comment=Keeps the immurok quick-fill panel one hotkey away
+Exec=immurok-gui --gapplication-service
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=com.immurok.Settings
+Exec=/usr/bin/immurok-gui --gapplication-service

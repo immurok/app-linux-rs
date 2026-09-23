@@ -1,9 +1,18 @@
 //! immurok-cli — command-line management tool for the immurok daemon.
 
 mod commands;
-mod enroll_hint;
-mod fwupdate;
-mod socket_client;
+// Firmware-update orchestration lives in immurok-client now (shared with
+// immurok-gui); re-exported under the old module name so `crate::fwupdate::…`
+// across commands/ and tui/ keeps working unchanged.
+use immurok_client::fwupdate;
+// The socket client lives in its own crate now (shared with immurok-gui).
+// Re-exported under the old module name so `crate::socket_client::…` paths
+// across commands/ and tui/ keep working unchanged.
+use immurok_client as socket_client;
+// Enrollment step text now lives in immurok-client (shared with the GUI);
+// re-exported under the old module name so `crate::enroll_hint::…` in
+// commands/ and tui/ keeps working unchanged.
+use immurok_client::enroll_hint;
 mod tui;
 
 use clap::Parser;

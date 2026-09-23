@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=immurok
+Comment=Fingerprint key settings and quick-fill
+Exec=immurok-gui
+Icon=dialog-password
+Terminal=false
+Categories=Settings;Security;
+DBusActivatable=true
+StartupNotify=true

@@ -18,6 +18,10 @@ CARGO := $(shell \
     if [ -x "$(HOME)/.cargo/bin/cargo" ]; then echo "$(HOME)/.cargo/bin/cargo"; \
     elif command -v cargo >/dev/null 2>&1; then command -v cargo; \
     else echo cargo; fi)
+# GUI 需要 GTK4 + libadwaita 的开发头。缺就跳过 immurok-gui，其他 crate 照常构建，
+# daemon / CLI 用户不被拖着装一套图形依赖。
+HAS_GTK_DEV := $(shell pkg-config --exists gtk4 libadwaita-1 2>/dev/null && echo 1)
+CARGO_EXCLUDE := $(if $(HAS_GTK_DEV),,--exclude immurok-gui)
 POLKIT_DIR = /usr/share/polkit-1/actions
 # 旧版给 polkit 开的两个 override（socket 还在 /run/user/<uid> 的年代，
 # ProtectHome=yes 会把它整个挡掉）。socket 搬到 /run/immurok 后不再需要，
@@ -32,7 +36,7 @@ PAM_DIR := $(shell \
     elif [ -d /lib/security ]; then echo /lib/security; \
     else echo /usr/lib/security; fi)
 
-.PHONY: all build pam install uninstall clean check-deps
+.PHONY: all build pam install uninstall clean check-deps package verify-pkg
 
 all: build pam
 
@@ -43,7 +47,8 @@ check-deps:
 	@CARGO="$(CARGO)" CC="$(CC)" bash scripts/check-deps.sh all
 
 build: check-deps
-	$(CARGO) build --release --workspace
+	$(CARGO) build --release --workspace $(CARGO_EXCLUDE)
+	@[ -n "$(HAS_GTK_DEV)" ] || echo "⚠️  未找到 gtk4/libadwaita 开发头，已跳过 immurok-gui（装 libgtk-4-dev libadwaita-1-dev 后重跑 make）"
 
 pam:
 	$(MAKE) -C pam
@@ -56,6 +61,12 @@ install: all
 	-rm -f $(LEGACY_USER_UNIT_DIR)/immurok-daemon.service
 	systemctl --user daemon-reload
 	systemctl --user enable --now immurok-session-agent.service
+	@# ── 用户级：GUI 自启动（常驻，热键秒开）。二进制不存在时跳过 ──
+	@if [ -x $(BIN_DIR)/immurok-gui ]; then \
+		mkdir -p $(HOME)/.config/autostart; \
+		install -m644 packaging/com.immurok.Settings.autostart.desktop $(HOME)/.config/autostart/com.immurok.Settings.desktop; \
+		echo "✓ GUI 自启动已登记（$(HOME)/.config/autostart/com.immurok.Settings.desktop）"; \
+	fi
 	-rm -f $(LEGACY_BIN)/immurok-daemon $(LEGACY_BIN)/immurok-cli $(LEGACY_BIN)/imk
 	-rm -f $(LEGACY_BIN)/immurok-auth-dialog $(LEGACY_BIN)/immurok-pam-helper
 	-rm -f $(LEGACY_BIN)/ble-notify-helper.py
@@ -83,6 +94,7 @@ uninstall:
 	-rm -f $(LEGACY_BIN)/immurok-daemon $(LEGACY_BIN)/immurok-cli $(LEGACY_BIN)/imk
 	-rm -f $(LEGACY_BIN)/immurok-auth-dialog $(LEGACY_BIN)/immurok-pam-helper
 	-rm -f $(LEGACY_BIN)/ble-notify-helper.py
+	-rm -f $(HOME)/.config/autostart/com.immurok.Settings.desktop
 	-@for rc in $(HOME)/.bashrc $(HOME)/.zshrc; do \
 		[ -f "$$rc" ] || continue; \
 		if grep -q '# added by immurok install' "$$rc"; then \
@@ -92,6 +104,30 @@ uninstall:
 	done
 	@echo "=== Done$(if $(PURGE), (含 /var/lib/immurok), （/var/lib/immurok 保留，PURGE=1 可一并删除）) ==="
 
+# ── 发行版安装包 ──────────────────────────────────────────────────
+# 出 deb / rpm / archlinux 三种包到 dist/（设计稿 docs/superpowers/specs/2026-09-21-linux-packaging-design.md）。
+# 需要 nfpm：https://github.com/goreleaser/nfpm/releases，解开后把二进制放进 PATH。
+# GUI 是包的一部分，没有 gtk4/libadwaita 开发头就不出包。
+DIST_DIR = dist
+NFPM ?= nfpm
+
+package: build pam
+	@[ -n "$(HAS_GTK_DEV)" ] || { echo "✗ package needs immurok-gui: install gtk4/libadwaita dev headers"; exit 1; }
+	@command -v $(NFPM) >/dev/null 2>&1 || { echo "✗ nfpm not found: https://github.com/goreleaser/nfpm/releases (put the binary in ~/.local/bin)"; exit 1; }
+	bash packaging/stage.sh $(DIST_DIR)/stage
+	@set -e; set -a; . packaging/pkg-env.sh; set +a; \
+	for f in deb rpm archlinux; do $(NFPM) package -f packaging/nfpm.yaml -p $$f -t $(DIST_DIR)/; done
+	@ls -1 $(DIST_DIR)/*.deb $(DIST_DIR)/*.rpm $(DIST_DIR)/*.pkg.tar.zst
+
+# 在发行版容器里装/验/卸 dist/ 里的包——本地复现 CI 的 verify job。
+#   make verify-pkg DISTRO=debian:12   （ubuntu:24.04 / fedora:43 / archlinux:latest）
+# 注意：本机（Arch，新 glibc）编译的二进制在 debian:12 里跑不起来（GLIBC_2.39）——CI 在 debian:12 容器里构建，本地只用 debian:12 验依赖名和文件落点。
+DISTRO ?= debian:12
+verify-pkg:
+	docker run --rm -v "$$(pwd)/$(DIST_DIR):/dist:ro" -v "$$(pwd)/packaging/verify.sh:/verify.sh:ro" \
+		$(DISTRO) sh /verify.sh /dist
+
 clean:
 	$(CARGO) clean
 	$(MAKE) -C pam clean
+	rm -rf $(DIST_DIR)

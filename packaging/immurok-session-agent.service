@@ -13,7 +13,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/immurok-session-agent
+ExecStart=/usr/bin/immurok-session-agent
 # 进程自己有重连退避；这条只是兜底（比如二进制被换掉后崩溃）。
 Restart=always
 RestartSec=2

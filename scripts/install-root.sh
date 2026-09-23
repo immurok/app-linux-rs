@@ -28,6 +28,23 @@ cd "$SRC" || exit 1
 
 step() { echo "  → $*"; }
 
+# 与发行版安装包互斥：包装在 /usr，源码装在 /usr/local，同机两份会互相遮
+# （PATH、unit 覆盖、PAM .so 同路径）。发现 /usr/bin 的 daemon 归某个包管就停。
+owned_by_package() {
+    local f="$1"
+    [ -e "$f" ] || return 1
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$f" >/dev/null 2>&1; then return 0; fi
+    if command -v rpm >/dev/null 2>&1 && rpm -qf "$f" >/dev/null 2>&1; then return 0; fi
+    if command -v pacman >/dev/null 2>&1 && pacman -Qo "$f" >/dev/null 2>&1; then return 0; fi
+    return 1
+}
+if owned_by_package /usr/bin/immurok-daemon; then
+    echo "immurok is installed from a distribution package (/usr/bin/immurok-daemon)."
+    echo "Remove that package first (apt remove immurok / dnf remove immurok / pacman -R immurok),"
+    echo "then run make install again. Pairing data in /var/lib/immurok is kept."
+    exit 1
+fi
+
 step "binaries → $BIN_DIR"
 install -Dm755 target/release/immurok-daemon "$BIN_DIR/immurok-daemon"
 install -Dm755 target/release/immurok-cli    "$BIN_DIR/immurok-cli"
@@ -37,16 +54,30 @@ install -Dm755 scripts/immurok-pam-helper    "$HELPER"
 install -Dm755 scripts/ble-notify-helper.py  "$BIN_DIR/ble-notify-helper.py"
 install -Dm755 target/release/immurok-session-agent "$BIN_DIR/immurok-session-agent"
 
+# GUI 是可选构建产物（缺 GTK 开发头时 Makefile 会跳过）。
+if [ -x target/release/immurok-gui ]; then
+    mkdir -p /usr/local/share/applications /usr/local/share/dbus-1/services
+    install -Dm755 target/release/immurok-gui "$BIN_DIR/immurok-gui"
+    install -Dm644 packaging/com.immurok.Settings.desktop /usr/local/share/applications/com.immurok.Settings.desktop
+    sed "s|/usr/bin/|$BIN_DIR/|" packaging/com.immurok.Settings.service \
+        > /usr/local/share/dbus-1/services/com.immurok.Settings.service
+    chmod 644 /usr/local/share/dbus-1/services/com.immurok.Settings.service
+    update-desktop-database /usr/local/share/applications 2>/dev/null || true
+fi
+
 step "system integration files"
 sed "s|@HELPER_PATH@|$HELPER|" scripts/com.immurok.pam-helper.policy.in \
     > "$POLKIT_DIR/com.immurok.pam-helper.policy"
 chmod 644 "$POLKIT_DIR/com.immurok.pam-helper.policy"
-install -Dm644 packaging/immurok-daemon.service "$SYSTEMD_SYSTEM_DIR/immurok-daemon.service"
+# unit 文件以 /usr/bin 为规范路径（发行版包用），源码安装替换成 $BIN_DIR
+sed "s|/usr/bin/|$BIN_DIR/|" packaging/immurok-daemon.service > "$SYSTEMD_SYSTEM_DIR/immurok-daemon.service"
+chmod 644 "$SYSTEMD_SYSTEM_DIR/immurok-daemon.service"
 install -Dm644 packaging/tmpfiles.d/immurok.conf "$TMPFILES_DIR/immurok.conf"
 install -Dm644 packaging/dbus/immurok.conf "$DBUS_POLICY_DIR/immurok.conf"
 install -Dm644 packaging/polkit/49-immurok.rules "$POLKIT_RULES_DIR/49-immurok.rules"
 # 用户级单元装到 /etc/systemd/user/，各用户自己 enable（见 Makefile 的非 root 段）
-install -Dm644 packaging/immurok-session-agent.service /etc/systemd/user/immurok-session-agent.service
+sed "s|/usr/bin/|$BIN_DIR/|" packaging/immurok-session-agent.service > /etc/systemd/user/immurok-session-agent.service
+chmod 644 /etc/systemd/user/immurok-session-agent.service
 # BlueZ 的 policy 是 dbus 守护进程读的，reload 即可，不用重启 bluetoothd
 systemctl reload dbus 2>/dev/null || systemctl reload dbus-broker 2>/dev/null || true
 

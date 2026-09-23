@@ -804,7 +804,7 @@ async fn connect_and_serve(
                             warn!(
                                 "Challenge-Response: still unexpected on retry ({:?}) — \
                                  assuming pre-CHALLENGE firmware",
-                                other.map(|r| hex::encode(r))
+                                other.map(hex::encode)
                             );
                             coordinator.is_device_verified.store(true, Ordering::Relaxed);
                         }
@@ -1450,6 +1450,30 @@ async fn send_command_inner(
     }
 }
 
+/// Marks `coordinator.gate_active` for exactly as long as the BLE worker is
+/// parked in the gate wait loop below — i.e. exactly as long as there is a
+/// waiter registered on `coordinator.gate_cancel`.
+///
+/// A guard rather than plain stores because the loop has several exits
+/// (resolved / cancelled / timeout / `?` on an await inside
+/// `route_notification`): leaving the flag set would make the next
+/// `GATE:CANCEL` fire `notify_one()` with nobody waiting, and the stored
+/// permit would cancel a later, unrelated gate.
+struct GateActiveGuard<'a>(&'a Arc<Coordinator>);
+
+impl GateActiveGuard<'_> {
+    fn arm(coordinator: &Arc<Coordinator>) -> GateActiveGuard<'_> {
+        coordinator.gate_active.store(true, Ordering::SeqCst);
+        GateActiveGuard(coordinator)
+    }
+}
+
+impl Drop for GateActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.gate_active.store(false, Ordering::SeqCst);
+    }
+}
+
 /// FP-gated command: send -> WAIT_FP -> wait for gate resolution via notifications.
 async fn send_fp_gated_inner(
     helper: &mut HelperIO,
@@ -1488,6 +1512,13 @@ async fn send_fp_gated_inner(
     state.auth_failures = 0;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(BLE_FP_GATE_TIMEOUT_SECS);
+    // Armed for the wait loop: over this span a `gate_cancel` notification
+    // is guaranteed to be picked up — a `notify_one` that lands while the
+    // select body runs is stored as a permit and consumed by the next
+    // iteration's `notified()`. `handle_gate_cancel` /
+    // `handle_fp_enroll_cancel` key off this flag; the guard clears it on
+    // every exit (cancel / timeout / resolved / error).
+    let _gate_active = GateActiveGuard::arm(coordinator);
     let gate_result = loop {
         tokio::select! {
             result = &mut gate_rx => {

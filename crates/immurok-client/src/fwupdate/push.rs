@@ -16,9 +16,9 @@ pub trait OtaChannel {
     fn send(&mut self, request: &str) -> Result<String, String>;
 }
 
-impl OtaChannel for crate::socket_client::DaemonClient {
+impl OtaChannel for crate::DaemonClient {
     fn send(&mut self, request: &str) -> Result<String, String> {
-        crate::socket_client::DaemonClient::send(self, request)
+        crate::DaemonClient::send(self, request)
     }
 }
 

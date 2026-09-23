@@ -18,6 +18,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use immurok_common::paths;
+use immurok_common::socket_proto::MAX_REQUEST_BYTES;
 
 const EXIT_REJECTED: i32 = 77; // EX_NOPERM — agent rejected by user
 const EXIT_USAGE: i32 = 64;    // EX_USAGE
@@ -110,7 +111,13 @@ fn cmd_run(args: &[String]) -> i32 {
         return EXIT_CONFIG;
     }
 
-    let cmd_string = cmd_args.join(" ");
+    let cmd_string = match prepare_agent_command(&cmd_args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("imk: {}", msg);
+            return EXIT_USAGE;
+        }
+    };
 
     if is_agent {
         match request_agent_approval(&cmd_string) {
@@ -240,6 +247,39 @@ fn request_agent_approval(cmd: &str) -> ApprovalResult {
     } else {
         ApprovalResult::Error(format!("unexpected response: {}", resp))
     }
+}
+
+/// Build the one-line command string shown to the user and sent to the
+/// daemon. The socket protocol is line-based, so raw newlines (a multi-line
+/// `bash -c` body) would end the request early and leave the dialog showing
+/// only the first line of what gets run. Control characters are made
+/// visible instead, and the whole thing is bounded so the daemon never has
+/// to truncate it.
+fn prepare_agent_command(cmd_args: &[String]) -> Result<String, String> {
+    let mut out = String::new();
+    for (i, arg) in cmd_args.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        for c in arg.chars() {
+            match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\0' => out.push_str("\\0"),
+                c => out.push(c),
+            }
+        }
+    }
+    // "AGENT_APPROVE:" + command + "\n" must fit the daemon's single read.
+    let overhead = "AGENT_APPROVE:\n".len();
+    if out.len() + overhead >= MAX_REQUEST_BYTES {
+        return Err(format!(
+            "command too long for agent approval ({} bytes, limit {}); put it in a script file and wrap that instead",
+            out.len(),
+            MAX_REQUEST_BYTES - overhead - 1
+        ));
+    }
+    Ok(out)
 }
 
 fn daemon_socket_path() -> Result<String, String> {
@@ -460,5 +500,25 @@ fn truncate_for_log(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod agent_command_tests {
+    use super::*;
+
+    #[test]
+    fn newlines_in_agent_command_are_escaped_visibly() {
+        let args = ["sudo", "bash", "-c", "set -e\ncp a b\r\n"].map(String::from);
+        let cmd = prepare_agent_command(&args).unwrap();
+        assert_eq!(cmd, "sudo bash -c set -e\\ncp a b\\r\\n");
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn oversized_agent_command_is_refused_before_send() {
+        let args = ["echo".to_string(), "y".repeat(MAX_REQUEST_BYTES)];
+        let err = prepare_agent_command(&args).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
     }
 }

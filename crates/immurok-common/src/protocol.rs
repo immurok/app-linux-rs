@@ -127,6 +127,9 @@ pub const ENROLL_CAPTURED: u8 = 0x01;
 pub const ENROLL_PROCESSING: u8 = 0x02;
 pub const ENROLL_LIFT_FINGER: u8 = 0x03;
 pub const ENROLL_COMPLETE: u8 = 0x04;
+/// Mode-1 enrollment: the new frame overlaps the previous one too much.
+/// Not a failure — the user shifts the finger and presses again.
+pub const ENROLL_OVERLAP: u8 = 0x06;
 pub const ENROLL_FAILED: u8 = 0xFF;
 
 // Packet format

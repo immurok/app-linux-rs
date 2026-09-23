@@ -17,7 +17,9 @@ use tracing::{debug, info, warn};
 
 use immurok_common::dual_host::{self, ClearPath, SlotClearAck, SlotStatus};
 use immurok_common::protocol;
-use immurok_common::socket_proto::{parse_request, serialize_response, Request, Response};
+use immurok_common::socket_proto::{
+    parse_request, serialize_response, Request, Response, MAX_REQUEST_BYTES,
+};
 use immurok_common::types::PairProgress;
 
 use crate::coordinator::Coordinator;
@@ -222,6 +224,58 @@ async fn authorize(tier: Tier, peer_uid: u32) -> Result<(), String> {
     }
 }
 
+/// Why a request chunk could not be taken as a single request line.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestError {
+    /// The chunk filled the whole buffer: either the request exceeds
+    /// [`MAX_REQUEST_BYTES`] or more of it is still in flight. Either way
+    /// we will not act on a possibly-truncated command.
+    TooLong,
+    /// Non-blank bytes followed the first newline. A request is one line;
+    /// anything after it is a second, unseen request (typically a raw
+    /// multi-line command an old imk did not escape).
+    TrailingData,
+}
+
+impl RequestError {
+    fn wire_code(&self) -> &'static str {
+        match self {
+            RequestError::TooLong => "TOO_LONG",
+            RequestError::TrailingData => "PROTOCOL",
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            RequestError::TooLong => "request exceeds MAX_REQUEST_BYTES",
+            RequestError::TrailingData => "data after the request line",
+        }
+    }
+}
+
+/// Extract the single request line from the first chunk read off a client
+/// socket. Tolerates the newline-less form PAM sends (`AUTH:user:service`
+/// with no terminator), which is why this is chunk-based rather than
+/// `read_line`-based: PAM keeps the socket open, so waiting for `\n` would
+/// stall every sudo until the read timeout.
+fn split_request_chunk(chunk: &[u8]) -> Result<String, RequestError> {
+    if chunk.len() >= MAX_REQUEST_BYTES {
+        return Err(RequestError::TooLong);
+    }
+    let raw = String::from_utf8_lossy(chunk);
+    let strip = |s: &str| {
+        s.trim_matches(|c: char| c == '\0' || c == '\n' || c == '\r' || c == ' ')
+            .to_string()
+    };
+    match raw.split_once('\n') {
+        Some((_, rest)) if !strip(rest).is_empty() => {
+            debug!("request line followed by {} extra bytes", rest.len());
+            Err(RequestError::TrailingData)
+        }
+        Some((first, _)) => Ok(strip(first)),
+        None => Ok(strip(&raw)),
+    }
+}
+
 /// Handle a single client connection.
 async fn handle_client(
     mut stream: UnixStream,
@@ -235,8 +289,12 @@ async fn handle_client(
         }
     };
 
-    // Read first request with timeout
-    let mut buf = vec![0u8; 512];
+    // Read first request with timeout. The buffer is sized to the protocol
+    // maximum so a legitimately long `AGENT_APPROVE:<cmd>` arrives in one
+    // read instead of being cut at an arbitrary boundary (the old 512-byte
+    // buffer left the tail in the socket, where handle_agent_approve's
+    // disconnect probe read it and reported "user rejected").
+    let mut buf = vec![0u8; MAX_REQUEST_BYTES];
     let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         Ok(Ok(_)) => return Ok(()), // EOF
@@ -244,8 +302,16 @@ async fn handle_client(
         Err(_) => return Err("Read timeout".into()),
     };
 
-    let raw = String::from_utf8_lossy(&buf[..n]);
-    let line = raw.trim_matches(|c: char| c == '\0' || c == '\n' || c == '\r' || c == ' ');
+    let line = match split_request_chunk(&buf[..n]) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Rejecting request from uid {}: {}", peer_uid, e.as_str());
+            let resp = serialize_response(&Response::Error(e.wire_code().into()));
+            let _ = stream.write_all(format!("{}\n", resp).as_bytes()).await;
+            return Ok(());
+        }
+    };
+    let line = line.as_str();
     info!("Socket request: {}", line);
 
     // Authorize per command, not per connection: the socket is machine-wide,
@@ -707,22 +773,35 @@ async fn handle_fp_list(coord: &Arc<Coordinator>) -> Response {
         return Response::Error("NOT_CONNECTED".into());
     }
 
-    // Always query device for latest bitmap — avoids stale cache issues
-    // from race conditions between gate RSP_OK and FP_LIST responses.
-    // FP:LIST is only polled every ~2s, so one BLE round-trip is fine.
-    match coord.ble_send(protocol::CMD_FP_LIST, vec![]).await {
-        Ok((status, payload)) => {
-            info!("FP:LIST BLE response: status=0x{:02x} payload={:?}", status, payload);
-            if status == protocol::RSP_OK && !payload.is_empty() {
-                let mut ds = coord.device_status.write().await;
-                if let Some(ref mut s) = *ds {
-                    s.fp_bitmap = payload[0];
-                    info!("FP:LIST set bitmap={}", s.fp_bitmap);
+    // Serve from cache unless something has invalidated it. The bitmap is
+    // seeded from GET_STATUS on connect (ble.rs) and only changes on enroll
+    // complete / delete — both set `fp_bitmap_stale` — or on a device
+    // reboot, which drops the session and re-seeds. Everything else that
+    // asks (TUI every 2s, GUI, `status`) is a pure read.
+    //
+    // This used to be "always query the device": every FP:LIST was a BLE
+    // round-trip, so an open TUI put a CMD 0x13 on the air every 2s for as
+    // long as it ran (visible on the device serial log). SLOT:STATUS got
+    // the same treatment on the TUI side for the same reason.
+    let have_cache = coord.device_status.read().await.is_some();
+    if coord.fp_bitmap_stale.load(Ordering::Relaxed) || !have_cache {
+        match coord.ble_send(protocol::CMD_FP_LIST, vec![]).await {
+            Ok((status, payload)) => {
+                info!("FP:LIST BLE response: status=0x{:02x} payload={:?}", status, payload);
+                if status == protocol::RSP_OK && !payload.is_empty() {
+                    let mut ds = coord.device_status.write().await;
+                    if let Some(ref mut s) = *ds {
+                        s.fp_bitmap = payload[0];
+                        info!("FP:LIST set bitmap={}", s.fp_bitmap);
+                    }
+                    // Only a successful refresh clears the flag; a failed
+                    // round-trip leaves it set so the next caller retries.
+                    coord.fp_bitmap_stale.store(false, Ordering::Relaxed);
                 }
             }
-        }
-        Err(e) => {
-            info!("FP:LIST BLE error: {}", e);
+            Err(e) => {
+                info!("FP:LIST BLE error: {}", e);
+            }
         }
     }
 
@@ -793,8 +872,11 @@ async fn handle_fp_enroll(coord: &Arc<Coordinator>, slot: u8, stream: &mut UnixS
 ///    worker is back in its main loop, ENROLL_CANCEL goes through the
 ///    queue normally.
 ///
-/// Fire both — notify is no-op when no gate is active, ENROLL_CANCEL is
-/// idempotent on the firmware side.
+/// Fire both — but the notify ONLY while a gate is actually running:
+/// `Notify::notify_one()` with no waiter stores a permit, so a cancel sent
+/// after the gate is long past (the guide page's Cancel, which is the
+/// common case) would instantly kill the *next* gate. ENROLL_CANCEL is
+/// idempotent on the firmware side, so it goes out either way.
 async fn handle_fp_enroll_cancel(coord: &Arc<Coordinator>) -> Response {
     if !coord.is_connected.load(Ordering::Relaxed) {
         return Response::Error("NOT_CONNECTED".into());
@@ -802,7 +884,7 @@ async fn handle_fp_enroll_cancel(coord: &Arc<Coordinator>) -> Response {
 
     *coord.last_enroll_event.write().await = None;
 
-    coord.gate_cancel.notify_one();
+    coord.cancel_active_gate();
 
     match coord
         .ble_send(protocol::CMD_ENROLL_CANCEL, vec![])
@@ -896,9 +978,28 @@ async fn handle_fp_last_match(_coord: &Arc<Coordinator>) -> Response {
 
 // ── GATE:CANCEL ─────────────────────────────────────────────
 
+/// Cancel a gate the GUI/CLI is waiting on (Delete, Test, unbind-other-host).
+///
+/// A queued `BleCommand` is useless while a gate is running: the single BLE
+/// worker is parked inside `send_fp_gated_inner`, so `CMD_GATE_CANCEL` would
+/// sit in the queue until the gate resolves — the daemon would keep waiting
+/// up to 30 s with e.g. `DELETE_FP:<slot>` armed on the device, and the next
+/// touch (screen unlock, sudo) would execute it. So when a gate is active,
+/// poke `gate_cancel` instead: the gated loop bails out and writes
+/// `CMD_GATE_CANCEL` straight to the helper itself — hence no `ble_send`
+/// here, which would be a second cancel frame on the wire.
+///
+/// With no gate active the notify is deliberately NOT fired: `Notify`
+/// stores a permit when nobody is waiting, which would cancel the *next*
+/// gate. The queued `CMD_GATE_CANCEL` is the right tool there (the worker
+/// is in its main loop) and still clears any device-side gate state.
 async fn handle_gate_cancel(coord: &Arc<Coordinator>) -> Response {
     if !coord.is_connected.load(Ordering::Relaxed) {
         return Response::Error("NOT_CONNECTED".into());
+    }
+
+    if coord.cancel_active_gate() {
+        return Response::Ok("GATE_CANCELLED".into());
     }
 
     match coord
@@ -1235,6 +1336,7 @@ async fn handle_agent_approve(
     // own Cancel button (process exits with code 1).
     let auth_fut = coord.ble_auth_request();
     let mut disconnect_buf = [0u8; 1];
+    let mut protocol_error = false;
     let result = tokio::select! {
         ble_result = auth_fut => match ble_result {
             Ok(true) => true,
@@ -1256,8 +1358,12 @@ async fn handle_agent_approve(
                     false
                 }
                 Ok(_) => {
-                    info!("AGENT_APPROVE cancelled: unexpected data on imk socket");
+                    // Bytes the request read did not consume — a command
+                    // that did not fit one read. Not a user decision, so it
+                    // must not surface as REJECTED.
+                    warn!("AGENT_APPROVE aborted: unexpected data on imk socket");
                     coord.auth_dialog_cancel.notify_one();
+                    protocol_error = true;
                     false
                 }
             }
@@ -1284,6 +1390,10 @@ async fn handle_agent_approve(
     }
 
     coord.deny_pending_pam().await;
+
+    if protocol_error {
+        return Response::Error("PROTOCOL".into());
+    }
 
     if result {
         // 10s sudo pre-auth bridge: covers the latency between
@@ -1919,3 +2029,40 @@ async fn handle_key_import_inner(
     }
 }
 
+
+#[cfg(test)]
+mod request_line_tests {
+    use super::*;
+
+    #[test]
+    fn request_longer_than_512_bytes_is_kept_whole() {
+        let cmd = "x".repeat(2000);
+        let chunk = format!("AGENT_APPROVE:{cmd}\n");
+        let line = split_request_chunk(chunk.as_bytes()).unwrap();
+        assert_eq!(line, format!("AGENT_APPROVE:{cmd}"));
+    }
+
+    #[test]
+    fn bytes_after_newline_are_a_protocol_error() {
+        let chunk = b"AGENT_APPROVE:sudo bash -c \nset -e\ncp a b\n";
+        assert!(matches!(
+            split_request_chunk(chunk),
+            Err(RequestError::TrailingData)
+        ));
+    }
+
+    #[test]
+    fn newline_less_request_from_pam_is_accepted() {
+        let line = split_request_chunk(b"AUTH:katsu:sudo").unwrap();
+        assert_eq!(line, "AUTH:katsu:sudo");
+    }
+
+    #[test]
+    fn chunk_filling_the_buffer_is_too_long() {
+        let chunk = vec![b'a'; MAX_REQUEST_BYTES];
+        assert!(matches!(
+            split_request_chunk(&chunk),
+            Err(RequestError::TooLong)
+        ));
+    }
+}

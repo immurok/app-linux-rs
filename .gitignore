@@ -1,4 +1,5 @@
 /target/
+/dist/
 
 # PAM unit-test binaries (built by pam/Makefile `make test`)
 /pam/test_fp_policy
