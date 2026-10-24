@@ -46,6 +46,8 @@ rm -f /etc/systemd/user/immurok-session-agent.service
 rm -f "$BIN_DIR/ble-notify-helper.py"
 rm -f "$BIN_DIR/immurok-gui"
 rm -f /usr/local/share/applications/com.immurok.Settings.desktop
+rm -f /usr/local/share/icons/hicolor/*/apps/com.immurok.Settings.png
+gtk-update-icon-cache -q -t -f /usr/local/share/icons/hicolor 2>/dev/null || true
 rm -f /usr/local/share/dbus-1/services/com.immurok.Settings.service
 systemctl daemon-reload 2>/dev/null
 

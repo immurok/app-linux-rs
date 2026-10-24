@@ -1,13 +1,34 @@
 //! Sidebar device card: the always-visible anchor for "what state is the
 //! device in". Fed from the Dashboard's 2 s poll; owns no I/O.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use immurok_client::status::DeviceStatus;
+use immurok_client::status::{ConnParams, DeviceStatus};
+
+// The firmware line is a button only so it can be clicked: strip the button
+// padding so it sits flush with the caption lines above it. The flat style's
+// hover background is the affordance.
+const SIDEBAR_CSS: &str = r#"
+button.sidebar-fw { padding: 0 4px; margin-left: -4px; min-height: 0; }
+"#;
+
+fn install_css_once() {
+    thread_local! { static DONE: Cell<bool> = const { Cell::new(false) }; }
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(SIDEBAR_CSS);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
 
 pub struct SidebarStatus {
     root: gtk::Widget,
@@ -18,10 +39,16 @@ pub struct SidebarStatus {
     battery_bar: gtk::LevelBar,
     battery_pct: gtk::Label,
     fw: gtk::Label,
+    /// The firmware line is a flat button: clicking it reads the live BLE
+    /// connection parameters from the device into `conn_popover`.
+    fw_button: gtk::Button,
+    conn_popover: gtk::Popover,
+    conn_body: gtk::Label,
 }
 
 impl SidebarStatus {
     pub fn new() -> Rc<Self> {
+        install_css_once();
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         root.set_margin_top(14);
         root.set_margin_bottom(10);
@@ -48,7 +75,7 @@ impl SidebarStatus {
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(14)
+            .max_width_chars(18)
             .build();
         state.add_css_class("caption");
         state.add_css_class("dim-label");
@@ -70,35 +97,126 @@ impl SidebarStatus {
             .build();
         fw.add_css_class("caption");
         fw.add_css_class("dim-label");
+        let fw_button = gtk::Button::builder()
+            .child(&fw)
+            .has_frame(false)
+            .halign(gtk::Align::Start)
+            .visible(false)
+            .tooltip_text("Show the Bluetooth connection parameters")
+            .build();
+        fw_button.add_css_class("flat");
+        fw_button.add_css_class("sidebar-fw");
+
+        let conn_body = gtk::Label::builder()
+            .xalign(0.0)
+            .use_markup(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(44)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+        let conn_popover = gtk::Popover::new();
+        conn_popover.set_position(gtk::PositionType::Bottom);
+        conn_popover.set_child(Some(&conn_body));
+        conn_popover.set_parent(&fw_button);
 
         col.append(&name);
         col.append(&state);
         col.append(&battery_box);
-        col.append(&fw);
+        col.append(&fw_button);
         root.append(&col);
 
-        Rc::new(Self { root: root.upcast(), icon, name, state, battery_box, battery_bar, battery_pct, fw })
+        let this = Rc::new(Self {
+            root: root.upcast(),
+            icon,
+            name,
+            state,
+            battery_box,
+            battery_bar,
+            battery_pct,
+            fw,
+            fw_button,
+            conn_popover,
+            conn_body,
+        });
+        let weak = Rc::downgrade(&this);
+        this.fw_button.connect_clicked(move |_| {
+            if let Some(t) = weak.upgrade() {
+                t.show_conn_params();
+            }
+        });
+        this
+    }
+
+    /// Pop the connection-parameter card and fill it from the device. Read
+    /// fresh on every click: these values change whenever either side
+    /// renegotiates, and "too short a supervision timeout" is exactly what
+    /// makes linking fail with 0xFF, so stale numbers would mislead.
+    fn show_conn_params(self: &Rc<Self>) {
+        self.conn_body.set_markup("Reading connection parameters from the device…");
+        self.conn_popover.popup();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let r = crate::pages::run_blocking(immurok_client::status::query_conn_params).await;
+            let Some(t) = weak.upgrade() else { return };
+            let text = match r {
+                Some(Ok(p)) => conn_params_markup(&p),
+                Some(Err(e)) => format!(
+                    "Could not read the connection parameters: {}",
+                    glib::markup_escape_text(&crate::errors::friendly(&e))
+                ),
+                None => "Could not read the connection parameters.".into(),
+            };
+            t.conn_body.set_markup(&text);
+        });
     }
 
     pub fn widget(&self) -> &gtk::Widget {
         &self.root
     }
 
+    /// Two lines, two layers (docs/setup-wizard-flow.md): the desktop's
+    /// Bluetooth connection and this computer's app-level link are
+    /// different things, and showing one word for both is what made people
+    /// think "Connected" meant "done".
     pub fn apply(&self, s: &DeviceStatus, paired: bool) {
         self.name.set_text(if s.name.is_empty() { "immurok" } else { &s.name });
-        let (text, icon, accent) = if s.device_unpaired {
-            ("No longer paired with this host", "bluetooth-disconnected-symbolic", false)
-        } else if s.connected {
-            ("Connected", "bluetooth-active-symbolic", true)
-        } else if paired {
-            ("Paired, not connected", "bluetooth-disconnected-symbolic", false)
+        let bluetooth = if s.connected {
+            "Bluetooth: connected"
+        } else if s.link_up {
+            "Bluetooth: connected, device starting up…"
         } else {
-            ("Not paired", "bluetooth-disabled-symbolic", false)
+            "Bluetooth: not connected"
         };
-        self.state.set_text(text);
-        self.state.set_tooltip_text(None);
+        let link = if s.device_unpaired {
+            "Link: no longer linked"
+        } else if paired {
+            "Link: linked"
+        } else if s.connected {
+            "Link: not linked"
+        } else {
+            "Link: shown once connected"
+        };
+        let icon = if s.connected {
+            "bluetooth-active-symbolic"
+        } else if paired {
+            "bluetooth-disconnected-symbolic"
+        } else {
+            "bluetooth-disabled-symbolic"
+        };
+        self.state.set_text(&format!("{bluetooth}\n{link}"));
+        self.state.set_tooltip_text(if s.device_unpaired {
+            Some("The device no longer knows this computer. Link it again from the Device page.")
+        } else if s.connected && !paired {
+            Some("Bluetooth only lets this computer see the device. Link it so the device can authenticate you.")
+        } else {
+            None
+        });
         self.icon.set_icon_name(Some(icon));
-        if accent {
+        if s.connected && paired && !s.device_unpaired {
             self.icon.add_css_class("accent");
         } else {
             self.icon.remove_css_class("accent");
@@ -108,8 +226,11 @@ impl SidebarStatus {
             self.battery_bar.set_value(f64::from(s.battery.min(100)) / 100.0);
             self.battery_pct.set_text(&format!("{}%", s.battery.min(100)));
             self.fw.set_text(&format!("Firmware {}", s.fw_version));
+            self.fw_button.set_visible(true);
         } else {
             self.fw.set_text("");
+            self.fw_button.set_visible(false);
+            self.conn_popover.popdown();
         }
     }
 
@@ -120,5 +241,47 @@ impl SidebarStatus {
         self.icon.remove_css_class("accent");
         self.battery_box.set_visible(false);
         self.fw.set_text("");
+        self.fw_button.set_visible(false);
+        self.conn_popover.popdown();
+    }
+}
+
+/// Popover text: the raw link-layer values with their units, plus the one
+/// derived fact the user needs — whether the device will run its key
+/// exchange on this link.
+pub fn conn_params_markup(p: &ConnParams) -> String {
+    let verdict = if p.ecc_ok() {
+        "Long enough for linking and SSH signing.".to_string()
+    } else {
+        format!(
+            "Too short for linking and SSH signing (the device needs at least {} ms and asks this computer \
+             for 6000 ms). If linking fails, disconnect and reconnect the device.",
+            ConnParams::ECC_MIN_TIMEOUT_MS
+        )
+    };
+    format!(
+        "<b>Bluetooth connection parameters</b>\n\
+         Connection interval: {:.2} ms\n\
+         Peripheral latency: {} intervals (up to {:.0} ms between packets)\n\
+         Supervision timeout: {} ms\n\n\
+         <small>{}</small>",
+        p.interval_ms(),
+        p.latency,
+        p.effective_interval_ms(),
+        p.timeout_ms(),
+        verdict
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markup_states_verdict() {
+        let short = conn_params_markup(&ConnParams { interval: 24, latency: 0, timeout: 42 });
+        assert!(short.contains("420 ms") && short.contains("Too short"));
+        let fine = conn_params_markup(&ConnParams { interval: 48, latency: 20, timeout: 600 });
+        assert!(fine.contains("6000 ms") && fine.contains("Long enough"));
     }
 }

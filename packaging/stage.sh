@@ -45,6 +45,12 @@ chmod 644 "$ROOT/usr/share/polkit-1/actions/com.immurok.pam-helper.policy"
 install -Dm644 "$SRC/packaging/com.immurok.Settings.desktop"           "$ROOT/usr/share/applications/com.immurok.Settings.desktop"
 install -Dm644 "$SRC/packaging/com.immurok.Settings.autostart.desktop" "$ROOT/etc/xdg/autostart/com.immurok.Settings.desktop"
 
+# 应用图标（与 macOS AppIcon 同源，packaging/icons 由 app-macos/Resources/AppIcon.iconset 缩放而来）
+for d in "$SRC"/packaging/icons/hicolor/*/apps; do
+    size="$(basename "$(dirname "$d")")"
+    install -Dm644 "$d/com.immurok.Settings.png" "$ROOT/usr/share/icons/hicolor/$size/apps/com.immurok.Settings.png"
+done
+
 # 文档
 install -Dm644 "$SRC/README.md"    "$ROOT/usr/share/doc/immurok/README.md"
 install -Dm644 "$SRC/CHANGELOG.md" "$ROOT/usr/share/doc/immurok/CHANGELOG.md"

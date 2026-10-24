@@ -117,12 +117,33 @@ pub struct Coordinator {
     pub device_reports_unpaired: AtomicBool,
 
     pub challenge_verified: AtomicBool,
+    /// GATT session up: helper READY, commands can be sent. What `STATUS`
+    /// reports as `connected`.
     pub is_connected: AtomicBool,
+    /// BlueZ shows the device connected with services resolved, but the
+    /// session (`is_connected`) is not up yet — helper starting, or a failed
+    /// attempt being retried. Lets UIs say "Bluetooth connected, device
+    /// starting up" instead of "not connected" for those seconds.
+    pub link_up: AtomicBool,
     pub screen_locked: AtomicBool,
     pub fp_bitmap_stale: AtomicBool,
 
     // Enrollment progress (status, current, total) — updated by BLE, read by socket
     pub last_enroll_event: RwLock<Option<(u8, u8, u8)>>,
+
+    /// Last connection-parameter update the device reported
+    /// (`[0xF0][interval][latency][timeout]`): (interval units of 1.25 ms,
+    /// slave latency, supervision timeout units of 10 ms). Only used to make
+    /// the "device aborted the key exchange" error say what the link looked
+    /// like, since that abort is almost always a too-short supervision timeout.
+    pub last_conn_params: RwLock<Option<(u16, u8, u16)>>,
+
+    /// Bluetooth address of the device the current (or last) BLE session
+    /// ran on, as BlueZ prints it (`AA:BB:...`). Set when a session starts.
+    /// Read by the own-slot clear path: the firmware reboots under a NEW
+    /// address after clearing our slot, so the BlueZ bond at this address
+    /// is dead and must be removed or the daemon keeps reconnecting to it.
+    pub session_device_addr: RwLock<Option<String>>,
 
     /// Pairing progress, polled by the CLI/TUI over PAIR:PROGRESS.
     pub pair_progress: RwLock<PairProgress>,
@@ -217,9 +238,12 @@ impl Coordinator {
             device_reports_unpaired: AtomicBool::new(false),
             challenge_verified: AtomicBool::new(false),
             is_connected: AtomicBool::new(false),
+            link_up: AtomicBool::new(false),
             screen_locked: AtomicBool::new(false),
             fp_bitmap_stale: AtomicBool::new(false),
             last_enroll_event: RwLock::new(None),
+            last_conn_params: RwLock::new(None),
+            session_device_addr: RwLock::new(None),
             pair_progress: RwLock::new(PairProgress::Idle),
             ble_cmd_tx,
             fp_match_tx,

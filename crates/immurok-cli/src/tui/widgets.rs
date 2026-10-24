@@ -82,7 +82,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(ERR).add_modifier(Modifier::BOLD),
         ));
     } else if !app.connected {
-        spans.push(Span::styled("○ Disconnected", Style::default().fg(ERR)));
+        if app.link_up {
+            spans.push(Span::styled("◌ Starting up", Style::default().fg(WARN)));
+        } else {
+            spans.push(Span::styled("○ Disconnected", Style::default().fg(ERR)));
+        }
         if app.paired {
             spans.push(Span::styled("  ·  paired", Style::default().fg(DIM)));
         } else {

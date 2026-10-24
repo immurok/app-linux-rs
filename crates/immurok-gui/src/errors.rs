@@ -30,7 +30,12 @@ fn map(s: &str) -> Option<&'static str> {
         r if r.contains("INVALID_SLOT") => "Invalid slot",
         r if r.contains("DUAL_HOST_UNSUPPORTED") => "This firmware does not support two hosts",
         r if r.contains("SLOT_CLEAR_REFUSED") => "The device refused to clear the slot",
-        r if r.contains("PAIRING_IN_PROGRESS") => "Pairing is already in progress",
+        r if r.contains("PAIRING_IN_PROGRESS") => "Linking is already in progress",
+        r if r.contains("factory reset before re-pair") => {
+            "The device still has enrolled fingerprints; factory-reset it before linking again"
+        }
+        r if r.contains("pair timeout") => "Timed out waiting for the device button.",
+        r if r.contains("pair cancelled") => "Linking cancelled on the device",
         _ => return None,
     })
 }

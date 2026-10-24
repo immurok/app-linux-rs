@@ -26,6 +26,15 @@ from dbus_fast import BusType
 from dbus_fast.aio import MessageBus
 
 
+# One GATT round-trip right after connect can sit behind BlueZ's own HID
+# setup / encryption on the same link for many seconds. Bound each call so a
+# wedged write never hangs the helper forever (the daemon reads a silent
+# helper as "not ready" and respawns, which only adds contention).
+GATT_CALL_TIMEOUT = 10.0
+# How often the helper re-reads Device1.Connected as a safety net.
+LINK_POLL_INTERVAL = 5.0
+
+
 async def start_notify_with_retry(iface, label, retries=5, delay=0.3):
     """Enable GATT notifications, tolerating transient ATT errors.
 
@@ -41,7 +50,7 @@ async def start_notify_with_retry(iface, label, retries=5, delay=0.3):
     """
     for attempt in range(1, retries + 1):
         try:
-            await iface.call_start_notify()
+            await asyncio.wait_for(iface.call_start_notify(), GATT_CALL_TIMEOUT)
             return True
         except Exception as e:
             sys.stderr.write(f"StartNotify {label} attempt {attempt}/{retries}: {e}\n")
@@ -112,15 +121,21 @@ async def main():
         except Exception:
             pass
 
-    # StartNotify on extra characteristics (HID etc.)
-    for path in extra_paths:
-        try:
-            intro = await bus.introspect("org.bluez", path)
-            obj = bus.get_proxy_object("org.bluez", path, intro)
-            iface = obj.get_interface("org.bluez.GattCharacteristic1")
-            await iface.call_start_notify()
-        except Exception:
-            pass
+    # StartNotify on extra characteristics (HID report, battery, ...). Nothing
+    # the daemon does depends on these, so they run AFTER READY in the
+    # background: right after a fresh connect each CCCD write can queue behind
+    # BlueZ's own HID setup for seconds, and doing four of them before READY
+    # was what pushed session start past the daemon's ready timeout (observed
+    # 19 s from "Bluetooth connected" to a usable session).
+    async def subscribe_extras():
+        for path in extra_paths:
+            try:
+                intro = await asyncio.wait_for(bus.introspect("org.bluez", path), GATT_CALL_TIMEOUT)
+                obj = bus.get_proxy_object("org.bluez", path, intro)
+                iface = obj.get_interface("org.bluez.GattCharacteristic1")
+                await asyncio.wait_for(iface.call_start_notify(), GATT_CALL_TIMEOUT)
+            except Exception:
+                pass
 
     # Monitor device disconnect
     dev_intro = await bus.introspect("org.bluez", device_path)
@@ -142,8 +157,76 @@ async def main():
 
     dev_props.on_properties_changed(on_dev_changed)
 
+    def mark_disconnected(why):
+        nonlocal disconnected
+        if disconnected:
+            return
+        disconnected = True
+        sys.stderr.write(f"link lost: {why}\n")
+        sys.stderr.flush()
+        sys.stdout.write("DISCONNECT\n")
+        sys.stdout.flush()
+
+    # The PropertiesChanged subscription above only sees transitions that
+    # happen AFTER it is in place. A device that dropped the link between the
+    # daemon's connect check and this point (seen: firmware tore the link
+    # down right after a slot clear while BlueZ still showed it connected)
+    # never flips Connected again, and the daemon would keep a dead session
+    # forever. Read the current value once.
+    try:
+        cur = await asyncio.wait_for(dev_props.call_get("org.bluez.Device1", "Connected"), GATT_CALL_TIMEOUT)
+        if hasattr(cur, "value"):
+            cur = cur.value
+        if not cur:
+            mark_disconnected("Connected=false at startup")
+    except Exception as e:
+        mark_disconnected(f"cannot read Connected: {e}")
+
+    # BlueZ removes the whole device object (RemoveDevice from the user's
+    # Bluetooth settings, or our own stale-bond cleanup) without a final
+    # Connected=false on it. Watch ObjectManager for the removal.
+    def on_interfaces_removed(path, interfaces):
+        if str(path) == device_path and "org.bluez.Device1" in interfaces:
+            mark_disconnected("device object removed")
+
+    try:
+        om_intro = await asyncio.wait_for(bus.introspect("org.bluez", "/"), GATT_CALL_TIMEOUT)
+        om_obj = bus.get_proxy_object("org.bluez", "/", om_intro)
+        om_iface = om_obj.get_interface("org.freedesktop.DBus.ObjectManager")
+        om_iface.on_interfaces_removed(on_interfaces_removed)
+    except Exception as e:
+        sys.stderr.write(f"ObjectManager watch unavailable: {e}\n")
+        sys.stderr.flush()
+
+    # Belt and braces: poll Connected every few seconds. Catches whatever
+    # slips past both signals (missed match, object gone without a signal).
+    async def poll_connected():
+        while not disconnected:
+            await asyncio.sleep(LINK_POLL_INTERVAL)
+            if disconnected:
+                return
+            try:
+                cur = await asyncio.wait_for(dev_props.call_get("org.bluez.Device1", "Connected"), GATT_CALL_TIMEOUT)
+                if hasattr(cur, "value"):
+                    cur = cur.value
+                if not cur:
+                    mark_disconnected("Connected=false (poll)")
+            except Exception as e:
+                mark_disconnected(f"poll failed: {e}")
+
+    if disconnected:
+        # Say READY anyway so the daemon's protocol stays in order; the
+        # DISCONNECT already queued ends the session right after.
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
+        bus.disconnect()
+        return
+
     sys.stdout.write("READY\n")
     sys.stdout.flush()
+
+    extras_task = asyncio.ensure_future(subscribe_extras())
+    poll_task = asyncio.ensure_future(poll_connected())
 
     # Process commands from stdin
     loop = asyncio.get_event_loop()
@@ -199,6 +282,8 @@ async def main():
             sys.stdout.write(f"WRITE_ERR:{e}\n")
             sys.stdout.flush()
 
+    extras_task.cancel()
+    poll_task.cancel()
     bus.disconnect()
 
 

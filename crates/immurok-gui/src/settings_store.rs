@@ -60,6 +60,9 @@ pub struct GuiSettings {
     /// Slot → display name for authentication slots 0–4. Slot 5 (the
     /// host-switch finger) has a fixed name and is never stored.
     pub fingerprint_names: BTreeMap<u8, String>,
+    /// The setup wizard was finished or dismissed with "Later". Until then
+    /// the main window opens the wizard on every launch.
+    pub setup_completed: bool,
 }
 
 impl Default for GuiSettings {
@@ -69,6 +72,7 @@ impl Default for GuiSettings {
             portal_restore_token: None,
             x11_hotkey: "ctrl+backslash".into(),
             fingerprint_names: BTreeMap::new(),
+            setup_completed: false,
         }
     }
 }

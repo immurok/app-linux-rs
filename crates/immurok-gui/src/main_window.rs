@@ -3,11 +3,14 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::gio;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::pages;
+use crate::settings_store;
+use crate::setup_wizard;
 
 pub struct MainWindow;
 
@@ -63,6 +66,16 @@ impl MainWindow {
             .set_icon_name(Some("utilities-terminal-symbolic"));
 
         let header = adw::HeaderBar::new();
+        // Header menu: the wizard is reachable again after "Later".
+        let menu = gio::Menu::new();
+        menu.append(Some("Setup Wizard…"), Some("app.setup"));
+        menu.append(Some("Quit"), Some("app.quit"));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&menu)
+            .tooltip_text("Menu")
+            .build();
+        header.pack_end(&menu_button);
 
         let nav_list = build_sidebar(&stack);
         let status = crate::sidebar::SidebarStatus::new();
@@ -129,6 +142,27 @@ impl MainWindow {
         unsafe { window.set_data("logs-page", logs) };
 
         window.present();
+
+        // A wizard opened before this window existed (`immurok-gui --setup`,
+        // or the header menu from a quick-fill-only session) would otherwise
+        // end up underneath it: make it transient for the new window and
+        // bring it back up.
+        if let Some(setup) = app.windows().into_iter().find(|w| w.widget_name() == "setup") {
+            setup.set_transient_for(Some(&window));
+            setup.present();
+        }
+
+        // First run: the wizard opens on top of the settings window until
+        // it is finished or dismissed with "Later" (docs/setup-wizard-flow.md
+        // "窗口行为"). The flag read is a file read, so it stays off the
+        // main thread.
+        let app = app.clone();
+        glib::spawn_future_local(async move {
+            let completed = pages::run_blocking(|| settings_store::load().setup_completed).await.unwrap_or(true);
+            if !completed {
+                setup_wizard::SetupWizard::open(&app);
+            }
+        });
     }
 }
 

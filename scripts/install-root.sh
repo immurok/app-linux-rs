@@ -62,6 +62,11 @@ if [ -x target/release/immurok-gui ]; then
     sed "s|/usr/bin/|$BIN_DIR/|" packaging/com.immurok.Settings.service \
         > /usr/local/share/dbus-1/services/com.immurok.Settings.service
     chmod 644 /usr/local/share/dbus-1/services/com.immurok.Settings.service
+    for d in packaging/icons/hicolor/*/apps; do
+        size="$(basename "$(dirname "$d")")"
+        install -Dm644 "$d/com.immurok.Settings.png" "/usr/local/share/icons/hicolor/$size/apps/com.immurok.Settings.png"
+    done
+    gtk-update-icon-cache -q -t -f /usr/local/share/icons/hicolor 2>/dev/null || true
     update-desktop-database /usr/local/share/applications 2>/dev/null || true
 fi
 

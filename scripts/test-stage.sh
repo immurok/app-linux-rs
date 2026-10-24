@@ -25,6 +25,7 @@ for f in usr/bin/immurok-daemon usr/bin/immurok-cli usr/bin/imk usr/bin/immurok-
          usr/share/dbus-1/system.d/immurok.conf usr/share/dbus-1/services/com.immurok.Settings.service \
          usr/share/polkit-1/rules.d/49-immurok.rules usr/share/polkit-1/actions/com.immurok.pam-helper.policy \
          usr/share/applications/com.immurok.Settings.desktop etc/xdg/autostart/com.immurok.Settings.desktop \
+         usr/share/icons/hicolor/48x48/apps/com.immurok.Settings.png usr/share/icons/hicolor/512x512/apps/com.immurok.Settings.png \
          usr/share/doc/immurok/README.md usr/share/doc/immurok/CHANGELOG.md; do
     [ -f "$R/$f" ] && r=ok || r=missing
     check "$r" ok "file $f"

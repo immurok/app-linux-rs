@@ -3,10 +3,34 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
-## Unreleased
+## 0.9.1 — 2026-10-24
 
 ### Added
 
+- gui: first-run setup wizard (Welcome → Install check → Bluetooth → Link →
+  Fingerprint → Done) ported from the macOS flow (`docs/setup-wizard-flow.md`
+  upstream): live completion checks, auto-advance, skippable fingerprint
+  step, "Later" to dismiss. Opens on first launch, from the header menu, or
+  with `immurok-gui --setup`; unlinking from the Device page brings it back
+  on the next launch.
+- gui: link guide dialog with a device illustration — bottom face with a
+  halo on the button, top face with a finger for the second-host step —
+  driven by `PAIR:PROGRESS`; shared by the wizard and the Device page.
+  Timeout text explains the second-host finger step and the factory-reset
+  escape for second-hand devices.
+  When linking fails, the guide closes and an error dialog explains the
+  failure together with the Bluetooth connection parameters read from the
+  device right then (`GET:CONN_PARAMS`); a supervision timeout under 3000 ms
+  is called out as the cause with the advice to disconnect and reconnect the
+  device in Bluetooth settings so the parameters are renegotiated.
+- gui: app icon — the macOS AppIcon artwork, installed into hicolor
+  (16–512 px) by the package and `make install`, used by the desktop entry,
+  window icon and the wizard sidebar.
+- gui: clicking the firmware line in the sidebar device card reads the live
+  Bluetooth connection parameters from the device (interval, peripheral
+  latency, supervision timeout) and says whether the link is long enough for
+  linking and SSH signing. New daemon request `GET:CONN_PARAMS`
+  (device command `GET_CONN_PARAMS` 0x03, firmware 1.8+).
 - gui: sidebar navigation; Features moved to its own page; bundled fingerprint icon
 - gui: sidebar device card, consistent icons, Firmware folded into Device, actionable empty states, header-placed actions
 - gui(keys): add SSH (generate/import), OTP (single + file import), API entries; capacity and empty states; inline OTP code with Copy
@@ -25,8 +49,66 @@ module) are documented here. Versions follow the workspace crate version.
   the other); unit files reference `/usr/bin` and are rewritten for
   `/usr/local` at install time.
 
+### Changed
+
+- gui: terminology split — the desktop's Bluetooth step is "connect", the
+  app-level key exchange is "Link / Unlink" (was "Pair / Unpair / Unbind");
+  the sidebar device card shows both layers on two lines. Wire commands and
+  `immurok-cli pair` are unchanged.
+
 ### Fixed
 
+- daemon: right after linking, the Two Hosts card said it could not tell
+  which slot is this computer's until the device reconnected. `SLOT:STATUS`
+  only claims a slot after a real challenge-response, which ran at session
+  start only; the daemon now runs one challenge immediately after a
+  successful ECDH link, so the card updates on the next poll.
+- daemon: after "Unlink" (own-slot `SLOT:CLEAR`) the daemon got stuck in a
+  dead BLE session that it reported as connected for good: `status` said
+  Connected with no device name, firmware or battery, every request failed,
+  and the device's new identity was never picked up. The firmware erases its
+  bond, drops the link and reboots under a new address after clearing our
+  slot; the daemon re-dialled the stale BlueZ bond, BlueZ showed it connected
+  while rejecting every ATT request, the session started anyway, and the
+  helper never saw a disconnect because the Connected=false transition
+  happened before it subscribed and the device object was later removed
+  without one. Four fixes: the helper reads `Connected` once at startup,
+  watches `InterfacesRemoved` for its device and polls `Connected` every 5 s;
+  a GATT write failing with "Not connected" / object-gone ends the session
+  immediately; a device whose GATT services do not resolve within 5 s is no
+  longer used for a session; and a confirmed own-slot clear removes the old
+  BlueZ bond (`RemoveDevice`) so nothing keeps connecting to it.
+- daemon: a Bluetooth connect took up to ~20 s to turn into a usable session.
+  The notify helper subscribed to HID / battery characteristics before saying
+  READY, each CCCD write queueing behind BlueZ's own HID setup on the fresh
+  link; the daemon gave up after 5 s and respawned, and the orphaned helper
+  kept competing for the link (19 s and three attempts seen in the log). READY
+  now follows the RSP subscription alone, the extra subscriptions run in the
+  background with timeouts, the ready timeout is 20 s and a late helper is
+  killed before the retry.
+- daemon/gui: a `[0x30][0xFF]` / `[0x31][0xFF]` reply during linking (the
+  device aborted the ECDH step — supervision timeout too short, or key
+  generation failed) was reported as `PAIR_INIT bad response: 30ff`. It now
+  says what happened, includes the last connection parameters the device
+  reported, and the link guide tells the user to reconnect the device and link
+  again (on Linux the kernel queues accepted connection-parameter updates on
+  its cmd_sync worker; in the observed failure the update never landed on
+  that connection, while a fresh connection linked at once). The daemon
+  also re-arms its pairing deadline for 30 s once the button is pressed, so
+  a slow parameter grant plus the ECC step never runs out the button window.
+- gui: the setup wizard is transient for the settings window, so clicking the
+  settings window no longer hides the wizard behind it; a wizard opened first
+  (`immurok-gui --setup`) is re-parented when the settings window appears.
+- status: `STATUS` gained a seventh field, `link_up` — BlueZ link connected but
+  session not ready. The wizard's Bluetooth step, the GUI sidebar, `immurok-cli
+  status` and the TUI header say "starting up" for those seconds instead of
+  "not connected".
+- gui: a resident instance (`--gapplication-service`) started before `make install`
+  kept serving every later launch with the old binary — the setup wizard did not
+  come back after Unlink, fixes looked unapplied. `make install` / `make uninstall`
+  and the package post-install now stop it (`scripts/retire-gui.sh`, new `retire`
+  action), and `immurok-gui` itself asks a resident instance running a replaced
+  binary to exit before forwarding to it.
 - **`imk run --agent` commands longer than ~500 bytes were reported as
   "rejected by user".** The daemon read a request into a 512-byte buffer;
   the tail stayed in the socket, where the approval handler's disconnect

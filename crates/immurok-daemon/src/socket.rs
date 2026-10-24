@@ -186,7 +186,7 @@ fn tier_of(line: &str) -> Tier {
         return Tier::Auth;
     }
     match line {
-        "STATUS" | "GET:INFO" | "GET:SETTINGS" | "PAIR:STATUS" => Tier::Public,
+        "STATUS" | "GET:INFO" | "GET:SETTINGS" | "GET:CONN_PARAMS" | "PAIR:STATUS" => Tier::Public,
         _ => Tier::Manage,
     }
 }
@@ -538,6 +538,7 @@ async fn dispatch_request(
         Request::SetSshTakeover(v) => handle_set_setting(coord, "ssh_takeover", v).await,
         Request::GetSettings => handle_get_settings(coord).await,
         Request::GetInfo => handle_get_info(coord).await,
+        Request::GetConnParams => handle_get_conn_params(coord).await,
         // OTA commands handled in session wrapper, but in case of stray ones:
         Request::OtaStart { .. } | Request::OtaData(_) | Request::OtaFinish => {
             Response::Error("OTA commands require OTA session".into())
@@ -566,6 +567,7 @@ async fn handle_status(coord: &Arc<Coordinator>) -> Response {
         battery,
         version,
         device_unpaired: coord.device_reports_unpaired.load(Ordering::Relaxed),
+        link_up: coord.link_up.load(Ordering::Relaxed),
     }
 }
 
@@ -1059,6 +1061,25 @@ async fn handle_pair_progress(coord: &Arc<Coordinator>) -> Response {
     Response::Ok(coord.pair_progress().await.as_wire().to_string())
 }
 
+/// After the device confirmed clearing our slot it erases its bond, drops
+/// the link and reboots under a new Bluetooth address (firmware "CLR own"
+/// path). The BlueZ entry for the old address is therefore dead: the daemon
+/// would keep auto-connecting to it, the device would accept the link and
+/// then refuse every ATT request, and nothing would ever connect to the
+/// device's new identity. Remove it now. Best effort: a failure is logged
+/// and the user can still forget the device in Bluetooth settings.
+async fn forget_session_bond(coord: &Arc<Coordinator>) {
+    let addr = coord.session_device_addr.read().await.clone();
+    match addr {
+        Some(a) => {
+            if let Err(e) = crate::ble::forget_bond(&a).await {
+                warn!("Could not remove stale BlueZ bond {}: {}", a, e);
+            }
+        }
+        None => warn!("Own slot cleared but the session's device address is unknown; BlueZ bond left in place"),
+    }
+}
+
 /// Drop this host's pairing material. Idempotent.
 async fn clear_local_pairing(coord: &Arc<Coordinator>) {
     let _ = immurok_common::security::clear_pairing();
@@ -1143,6 +1164,7 @@ async fn clear_own_slot(coord: &Arc<Coordinator>, target: Option<u8>) -> Respons
         Ok((first, rest)) => match dual_host::classify_slot_clear_ack(first, &rest) {
             SlotClearAck::Cleared => {
                 clear_local_pairing(coord).await;
+                forget_session_bond(coord).await;
                 Response::Ok("CLEARED".into())
             }
             SlotClearAck::SlotUnpaired => {
@@ -1751,6 +1773,28 @@ async fn handle_get_info(coord: &Arc<Coordinator>) -> Response {
         immurok_common::paths::pam_socket().display(),
     );
     Response::Ok(msg)
+}
+
+/// `GET:CONN_PARAMS` → `OK:interval:latency:timeout` straight from the device
+/// (`CMD_GET_CONN_PARAMS`, firmware 1.8+). The device tracks the link-layer
+/// values the central actually applied, which is what decides whether the
+/// ECC long ops can run; the host has no unprivileged way to read them.
+async fn handle_get_conn_params(coord: &Arc<Coordinator>) -> Response {
+    if !coord.is_connected.load(Ordering::Relaxed) {
+        return Response::Error("NOT_CONNECTED".into());
+    }
+    match coord.ble_send(protocol::CMD_GET_CONN_PARAMS, vec![]).await {
+        // [0x03][0x00][interval:2 BE][latency:2 BE][timeout:2 BE]
+        Ok((first, rest)) if first == protocol::CMD_GET_CONN_PARAMS && rest.len() >= 7 && rest[0] == protocol::RSP_OK => {
+            let be = |i: usize| ((rest[i] as u16) << 8) | rest[i + 1] as u16;
+            let (interval, latency, timeout) = (be(1), be(3), be(5));
+            *coord.last_conn_params.write().await = Some((interval, latency.min(255) as u8, timeout));
+            Response::Ok(format!("{interval}:{latency}:{timeout}"))
+        }
+        // Older firmware answers an unknown command with a bare 0xFF.
+        Ok((first, rest)) => Response::Error(format!("CONN_PARAMS_UNSUPPORTED:{:02x}{}", first, hex::encode(&rest))),
+        Err(e) => Response::Error(format!("CONN_PARAMS_FAILED:{e}")),
+    }
 }
 
 // Map a write-path BLE status byte to a user-facing error string. Recognises

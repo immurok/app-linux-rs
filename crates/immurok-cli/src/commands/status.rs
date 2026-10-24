@@ -20,6 +20,8 @@ pub fn run() {
     let parts: Vec<&str> = status_rsp.split(':').collect();
     if parts.first() == Some(&"STATUS") && parts.len() >= 5 {
         let connected = parts[1] == "1";
+        // 第 7 段：蓝牙链路已连上但会话未就绪（老 daemon 没有这段）。
+        let link_up = parts.get(6) == Some(&"1");
         let name = parts[2];
         let battery = parts[3];
         let version = parts[4];
@@ -29,6 +31,8 @@ pub fn run() {
             "Status:     {}",
             if connected {
                 "\x1b[32mConnected\x1b[0m"
+            } else if link_up {
+                "\x1b[33mStarting up\x1b[0m (Bluetooth connected, session not ready yet)"
             } else {
                 "\x1b[31mDisconnected\x1b[0m"
             }

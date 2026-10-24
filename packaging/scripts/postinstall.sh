@@ -27,6 +27,11 @@ main() {
             run systemctl --user --machine="$u@" restart immurok-session-agent.service
         done
     fi
+    # 常驻的 immurok-gui（--gapplication-service）跑的还是旧二进制，GApplication
+    # 会把之后每次启动都转发给它。结束掉，下次启动由 D-Bus 拉起新版本。
+    if pgrep -f 'immurok-gui --gapplication-service' >/dev/null 2>&1; then
+        run pkill -f 'immurok-gui --gapplication-service'
+    fi
 
     cat <<'EOF'
 immurok installed.

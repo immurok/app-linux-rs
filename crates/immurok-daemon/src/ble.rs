@@ -48,6 +48,10 @@ pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCo
         coordinator.is_device_verified.store(false, Ordering::Relaxed);
         coordinator.challenge_verified.store(false, Ordering::Relaxed);
         *coordinator.device_status.write().await = None;
+        // The BlueZ link usually survives a failed session start (helper not
+        // READY in time → retry below), so keep reporting it as up instead
+        // of flashing "not connected" at the UI for the backoff second.
+        coordinator.link_up.store(check_immurok_connected().await, Ordering::Relaxed);
 
         // Backoff before retrying. A GATT discovery failure (transient BlueZ
         // state where Connected=true but the GATT tree hasn't repopulated yet)
@@ -101,6 +105,9 @@ struct BleState {
     /// passed the fingerprint half and moved on to the button. Read by
     /// wait_pair_button to extend its window.
     pair_button_fp_ok: bool,
+    /// [0x34, 0x01] seen: the user pressed the button, the device is in the
+    /// parameter-wait + ECDH phase. `wait_pair_button` re-arms its deadline.
+    pair_button_confirmed: bool,
 }
 
 impl BleState {
@@ -116,6 +123,7 @@ impl BleState {
             pair_button_pending: false,
             pair_button_tx: None,
             pair_button_fp_ok: false,
+            pair_button_confirmed: false,
         }
     }
 }
@@ -130,6 +138,24 @@ struct HelperIO {
     stdin: tokio::process::ChildStdin,
     /// Channel for command responses (WRITE_OK, WRITE_ERR, READ_OK, READ_ERR).
     response_rx: mpsc::Receiver<String>,
+    /// Set (with the error text) the first time a GATT write fails in a way
+    /// that means the link itself is gone, not just this command. The
+    /// session loop ends the session on it. Without this a device that
+    /// vanished without a Connected=false signal left the daemon "connected"
+    /// forever, every write failing, no reconnect ever attempted.
+    link_lost: Option<String>,
+}
+
+/// BlueZ error texts that mean the device is no longer reachable on this
+/// D-Bus path: the link dropped (`Not connected`), or the device object was
+/// removed altogether so the characteristic no longer exists. An ATT-level
+/// error on a live link is NOT one of these.
+fn is_link_lost_error(msg: &str) -> bool {
+    msg.contains("Not connected")
+        || msg.contains("doesn't exist")
+        || msg.contains("UnknownObject")
+        || msg.contains("UnknownMethod")
+        || msg.contains("Object does not exist")
 }
 
 impl HelperIO {
@@ -181,6 +207,10 @@ impl HelperIO {
                 if line == "WRITE_OK" {
                     Ok(())
                 } else if let Some(err) = line.strip_prefix("WRITE_ERR:") {
+                    if is_link_lost_error(err) && self.link_lost.is_none() {
+                        warn!("GATT write says the link is gone: {}", err);
+                        self.link_lost = Some(err.to_string());
+                    }
                     Err(format!("write failed: {}", err))
                 } else {
                     Err(format!("unexpected response: {}", line))
@@ -412,6 +442,26 @@ pub async fn cancel_pending_connect() {
     }
 }
 
+/// Remove a BlueZ device (and its bond) by address. Used after the device
+/// confirmed clearing OUR slot: the firmware erases its side of the bond,
+/// drops the link and reboots under a new address, so this entry can never
+/// connect again — yet `try_active_connect` would keep dialling it, BlueZ
+/// would report Connected=true for a link the device rejects at ATT level,
+/// and the user would have to find and forget it by hand.
+pub async fn forget_bond(addr: &str) -> Result<(), String> {
+    let parsed: bluer::Address = addr.parse().map_err(|e| format!("bad address {}: {}", addr, e))?;
+    let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
+    let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
+    match tokio::time::timeout(Duration::from_secs(5), adapter.remove_device(parsed)).await {
+        Ok(Ok(())) => {
+            info!("Removed stale BlueZ bond {}", addr);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("RemoveDevice timed out".into()),
+    }
+}
+
 /// Check if any immurok device is connected with services resolved (HID keyboard ready).
 async fn check_immurok_connected() -> bool {
     let Ok(session) = bluer::Session::new().await else { return false };
@@ -432,7 +482,7 @@ async fn check_immurok_connected() -> bool {
 
 /// Find a connected immurok device and return its D-Bus device path.
 /// Also waits for GATT services to be resolved (instead of fixed sleep).
-async fn find_immurok_device_path() -> Result<Option<String>, BoxError> {
+async fn find_immurok_device_path() -> Result<Option<(String, String)>, BoxError> {
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     let adapter_name = adapter.name().to_string();
@@ -446,8 +496,10 @@ async fn find_immurok_device_path() -> Result<Option<String>, BoxError> {
         if !name_match { continue; }
 
         // Wait for GATT services to be resolved (up to 5s)
+        let mut resolved = false;
         for _ in 0..50 {
             if device.is_services_resolved().await.unwrap_or(false) {
+                resolved = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -455,11 +507,21 @@ async fn find_immurok_device_path() -> Result<Option<String>, BoxError> {
 
         let dev_addr = addr.to_string().replace(':', "_");
         let device_path = format!("/org/bluez/{}/dev_{}", adapter_name, dev_addr);
-        info!("Found immurok device: {} ({}) path={} services_resolved={}",
-              device.name().await.ok().flatten().unwrap_or_default(),
-              addr, device_path,
-              device.is_services_resolved().await.unwrap_or(false));
-        return Ok(Some(device_path));
+        let name = device.name().await.ok().flatten().unwrap_or_default();
+        // Not resolved after the wait: BlueZ has Connected=true but its own
+        // GATT reads are failing (seen as ATT 0x0e on a bond the device had
+        // just erased). The characteristic paths we would use come from the
+        // cache, the first write fails, and the session is dead on arrival.
+        // Refuse and let the reconnect loop try again.
+        if !resolved {
+            return Err(format!(
+                "{} ({}) is connected but its GATT services did not resolve within 5s",
+                name, addr
+            )
+            .into());
+        }
+        info!("Found immurok device: {} ({}) path={} services_resolved=true", name, addr, device_path);
+        return Ok(Some((device_path, addr.to_string())));
     }
     Ok(None)
 }
@@ -548,10 +610,15 @@ async fn connect_and_serve(
     coordinator: &Arc<Coordinator>,
     cmd_rx: &mut mpsc::Receiver<BleCommand>,
 ) -> Result<(), BoxError> {
-    let device_path = match find_immurok_device_path().await? {
+    let (device_path, device_addr) = match find_immurok_device_path().await? {
         Some(p) => p,
-        None => return Err("no device".into()),
+        None => {
+            coordinator.link_up.store(false, Ordering::Relaxed);
+            return Err("no device".into());
+        }
     };
+    coordinator.link_up.store(true, Ordering::Relaxed);
+    *coordinator.session_device_addr.write().await = Some(device_addr);
 
     // One-time D-Bus connection for GATT path discovery via ObjectManager
     let dbus_discovery = zbus::Connection::system().await?;
@@ -657,21 +724,27 @@ async fn connect_and_serve(
             }
 
             info!("BLE helper reader exited");
-            let _ = child.wait().await;
         });
     }
 
     let mut helper = HelperIO {
         stdin: child_stdin,
         response_rx,
+        link_lost: None,
     };
 
     // 等 helper 就绪再往下走。等不到就结束会话，让外层重连 —— 总比对着一个
     // 还没接上 D-Bus 的 helper 空写一通、然后自称已验证要好。
-    match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
+    match tokio::time::timeout(Duration::from_secs(BLE_HELPER_READY_TIMEOUT_SECS), ready_rx).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => return Err("BLE helper exited before READY".into()),
-        Err(_) => return Err("BLE helper did not report READY within 5s".into()),
+        Err(_) => {
+            // Kill it: left alone it keeps queuing CCCD writes on the link and
+            // competes with the helper the retry is about to spawn (two READY
+            // lines at the same instant in the log were exactly that).
+            let _ = child.start_kill();
+            return Err(format!("BLE helper did not report READY within {}s", BLE_HELPER_READY_TIMEOUT_SECS).into());
+        }
     }
 
     coordinator.is_connected.store(true, Ordering::Relaxed);
@@ -835,6 +908,11 @@ async fn connect_and_serve(
         }
     }
 
+    if let Some(why) = helper.link_lost.take() {
+        helper.quit().await;
+        return Err(format!("BLE link lost during session start: {}", why).into());
+    }
+
     // Sync key cache after verification
     if coordinator.is_device_verified.load(Ordering::Relaxed) {
         if let Err(e) = sync_ssh_keys(&mut helper, &mut state, coordinator, &mut notify_rx).await {
@@ -844,6 +922,15 @@ async fn connect_and_serve(
 
     // Main serve loop
     loop {
+        // A write inside the previous iteration found the link gone. End
+        // the session here rather than waiting for a DISCONNECT that may
+        // never come (the device object can disappear without one).
+        if let Some(why) = helper.link_lost.take() {
+            info!("Ending session: {}", why);
+            abort_pending(&mut state);
+            helper.quit().await;
+            return Err(format!("BLE link lost: {}", why).into());
+        }
         tokio::select! {
             Some(data) = notify_rx.recv() => {
                 route_notification(&data, &mut state, coordinator, &mut helper).await;
@@ -942,6 +1029,7 @@ async fn route_notification(
         let tout = ((data[4] as u16) << 8) | data[5] as u16;
         info!("Conn params: interval={} ({:.1}ms) latency={} timeout={} ({}ms)",
               interval, interval as f64 * 1.25, latency, tout, tout as u32 * 10);
+        *coordinator.last_conn_params.write().await = Some((interval, latency, tout));
         return;
     }
 
@@ -971,6 +1059,7 @@ async fn route_notification(
                 // The device is running ECDH now; completion still arrives
                 // separately as [0x30][pubkey:33] via pending_response.
                 if state.pair_button_pending {
+                    state.pair_button_confirmed = true;
                     coordinator.set_pair_progress(PairProgress::Ecdh).await;
                 } else {
                     info!("Pair button confirm with no pairing in flight — ignored");
@@ -1634,6 +1723,16 @@ async fn do_pair(
             return Err("PAIR_INIT: conn param update incomplete".into());
         }
 
+        // [0x30][0xFF]: the device gave up on the ECDH long op. Firmware
+        // sends this when, 5 s after the button press, the link's supervision
+        // timeout is still too short to survive the ~2 s computation (it
+        // deliberately uses this shape instead of a bare 0xE1, which the
+        // button-wait stage would drop), and when key generation itself
+        // fails. Either way the fix is the same: a fresh connection.
+        if rsp.len() == 2 && rsp[0] == CMD_PAIR_INIT && rsp[1] == RSP_ERROR {
+            return Err(ecdh_abort_error("PAIR_INIT", coordinator).await);
+        }
+
         // Validate: [0x30][pubkey:33B]
         if rsp.len() < 1 + COMPRESSED_PUBKEY_LEN || rsp[0] != CMD_PAIR_INIT {
             return Err(format!("PAIR_INIT bad response: {}", hex::encode(&rsp)));
@@ -1646,6 +1745,9 @@ async fn do_pair(
 
         // PAIR_CONFIRM
         let crsp = send_command_inner(helper, state, coordinator, notify_rx, CMD_PAIR_CONFIRM, &app_pubkey, 30).await?;
+        if crsp.len() == 2 && crsp[0] == CMD_PAIR_CONFIRM && crsp[1] == RSP_ERROR {
+            return Err(ecdh_abort_error("PAIR_CONFIRM", coordinator).await);
+        }
         if crsp.len() < 2 || crsp[0] != CMD_PAIR_CONFIRM || crsp[1] != RSP_OK {
             return Err(format!("PAIR_CONFIRM failed: {}", hex::encode(&crsp)));
         }
@@ -1677,8 +1779,58 @@ async fn do_pair(
         coordinator.is_device_verified.store(true, Ordering::Relaxed);
 
         info!("ECDH pairing successful");
+
+        // Prove the new key right away. `challenge_verified` is what makes
+        // SLOT:STATUS say which slot is ours; it is only ever set by a real
+        // challenge, which until now ran at session start only. A freshly
+        // linked host therefore sat on "cannot tell which slot is yours" in
+        // the Two Hosts card until the next reconnect. One challenge here
+        // closes that gap; if the device does not answer (it may still be
+        // settling after the ECC step) the next session start verifies as
+        // before.
+        let mut nonce = [0u8; 8];
+        {
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut nonce);
+        }
+        match send_command_inner(helper, state, coordinator, notify_rx, CMD_CHALLENGE, &nonce, BLE_COMMAND_TIMEOUT_SECS).await {
+            Ok(rsp) if rsp.len() >= 9 && rsp[0] == CMD_CHALLENGE => {
+                let mut device_hmac = [0u8; 8];
+                device_hmac.copy_from_slice(&rsp[1..9]);
+                if security::verify_challenge_response(&shared_key, &nonce, &device_hmac) {
+                    info!("Post-pair challenge verified — this slot is ours");
+                    coordinator.challenge_verified.store(true, Ordering::Relaxed);
+                } else {
+                    warn!("Post-pair challenge: HMAC mismatch; slot ownership stays unknown until reconnect");
+                }
+            }
+            Ok(rsp) => warn!("Post-pair challenge: unexpected reply {}; verifying on next reconnect", hex::encode(&rsp)),
+            Err(e) => warn!("Post-pair challenge failed: {}; verifying on next reconnect", e),
+        }
+
         return Ok((RSP_OK, vec![RSP_OK]));
     }
+}
+
+/// Error text for `[0x30|0x31][0xFF]`. Names the stage and the last link
+/// parameters the device reported, so a log line or the GUI dialog shows
+/// whether the supervision timeout was the problem (firmware needs it well
+/// above 1 s for the ECC step; it asks the central for 6 s).
+async fn ecdh_abort_error(stage: &str, coordinator: &Arc<Coordinator>) -> String {
+    let link = match *coordinator.last_conn_params.read().await {
+        Some((interval, latency, tout)) => format!(
+            "last link params: interval {:.1} ms, latency {}, supervision timeout {} ms",
+            interval as f64 * 1.25,
+            latency,
+            tout as u32 * 10
+        ),
+        None => "link parameters unknown".to_string(),
+    };
+    format!(
+        "{stage}: device aborted the key exchange (0xFF) — this computer had not applied the longer \
+         supervision timeout the device asked for in time ({link}); disconnect and reconnect the device \
+         in Bluetooth settings, then link again"
+    )
 }
 
 /// PAIR_INIT was accepted with WAIT_BUTTON. Wait for one of:
@@ -1699,6 +1851,7 @@ async fn wait_pair_button(
     state.pair_button_pending = true;
     state.pair_button_tx = Some(btn_tx);
     state.pair_button_fp_ok = false;
+    state.pair_button_confirmed = false;
     state.pending_response.take();
     state.pending_response = Some(cmd_tx);
 
@@ -1711,6 +1864,7 @@ async fn wait_pair_button(
     let mut deadline =
         tokio::time::Instant::now() + Duration::from_secs(BLE_PAIR_BUTTON_TIMEOUT_SECS);
     let mut extended = false;
+    let mut ecdh_window = false;
     let result = loop {
         tokio::select! {
             r = &mut cmd_rx => {
@@ -1739,6 +1893,16 @@ async fn wait_pair_button(
                         + Duration::from_secs(BLE_PAIR_BUTTON_TIMEOUT_SECS);
                     info!("Pair button window extended: fingerprint gate passed");
                 }
+                // Button pressed: the device may now wait several seconds for
+                // the host to apply its connection-parameter request before
+                // the ~2 s ECC, so the remaining button window is the wrong
+                // budget. Once only, same reasoning as above.
+                if state.pair_button_confirmed && !ecdh_window {
+                    ecdh_window = true;
+                    deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(BLE_PAIR_ECDH_WAIT_SECS);
+                    info!("Pair window re-armed for ECDH ({}s)", BLE_PAIR_ECDH_WAIT_SECS);
+                }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 break Err("pair timeout: no button event".to_string());
@@ -1749,6 +1913,7 @@ async fn wait_pair_button(
     state.pair_button_pending = false;
     state.pair_button_tx.take();
     state.pair_button_fp_ok = false;
+    state.pair_button_confirmed = false;
     result
 }
 
@@ -1982,4 +2147,25 @@ fn find_helper_script() -> String {
     }
     // Fallback: assume in PATH or current dir
     "ble-notify-helper.py".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_link_lost_error;
+
+    #[test]
+    fn link_lost_errors_are_recognised() {
+        assert!(is_link_lost_error("Not connected"));
+        assert!(is_link_lost_error(
+            "Method \"WriteValue\" with signature \"aya{sv}\" on interface \"org.bluez.GattCharacteristic1\" doesn't exist"
+        ));
+        assert!(is_link_lost_error("org.freedesktop.DBus.Error.UnknownObject: ..."));
+    }
+
+    #[test]
+    fn att_errors_on_a_live_link_are_not_link_lost() {
+        assert!(!is_link_lost_error("Operation failed with ATT error: 0x0e"));
+        assert!(!is_link_lost_error("In Progress"));
+        assert!(!is_link_lost_error("timeout: 0x01"));
+    }
 }

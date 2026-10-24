@@ -2,5 +2,6 @@
 <gresources>
   <gresource prefix="/com/immurok/Settings/icons">
     <file>scalable/actions/immurok-fingerprint-symbolic.svg</file>
+    <file>256x256/apps/com.immurok.Settings.png</file>
   </gresource>
 </gresources>

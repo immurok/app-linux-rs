@@ -15,6 +15,10 @@ pub const DEVICE_NAME_PREFIX: &str = "immurok";
 
 // Command codes (App → Device)
 pub const CMD_GET_STATUS: u8 = 0x01;
+/// Live link-layer connection parameters as the device sees them:
+/// `[0x03][0x00][interval:2 BE][latency:2 BE][timeout:2 BE]`. Read-only,
+/// allowed before pairing (the peer can observe these anyway).
+pub const CMD_GET_CONN_PARAMS: u8 = 0x03;
 pub const CMD_ENROLL_START: u8 = 0x10;
 pub const CMD_ENROLL_CANCEL: u8 = 0x11;
 pub const CMD_DELETE_FP: u8 = 0x12;
@@ -138,6 +142,12 @@ pub const MAX_PAYLOAD_SIZE: usize = 62;
 
 // Timing
 pub const BLE_COMMAND_TIMEOUT_SECS: u64 = 5;
+// How long the daemon waits for the notify helper's READY after spawning it.
+// READY needs one CCCD write on the fresh link; right after connect that write
+// can sit behind BlueZ's own HID setup / encryption for a long time (19 s seen
+// on a 2026-10 Fedora box). Too short and the daemon respawns a helper that
+// then competes with the orphaned one for the same link.
+pub const BLE_HELPER_READY_TIMEOUT_SECS: u64 = 20;
 pub const BLE_RECONNECT_INTERVAL_SECS: u64 = 1;
 pub const BLE_CONNECTING_TIMEOUT_SECS: u64 = 10;
 // Reconnect backoff ceiling. The 1s base above is the FAST path for a normal
@@ -174,6 +184,13 @@ pub const BLE_FP_GATE_TIMEOUT_SECS: u64 = 30;
 pub const BLE_AUTH_TIMEOUT_SECS: u64 = 30;
 // 30s 等按钮 + 2×2s ECC + 余量
 pub const BLE_PAIR_BUTTON_TIMEOUT_SECS: u64 = 35;
+// After the button press the device first waits for the host to grant a longer
+// supervision timeout (it asks for 6 s), then runs ~2 s of ECC. On Linux the
+// kernel applies accepted parameter updates one at a time on its cmd_sync
+// worker, each blocking until the controller confirms, so a grant can land
+// many seconds after the request. Give the ECDH phase its own window instead
+// of letting whatever is left of the button window decide.
+pub const BLE_PAIR_ECDH_WAIT_SECS: u64 = 30;
 // Pre-auth window (after FP match → screen unlock or PAM approve) for
 // follow-up PAM requests like polkit prompts. Bound to a service set; an
 // out-of-set request still requires a fresh fingerprint. Tightened from

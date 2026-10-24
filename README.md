@@ -29,7 +29,9 @@ sudo pacman -U immurok-<version>-1-x86_64.pkg.tar.zst
 The package starts `immurok-daemon`, enables the session agent for every user and registers
 the settings app to autostart. Two things are left to you:
 
-1. **Pair** — open *immurok* from the app menu, or run `immurok-cli pair`.
+1. **Link the device** — open *immurok* from the app menu (the setup wizard
+   walks you through Bluetooth, linking and enrolling a fingerprint), or run
+   `immurok-cli pair`.
 2. **Enable the PAM hooks** on the PAM page (or `immurok-cli pam install sudo`). The package
    deliberately does not touch `/etc/pam.d` on its own.
 
@@ -146,6 +148,12 @@ settings, press it in any text field, pick an OTP, touch the device. Phase 1
 copies the code to the clipboard (cleared after 30 s); direct typing arrives in
 0.9.
 
+On first launch a **setup wizard** opens: connect the device in your
+desktop's Bluetooth settings, link this computer (press the device button;
+a second computer first touches an enrolled finger), enroll a fingerprint.
+Every step checks itself and moves on; "Later" dismisses it and the header
+menu (or `immurok-gui --setup`) brings it back.
+
 The **Fingerprints** page mirrors the macOS app: one card per enrolled
 finger (click the name to rename it — names are stored locally in
 `~/.config/immurok/gui.json`, the device only knows slot numbers), "+" to
@@ -153,8 +161,18 @@ enroll with the six-step guide, a hover-revealed delete button, "Test
 Fingerprint", and — on firmware with two-host support — "Add switch
 fingerprint" for the finger that only switches between your two computers.
 The **Two Hosts** group on the Device page shows both host slots, marks this
-computer, and lets you pair / unpair here or unbind the other computer
-(one touch of an enrolled finger on the device confirms it).
+computer, and lets you link / unlink here or unlink the other computer
+(one touch of an enrolled finger on the device confirms it). "Link" is the
+app-level key exchange; the Bluetooth connection itself is made in your
+desktop's Bluetooth settings.
+
+Clicking the firmware line in the sidebar device card reads the live
+Bluetooth connection parameters from the device (interval, peripheral
+latency, supervision timeout) and says whether the link is long enough for
+linking and SSH signing. When linking fails, the error dialog reads these
+parameters for you and, if the supervision timeout is under 3000 ms, says to
+disconnect and reconnect the device in Bluetooth settings so they are
+renegotiated.
 
 The **PAM** page shows whether the immurok line is installed for sudo,
 polkit and the login screen, with Install / Remove / Repair buttons (polkit
@@ -383,6 +401,21 @@ Note that `ble-notify-helper.py` uses `#!/usr/bin/python3`, i.e. the system pyth
 ### GTK dialog doesn't grab focus under Wayland
 
 Intentional — it never steals keyboard focus and closes itself once the fingerprint passes. Alt+Tab to it if you need the Cancel button.
+
+### The GUI still behaves like the previous build after `make install` (setup wizard doesn't come back, old wording, old bugs)
+
+`immurok-gui` stays resident after login (`--gapplication-service`), and every
+later `immurok-gui`, hotkey or app-menu launch is forwarded to that process. A
+resident instance started before `make install` keeps running the old binary
+until it exits. `make install` now asks it to quit (`scripts/retire-gui.sh`),
+and a newer `immurok-gui` started from a terminal does the same when it finds
+the resident instance running a replaced binary. For a resident instance older
+than 0.9 — it has no `retire` action — stop it once by hand:
+
+```bash
+pkill -f 'immurok-gui --gapplication-service'
+immurok-gui
+```
 
 ## 7. Uninstall
 

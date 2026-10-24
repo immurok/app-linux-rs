@@ -31,6 +31,7 @@
 //! | SET:SSH_TAKEOVER    | `SET:SSH_TAKEOVER:1` / `:0`        |
 //! | GET:SETTINGS        | `GET:SETTINGS`                     |
 //! | GET:INFO            | `GET:INFO`                         |
+//! | GET:CONN_PARAMS     | `GET:CONN_PARAMS`                  |
 //! | OTA:START           | `OTA:START:size:version`           |
 //! | OTA:DATA            | `OTA:DATA:hex_bytes`               |
 //! | OTA:FINISH          | `OTA:FINISH`                       |
@@ -43,7 +44,7 @@
 //! | Deny        | `DENY:message`                                    |
 //! | Retry       | `RETRY:remaining`                                 |
 //! | Error       | `ERROR:message`                                   |
-//! | Status      | `STATUS:connected(0/1):name:battery:version`      |
+//! | Status      | `STATUS:connected(0/1):name:battery:version:device_unpaired(0/1):link_up(0/1)` |
 
 use std::fmt;
 
@@ -112,6 +113,10 @@ pub enum Request {
     SetSshTakeover(bool),
     GetSettings,
     GetInfo,
+    /// Live BLE connection parameters read from the device
+    /// (`CMD_GET_CONN_PARAMS`). Reply `OK:interval:latency:timeout` in
+    /// link-layer units (1.25 ms, intervals, 10 ms).
+    GetConnParams,
     OtaStart { size: u32, version: String },
     OtaData(Vec<u8>),
     OtaFinish,
@@ -142,6 +147,10 @@ pub enum Response {
         /// 设备自己说它没和本机配对（工厂复位 / 槽被清）。主机的 pairing.json
         /// 还在时，这是唯一能戳破「Paired: Yes」假象的信息。
         device_unpaired: bool,
+        /// BlueZ 层链路已连上（Connected + ServicesResolved），但 GATT 会话还没
+        /// 就绪（helper 启动中 / 上一次没就绪在重试）。`connected` 为 true 时
+        /// 它也为 true。UI 用它把「蓝牙已连上、设备启动中」和「未连接」区分开。
+        link_up: bool,
     },
 }
 
@@ -325,6 +334,7 @@ pub fn parse_request(line: &str) -> Result<Request, ParseError> {
             match sub {
                 "SETTINGS" => Ok(Request::GetSettings),
                 "INFO" => Ok(Request::GetInfo),
+                "CONN_PARAMS" => Ok(Request::GetConnParams),
                 other => Err(ParseError::UnknownCommand(format!("GET:{other}"))),
             }
         }
@@ -370,11 +380,13 @@ pub fn serialize_response(resp: &Response) -> String {
             battery,
             version,
             device_unpaired,
+            link_up,
         } => {
             let conn_flag = if *connected { 1u8 } else { 0u8 };
-            // device_unpaired 追加在末尾：老客户端按下标取前四项，不受影响。
+            // device_unpaired / link_up 追加在末尾：老客户端按下标取前几项，不受影响。
             let unpaired_flag = if *device_unpaired { 1u8 } else { 0u8 };
-            format!("STATUS:{conn_flag}:{name}:{battery}:{version}:{unpaired_flag}")
+            let link_flag = if *link_up || *connected { 1u8 } else { 0u8 };
+            format!("STATUS:{conn_flag}:{name}:{battery}:{version}:{unpaired_flag}:{link_flag}")
         }
     }
 }
@@ -469,9 +481,10 @@ mod tests {
             battery: 85,
             version: "v1.0.0".to_string(),
             device_unpaired: false,
+            link_up: true,
         };
         let s = serialize_response(&resp);
-        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0:0");
+        assert_eq!(s, "STATUS:1:immurok-AB12:85:v1.0.0:0:1");
 
         // disconnected variant
         let resp_off = Response::Status {
@@ -480,9 +493,21 @@ mod tests {
             battery: 0,
             version: String::new(),
             device_unpaired: false,
+            link_up: false,
         };
         let s_off = serialize_response(&resp_off);
-        assert_eq!(s_off, "STATUS:0::0::0");
+        assert_eq!(s_off, "STATUS:0::0::0:0");
+
+        // 蓝牙链路已连上、会话未就绪：connected=0 但 link_up=1。
+        let resp_starting = Response::Status {
+            connected: false,
+            name: String::new(),
+            battery: 0,
+            version: String::new(),
+            device_unpaired: false,
+            link_up: true,
+        };
+        assert_eq!(serialize_response(&resp_starting), "STATUS:0::0::0:1");
 
         // 设备自报未配对：新字段追加在末尾，前四段与老格式逐字节一致 ——
         // 老客户端按下标取值，不会因为多一段而错乱。
@@ -492,9 +517,10 @@ mod tests {
             battery: 85,
             version: "v1.0.0".to_string(),
             device_unpaired: true,
+            link_up: true,
         };
         let s_unpaired = serialize_response(&resp_unpaired);
-        assert_eq!(s_unpaired, "STATUS:1:immurok-AB12:85:v1.0.0:1");
+        assert_eq!(s_unpaired, "STATUS:1:immurok-AB12:85:v1.0.0:1:1");
         assert!(s_unpaired.starts_with("STATUS:1:immurok-AB12:85:v1.0.0"));
     }
 
@@ -569,6 +595,7 @@ mod tests {
     fn test_parse_get_commands() {
         assert_eq!(parse_request("GET:SETTINGS").unwrap(), Request::GetSettings);
         assert_eq!(parse_request("GET:INFO").unwrap(), Request::GetInfo);
+        assert_eq!(parse_request("GET:CONN_PARAMS").unwrap(), Request::GetConnParams);
     }
 
     #[test]

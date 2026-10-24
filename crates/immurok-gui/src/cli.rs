@@ -8,6 +8,8 @@ pub enum Launch {
     QuickFill,
     /// Started by D-Bus activation / autostart: stay resident, no window.
     Service,
+    /// Open the first-run setup wizard directly.
+    Setup,
 }
 
 /// `args` includes argv[0].
@@ -16,6 +18,7 @@ pub fn parse_launch(args: &[String]) -> Launch {
     for a in args.iter().skip(1) {
         match a.as_str() {
             "--quick-fill" => return Launch::QuickFill,
+            "--setup" => return Launch::Setup,
             "--gapplication-service" => launch = Launch::Service,
             _ => {}
         }
@@ -39,6 +42,11 @@ mod tests {
     #[test]
     fn quick_fill_flag() {
         assert_eq!(parse_launch(&v(&["immurok-gui", "--quick-fill"])), Launch::QuickFill);
+    }
+
+    #[test]
+    fn setup_flag() {
+        assert_eq!(parse_launch(&v(&["immurok-gui", "--setup"])), Launch::Setup);
     }
 
     #[test]

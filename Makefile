@@ -62,7 +62,9 @@ install: all
 	systemctl --user daemon-reload
 	systemctl --user enable --now immurok-session-agent.service
 	@# ── 用户级：GUI 自启动（常驻，热键秒开）。二进制不存在时跳过 ──
+	@# 常驻的旧实例先请走，否则之后的 immurok-gui 全被转发给旧二进制（见 scripts/retire-gui.sh）
 	@if [ -x $(BIN_DIR)/immurok-gui ]; then \
+		bash scripts/retire-gui.sh; \
 		mkdir -p $(HOME)/.config/autostart; \
 		install -m644 packaging/com.immurok.Settings.autostart.desktop $(HOME)/.config/autostart/com.immurok.Settings.desktop; \
 		echo "✓ GUI 自启动已登记（$(HOME)/.config/autostart/com.immurok.Settings.desktop）"; \
@@ -85,6 +87,8 @@ install: all
 # 卸载。默认保留 /var/lib/immurok（配对数据）；PURGE=1 才连它一起删。
 uninstall:
 	@echo "=== immurok uninstall ==="
+	@# 常驻 GUI 先退出，二进制删掉后它还会一直跑
+	-bash scripts/retire-gui.sh
 	sudo bash scripts/uninstall-root.sh $(PAM_DIR) $(BIN_DIR) $(if $(PURGE),--purge-state,--keep-state)
 	@# ── 用户级 ──
 	-systemctl --user disable --now immurok-session-agent.service 2>/dev/null
