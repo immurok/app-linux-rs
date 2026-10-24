@@ -92,6 +92,10 @@ overrides:
       - python3
       - python3-dbus-fast
       - python3-gobject
+      # Owns cairo-1.0.typelib, which Gtk-4.0.typelib depends on. Since
+      # pygobject 3.54 (Fedora 43 updates) python3-gobject-base links
+      # glib2's libgirepository-2.0 and no longer pulls this package in.
+      - gobject-introspection
       - gtk4
       - libadwaita
       - dbus-libs
