@@ -51,6 +51,11 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container: debian:12
+    # The runner executes `run` steps inside the container with `sh`, which
+    # rejects `set -o pipefail`; every step below is written for bash.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Build dependencies
         run: |
