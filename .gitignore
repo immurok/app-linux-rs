@@ -1,6 +1,15 @@
 /target/
 /dist/
 
+# PAM build output. This matters beyond a tidy `git status`: the public
+# mirror is produced by rsyncing this directory, which copies the working
+# tree rather than the git index, and only THIS .gitignore travels with it —
+# the monorepo's root .gitignore (which also has `*.so`) does not. Without
+# the entry below, a local build would publish a compiled module.
+/pam/pam_immurok.so
 # PAM unit-test binaries (built by pam/Makefile `make test`)
 /pam/test_fp_policy
 /pam/test_socket_trust
+
+# Python bytecode from scripts/ (ble-notify-helper, immurok-auth-dialog)
+__pycache__/

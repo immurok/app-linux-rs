@@ -9,9 +9,19 @@
 //! `ERROR:…(svc)` line per service. pkexec itself exits 126 when the user
 //! cancels the authentication and 127 when no polkit agent is available.
 //!
-//! Repair derivation mirrors `immurok-cli pam repair`: sudo / polkit-1 come
-//! from the daemon's feature toggles; gdm-password is only touched when its
-//! file already exists and lacks the line.
+//! Repair derivation mirrors `immurok-cli pam repair`: the target set comes
+//! straight from the daemon's feature toggles.
+//!
+//! `gdm-password` is deliberately NOT here. The module returns `PAM_IGNORE`
+//! for it on purpose (`pam/fp_policy.h`) — the graphical screen has no
+//! controlling tty, so blocking on a fingerprint there stalls password
+//! entry — and fingerprint unlock of a locked session runs out-of-band via
+//! the daemon's `loginctl unlock-session`. Offering an install that changes
+//! nothing only made "Not installed" read as "unlock is broken". Should
+//! greeter (login-screen) fingerprint ever happen, its hook is GDM's own
+//! `gdm-fingerprint` service, not `gdm-password`. The helper still accepts
+//! `remove gdm-password` so uninstall clears the line on machines that got
+//! it from an older version.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -28,14 +38,19 @@ pub struct PamService {
     pub path: &'static str,
 }
 
-pub const PAM_SERVICES: [PamService; 3] = [
+/// Services the app manages — what the GUI/TUI list and `add` may target.
+pub const PAM_SERVICES: [PamService; 2] = [
     PamService { label: "sudo", service: "sudo", path: "/etc/pam.d/sudo" },
     PamService { label: "System authorization (polkit)", service: "polkit-1", path: "/etc/pam.d/polkit-1" },
-    PamService { label: "Login screen (gdm)", service: "gdm-password", path: "/etc/pam.d/gdm-password" },
 ];
 
+/// Services the helper will act on. A superset of [`PAM_SERVICES`]:
+/// `gdm-password` is no longer installed by anything, but uninstall must
+/// still be able to strip a line an older version left behind.
+const REMOVABLE_SERVICES: [&str; 1] = ["gdm-password"];
+
 pub fn is_known_service(s: &str) -> bool {
-    PAM_SERVICES.iter().any(|p| p.service == s)
+    PAM_SERVICES.iter().any(|p| p.service == s) || REMOVABLE_SERVICES.contains(&s)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,17 +89,12 @@ pub fn desired_services(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
     v
 }
 
-/// Desired-but-missing services, plus gdm-password when its file exists and
-/// lacks the line (best effort, never created).
+/// Desired-but-missing services.
 pub fn services_to_repair_in(dir: &Path, sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = desired_services(sudo_on, polkit_on)
+    desired_services(sudo_on, polkit_on)
         .into_iter()
         .filter(|s| !pam_line_present_in(dir, s))
-        .collect();
-    if dir.join("gdm-password").exists() && !pam_line_present_in(dir, "gdm-password") {
-        v.push("gdm-password");
-    }
-    v
+        .collect()
 }
 
 pub fn services_to_repair(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
@@ -175,9 +185,14 @@ pub fn classify_exit(code: Option<i32>, stdout: &str) -> Result<HelperReport, Pa
 /// user finishes (or cancels) the polkit prompt — never call on a UI thread.
 /// Only `add` / `remove` and the services in [`PAM_SERVICES`] are accepted.
 pub fn run_helper(action: &str, services: &[&str]) -> Result<HelperReport, PamError> {
-    let valid = matches!(action, "add" | "remove")
-        && !services.is_empty()
-        && services.iter().all(|s| is_known_service(s));
+    // `add` only ever targets what we manage; `remove` additionally reaches
+    // the legacy `gdm-password` line so uninstall can clean it up.
+    let targets_ok = match action {
+        "add" => services.iter().all(|s| PAM_SERVICES.iter().any(|p| p.service == *s)),
+        "remove" => services.iter().all(|s| is_known_service(s)),
+        _ => false,
+    };
+    let valid = matches!(action, "add" | "remove") && !services.is_empty() && targets_ok;
     if !valid {
         return Err(PamError::Spawn("invalid request".into()));
     }
@@ -207,21 +222,44 @@ mod tests {
 
     #[test]
     fn service_table() {
-        assert_eq!(PAM_SERVICES.len(), 3);
+        assert_eq!(PAM_SERVICES.len(), 2);
         assert_eq!(PAM_SERVICES[0].service, "sudo");
         assert_eq!(PAM_SERVICES[1].service, "polkit-1");
-        assert_eq!(PAM_SERVICES[2].service, "gdm-password");
         assert_eq!(PAM_SERVICES[1].path, "/etc/pam.d/polkit-1");
         assert!(is_known_service("sudo") && !is_known_service("login"));
+    }
+
+    /// The login screen is not a managed service: the module `PAM_IGNORE`s
+    /// it, so installing the line changed nothing and the row only read as
+    /// "unlock is broken". Removal stays reachable for legacy machines.
+    #[test]
+    fn gdm_password_is_removable_but_never_installed() {
+        assert!(!PAM_SERVICES.iter().any(|p| p.service == "gdm-password"));
+        assert!(is_known_service("gdm-password"));
+        assert_eq!(
+            run_helper("add", &["gdm-password"]),
+            Err(PamError::Spawn("invalid request".into()))
+        );
+    }
+
+    /// Repair never offers it either, whichever directory provides the file.
+    #[test]
+    fn repair_never_offers_the_login_screen() {
+        let dir = tmp_pam_dir(&[
+            ("sudo", "auth sufficient pam_immurok.so\n"),
+            ("polkit-1", "auth sufficient pam_immurok.so\n"),
+            ("gdm-password", "auth include system-local-login\n"),
+        ]);
+        assert_eq!(services_to_repair_in(dir.path(), true, true), Vec::<&str>::new());
     }
 
     #[test]
     fn status_reads_each_file() {
         let dir = tmp_pam_dir(&[("sudo", "auth sufficient pam_immurok.so\n"), ("polkit-1", "auth include common-auth\n")]);
         let st = service_status_in(dir.path());
-        assert_eq!(st.len(), 3);
-        assert!(st[0].installed && !st[1].installed && !st[2].installed);
-        assert_eq!(st[2].label, "Login screen (gdm)");
+        assert_eq!(st.len(), 2);
+        assert!(st[0].installed && !st[1].installed);
+        assert_eq!(st[1].label, "System authorization (polkit)");
     }
 
     #[test]
@@ -230,9 +268,6 @@ mod tests {
         assert_eq!(services_to_repair_in(dir.path(), true, true), vec!["sudo"]);
         assert_eq!(services_to_repair_in(dir.path(), false, true), Vec::<&str>::new());
         assert_eq!(services_to_repair_in(dir.path(), true, false), vec!["sudo"]);
-        // gdm only when the file exists and lacks the line.
-        let dir2 = tmp_pam_dir(&[("gdm-password", "auth include common-auth\n")]);
-        assert_eq!(services_to_repair_in(dir2.path(), false, false), vec!["gdm-password"]);
     }
 
     #[test]

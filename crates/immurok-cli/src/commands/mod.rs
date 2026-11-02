@@ -181,7 +181,7 @@ pub enum SetCommands {
 pub enum PamCommands {
     /// Install PAM config for a service
     Install {
-        /// PAM service name (e.g. sudo, polkit-1, gdm-password)
+        /// PAM service name (sudo or polkit-1)
         service: String,
     },
     /// Remove PAM config for a service

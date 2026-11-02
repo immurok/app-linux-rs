@@ -96,7 +96,10 @@ mv -f "$PAM_DIR/pam_immurok.so.new" "$PAM_DIR/pam_immurok.so"
 step "PAM service configs"
 "$HELPER" add sudo
 "$HELPER" add polkit-1
-"$HELPER" add gdm-password
+# 登录屏不再管理：模块对 gdm-password 直接 PAM_IGNORE（pam/fp_policy.h），
+# 锁屏指纹走 daemon 的 loginctl unlock-session。旧版在这里 add 过一行，
+# 留着只会让 PAM 面板显示一个永远「没装上」的空操作项 —— 顺手清掉。
+"$HELPER" remove gdm-password
 
 # 建系统用户、搬数据、停旧的用户级 daemon、起系统 daemon、删旧 polkit
 # override —— 一步做完，中间不会出现两个 daemon 抢 BLE 的窗口。

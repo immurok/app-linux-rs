@@ -115,6 +115,43 @@ pub fn save_digests(
     save_json(path, digests)
 }
 
+/// Every on-disk artefact of the key cache, in one place so purging cannot
+/// miss one as the set grows.
+const CACHE_FILES: [&str; 3] = [
+    protocol::SSH_KEYS_FILE,
+    protocol::KEY_NAMES_FILE,
+    protocol::KEYSTORE_DIGESTS_FILE,
+];
+
+/// Drop the whole key cache. Idempotent — a missing file is a success.
+///
+/// Called whenever this host stops being paired (unpair / slot clear /
+/// factory reset). The cache is *per-device* state living in a
+/// device-agnostic directory, and nothing downstream checks which device it
+/// came from: `LIST`/`KEY:CACHE` (GUI keys page), `GET:ssh`, `imk LIST` and
+/// the SSH agent all read these files unconditionally, so a cache left
+/// behind by the old device is served as if it belonged to the new one.
+/// `keystore_digests.json` matters just as much — a surviving (count,
+/// checksum) pair can make a fresh device's KEY_COUNT look like a digest
+/// *hit*, which skips the full KEY_READ chain and leaves the stale entries
+/// in place for good.
+pub fn clear_caches(state_dir: &Path) -> Result<(), String> {
+    let mut failed = Vec::new();
+    for name in CACHE_FILES {
+        let path = state_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(format!("{}: {}", path.display(), e)),
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
 // ── SSH public key wire format ──────────────────────────────
 
 /// Build the SSH public key blob for ecdsa-sha2-nistp256.
@@ -195,6 +232,47 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── clear_caches ────────────────────────────────────────
+
+    #[test]
+    fn clear_caches_removes_every_artefact() {
+        let dir = std::env::temp_dir().join(format!("immurok_ks_clear_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            protocol::SSH_KEYS_FILE,
+            protocol::KEY_NAMES_FILE,
+            protocol::KEYSTORE_DIGESTS_FILE,
+        ] {
+            std::fs::write(dir.join(f), "[]").unwrap();
+        }
+
+        clear_caches(&dir).expect("clear should succeed");
+
+        assert!(load_ssh_keys(&dir).is_empty());
+        assert!(load_key_names(&dir).is_empty());
+        assert!(load_digests(&dir.join(protocol::KEYSTORE_DIGESTS_FILE)).is_empty());
+        for f in [
+            protocol::SSH_KEYS_FILE,
+            protocol::KEY_NAMES_FILE,
+            protocol::KEYSTORE_DIGESTS_FILE,
+        ] {
+            assert!(!dir.join(f).exists(), "{} survived the purge", f);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Unpair runs on paths that may already have no cache (never connected,
+    /// or a second unpair): a missing file is not an error.
+    #[test]
+    fn clear_caches_is_idempotent_on_empty_dir() {
+        let dir = std::env::temp_dir().join(format!("immurok_ks_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        clear_caches(&dir).expect("first clear");
+        clear_caches(&dir).expect("second clear");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_build_ssh_public_key_blob_length() {

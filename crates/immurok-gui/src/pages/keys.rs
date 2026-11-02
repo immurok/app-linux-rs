@@ -23,6 +23,20 @@ use immurok_client::keys::{
 
 use super::{confirm, run_blocking};
 
+/// Whether a connection-state update means the daemon's key cache may have
+/// changed behind the page's back, so the rows must be re-read.
+///
+/// Every transition counts, in both directions. Connecting is when the
+/// daemon syncs the cache off the device (`sync_ssh_keys`), so the entries
+/// on screen are whatever the *previous* device left behind until that
+/// lands. Disconnecting is the tail of an unpair — the device reboots and
+/// drops the link right after the daemon purged the cache — so the rows are
+/// stale there too. `None` is the first update after construction, which
+/// already loaded once.
+fn cache_may_have_changed(previous: Option<bool>, now: bool) -> bool {
+    matches!(previous, Some(p) if p != now)
+}
+
 /// Title/subtitle for the clickable empty-state row shown when a category
 /// has no entries yet.
 fn empty_hint(cat: KeyCategory) -> (&'static str, &'static str) {
@@ -39,7 +53,8 @@ pub struct KeysPage {
     add_buttons: Vec<(KeyCategory, gtk::Button)>,
     rows: RefCell<Vec<(adw::PreferencesGroup, adw::ActionRow)>>,
     counts: RefCell<HashMap<KeyCategory, usize>>,
-    connected: Cell<bool>,
+    /// `None` until the first Dashboard poll reports a connection state.
+    connected: Cell<Option<bool>>,
     toasts: adw::ToastOverlay,
     /// Rows currently showing an inline OTP/API code: (row, original
     /// subtitle markup, its Copy button), so `clear_codes` can restore them.
@@ -76,7 +91,7 @@ impl KeysPage {
             add_buttons,
             rows: RefCell::new(Vec::new()),
             counts: RefCell::new(HashMap::new()),
-            connected: Cell::new(false),
+            connected: Cell::new(None),
             toasts: toasts.clone(),
             shown: RefCell::new(Vec::new()),
             code_gen: Cell::new(0),
@@ -90,6 +105,17 @@ impl KeysPage {
                 }
             });
         }
+        // The daemon cache changes without the page knowing: a connect-time
+        // sync, a key added from the CLI, an unpair purging it. Re-read every
+        // time the page comes back into view — a GtkStack unmaps the pages it
+        // is not showing, so this fires on each switch into Keys. Without it
+        // the rows were whatever was cached at window construction, forever.
+        let weak = Rc::downgrade(&this);
+        this.root.connect_map(move |_| {
+            if let Some(p) = weak.upgrade() {
+                p.reload();
+            }
+        });
         this.refresh_add_buttons();
         this.reload();
         this
@@ -246,10 +272,16 @@ impl KeysPage {
         }
     }
 
-    /// Fed from the Dashboard poll; the add buttons need a live device.
-    pub fn set_connected(&self, connected: bool) {
-        if self.connected.replace(connected) != connected {
-            self.refresh_add_buttons();
+    /// Fed from the Dashboard poll; the add buttons need a live device, and
+    /// a changed connection state means the cache behind the rows moved.
+    pub fn set_connected(self: &Rc<Self>, connected: bool) {
+        let previous = self.connected.replace(Some(connected));
+        if previous == Some(connected) {
+            return;
+        }
+        self.refresh_add_buttons();
+        if cache_may_have_changed(previous, connected) {
+            self.reload();
         }
     }
 
@@ -258,7 +290,7 @@ impl KeysPage {
         for (cat, btn) in &self.add_buttons {
             let n = counts.get(cat).copied().unwrap_or(0);
             let full = n >= capacity(*cat) as usize;
-            let (sensitive, tip) = if !self.connected.get() {
+            let (sensitive, tip) = if self.connected.get() != Some(true) {
                 (false, "Device not connected".to_string())
             } else if full {
                 (false, "Keystore full — delete an entry first".to_string())
@@ -271,7 +303,7 @@ impl KeysPage {
     }
 
     fn open_add(self: &Rc<Self>, cat: KeyCategory) {
-        if !self.connected.get() {
+        if self.connected.get() != Some(true) {
             self.toast("Device not connected", 3);
             return;
         }
@@ -360,5 +392,40 @@ impl KeysPage {
                 None => {}
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_may_have_changed;
+
+    /// The first poll after construction must not re-read: `new()` already
+    /// loaded, and reloading would throw away a just-shown OTP code.
+    #[test]
+    fn first_update_is_not_a_change() {
+        assert!(!cache_may_have_changed(None, true));
+        assert!(!cache_may_have_changed(None, false));
+    }
+
+    /// Connecting is when the daemon syncs the cache off the device — until
+    /// then the rows are the previous device's entries, which is exactly the
+    /// bug: after relinking to a new device the GUI kept showing the old
+    /// device's OTP names even though the daemon cache was already empty.
+    #[test]
+    fn reconnect_reloads() {
+        assert!(cache_may_have_changed(Some(false), true));
+    }
+
+    /// Disconnecting is the tail of an unpair (device reboots and drops the
+    /// link right after the daemon purged the cache), so re-read there too.
+    #[test]
+    fn disconnect_reloads() {
+        assert!(cache_may_have_changed(Some(true), false));
+    }
+
+    #[test]
+    fn a_repeated_state_does_not_reload() {
+        assert!(!cache_may_have_changed(Some(true), true));
+        assert!(!cache_may_have_changed(Some(false), false));
     }
 }

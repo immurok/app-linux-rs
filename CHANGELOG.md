@@ -3,6 +3,83 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
+## 0.9.2 — 2026-11-02
+
+### Added
+
+- gui: the window and header bar now read `immurok app v<version>`, taken
+  from the crate version. It also makes a resident instance running a
+  replaced binary obvious at a glance — the title bar shows the old version.
+
+### Changed
+
+- make install / verify-fresh.sh: all output and comments are English, in
+  line with the rest of the Linux companion.
+
+### Fixed
+
+- daemon: unpairing now purges the key cache. `SLOT:CLEAR` / factory reset
+  dropped the pairing material but left `ssh_keys.json`, `key_names.json`
+  and `keystore_digests.json` in `/var/lib/immurok`, and no reader checks
+  which device a cache came from — so after unlinking and linking a *new*
+  device, the GUI Keys page, `imk LIST/GET ssh` and the SSH agent kept
+  serving the old device's OTP and SSH entries. The surviving digest file
+  made it worse: a fresh device's `KEY_COUNT` could read as a cache *hit*
+  and skip the full re-read, pinning the stale entries in place.
+- daemon: re-sync the key cache right after a successful pairing, instead of
+  waiting for the next reconnect. The connect-time sync has already run by
+  then (with no pairing to read keys with), so the cache would otherwise sit
+  empty for the rest of the session.
+- make install: the session agent is now `enable`d and `restart`ed instead of
+  `enable --now`. `--now` is a no-op on an already-running unit, so
+  `immurok-session-agent` kept running a binary that had been replaced —
+  across any number of installs, with nothing reported. A new
+  `scripts/verify-fresh.sh` runs as the last install step and fails the
+  build if any of the three long-lived processes (daemon, session agent,
+  resident GUI) is still older than the binary on disk, naming the command
+  that replaces it. "New code on disk, old code running" presents as "my
+  change had no effect" and is otherwise silent.
+- make install/uninstall: refuse to run as root. Both targets are half
+  user-level (`systemctl --user`, GUI autostart, `$HOME` cleanup) and only
+  shell out to sudo for the root half; under `sudo make` the user half
+  silently breaks — `systemctl --user` finds no session bus, `$HOME` becomes
+  `/root` — and `target/` is left root-owned, which breaks the next
+  unprivileged `cargo build`. The check is a parse-time `$(error)`, so it
+  fires before anything builds. `make build` as root is still allowed.
+- gui: the Keys page re-reads the daemon cache when it comes back into view
+  and whenever the device's connection state changes. It used to read once,
+  at window construction, and never again — so after relinking to a new
+  device it kept listing the *old* device's OTP/API/SSH entries even once the
+  daemon cache was already correct (the connect-time sync lands after the
+  window is up). A key added or deleted from the CLI was invisible for the
+  same reason.
+- pam-helper: `add` can now install into a service whose config the
+  distribution ships in `/usr/lib/pam.d` — it copies the vendor file into
+  `/etc/pam.d` (which PAM prefers) and edits the copy. Distributions have
+  been moving stock PAM configs there (Arch's gdm, for one), and pacman then
+  leaves a locally edited `/etc` copy behind as `.pacsave`, so the line
+  disappears on a system upgrade and `add` could only answer
+  `ERROR:FILE_NOT_FOUND`. `remove` now deletes any file we created outright
+  (vendor copy or polkit-1 template) so the distribution's own config takes
+  effect again, instead of leaving a stale `/etc` override shadowing it.
+
+### Removed
+
+- gui/cli/tui: dropped the "Login screen (gdm)" PAM entry. The module
+  returns `PAM_IGNORE` for `gdm-password` on purpose (`pam/fp_policy.h`) —
+  the graphical screen has no controlling tty, so blocking there stalls
+  password entry — and fingerprint unlock of a locked session runs
+  out-of-band through the daemon's `loginctl unlock-session`. The row
+  therefore offered an install that changed nothing while reading "Not
+  installed", which looks exactly like broken unlock. `install-root.sh` now
+  strips the line instead of adding it, and `remove gdm-password` stays
+  available so uninstall still cleans up machines that got it from an older
+  version. If greeter (login-screen) fingerprint is ever built, its hook is
+  GDM's own `gdm-fingerprint` service, not `gdm-password`.
+- daemon: `gdm-password` left `UNLOCK_FOLLOWUP_SERVICES` for the same
+  reason — a pre-auth grant for a service the module never asks about could
+  not be consulted.
+
 ## 0.9.1 — 2026-10-24
 
 ### Added

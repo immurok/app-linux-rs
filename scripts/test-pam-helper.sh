@@ -49,4 +49,54 @@ echo "$out" | grep -qE '^ERROR:MODULE_NOT_INSTALLED$' && r=no || r=ok
 check "$r" ok "缺模块不输出裸行（无后缀）"
 rmdir "$EMPTY_MODDIR"
 
+# ── 厂商目录（/usr/lib/pam.d）回归 ─────────────────────────────
+# Arch 的 gdm 等把 PAM 配置搬到了 /usr/lib/pam.d，/etc/pam.d 下那份只在用户
+# 改过时才存在（升级时会被 pacman 留成 .pacsave）。PAM 的查找顺序是 /etc
+# 优先、再 /usr/lib，所以 add 必须把厂商那份抄到 /etc 再插行；旧实现直接
+# 报 FILE_NOT_FOUND，等于在这些机器上永远装不上登录屏。
+VENDOR="$(mktemp -d)"
+export IMMUROK_PAM_VENDOR_D="$VENDOR"
+printf '#%%PAM-1.0\nauth       include     system-local-login\n' > "$VENDOR/gdm-password"
+rm -f "$TMP/gdm-password"
+
+out=$("$HELPER" add gdm-password)
+echo "$out"
+echo "$out" | grep -q 'ERROR' && r=no || r=ok
+check "$r" ok "厂商目录兜底：add 不再报错"
+grep -q 'pam_immurok.so' "$TMP/gdm-password" && r=ok || r=no
+check "$r" ok "厂商副本已落到 /etc 并插入 immurok 行"
+grep -q 'system-local-login' "$TMP/gdm-password" && r=ok || r=no
+check "$r" ok "厂商原栈（include system-local-login）被保留"
+n=$(grep -c 'pam_immurok.so' "$TMP/gdm-password")
+check "$n" 1 "immurok 行只有一行"
+head -1 "$TMP/gdm-password" | grep -q '^#%PAM-1.0' && r=ok || r=no
+check "$r" ok "首行仍是 #%PAM-1.0"
+
+# 幂等：再 add 一次不重复插行
+"$HELPER" add gdm-password >/dev/null
+n=$(grep -c 'pam_immurok.so' "$TMP/gdm-password")
+check "$n" 1 "厂商副本上 add 幂等"
+
+# remove：我们建的副本整份删掉，让厂商文件重新生效
+"$HELPER" remove gdm-password >/dev/null
+[ -e "$TMP/gdm-password" ] && r=no || r=ok
+check "$r" ok "remove 删掉 immurok 建的副本（厂商文件恢复生效）"
+
+# 用户自己维护的 /etc 文件不能被 remove 删掉，只删行
+printf '#%%PAM-1.0\nauth       include     system-local-login\n' > "$TMP/gdm-password"
+"$HELPER" add gdm-password >/dev/null
+"$HELPER" remove gdm-password >/dev/null
+[ -f "$TMP/gdm-password" ] && r=ok || r=no
+check "$r" ok "非 immurok 创建的文件 remove 只删行、保留文件"
+grep -q 'pam_immurok.so' "$TMP/gdm-password" && r=no || r=ok
+check "$r" ok "非 immurok 创建的文件 immurok 行已删"
+
+# 两边都没有文件时仍诚实报 FILE_NOT_FOUND
+rm -f "$TMP/gdm-password" "$VENDOR/gdm-password"
+out=$("$HELPER" add gdm-password)
+echo "$out" | grep -q 'ERROR:FILE_NOT_FOUND(gdm-password)' && r=ok || r=no
+check "$r" ok "/etc 与厂商目录都没有时报 FILE_NOT_FOUND"
+rm -rf "$VENDOR"
+unset IMMUROK_PAM_VENDOR_D
+
 exit $fail

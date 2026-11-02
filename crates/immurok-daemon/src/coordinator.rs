@@ -74,7 +74,11 @@ struct PreAuth {
 /// or PAM-approve flow. Excludes `sudo` deliberately — sudo via terminal
 /// goes through a fresh AUTH_REQUEST cycle (or future AGENT_APPROVE), not
 /// pre-auth, since pre-auth has no command context.
-const UNLOCK_FOLLOWUP_SERVICES: &[&str] = &["polkit-1", "login", "gdm-password"];
+///
+/// `gdm-password` is not here either, for a different reason: the module
+/// returns `PAM_IGNORE` for that service before it ever opens the socket
+/// (`pam/fp_policy.h`), so a grant for it could never be consulted.
+const UNLOCK_FOLLOWUP_SERVICES: &[&str] = &["polkit-1", "login"];
 
 #[derive(Debug, Clone)]
 pub struct FpMatchEvent {

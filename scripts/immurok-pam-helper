@@ -7,12 +7,27 @@
 #        immurok-pam-helper migrate-daemon <user>
 #        immurok-pam-helper purge-daemon [--keep-state|--purge-state]
 #
-# service: sudo | gdm-password | polkit-1
+# service: sudo | polkit-1
+#          gdm-password —— 仅 remove 用：模块对它直接 PAM_IGNORE
+#          （pam/fp_policy.h），不再安装，但要能清掉旧版留下的那行。
 #
 
 PAM_LINE="auth        sufficient    pam_immurok.so"
 
 PAM_D="${IMMUROK_PAM_D:-/etc/pam.d}"
+
+# 厂商 PAM 目录。PAM 1.5 的查找顺序是 /etc/pam.d 优先、缺失才落到
+# /usr/lib/pam.d，于是像 Arch 的 gdm 这类包把配置整体搬去了 /usr/lib，
+# /etc 下那份只在用户改过时才存在 —— 而且包升级时 pacman 会把它留成
+# .pacsave，于是一次系统升级就能让「登录屏」那行凭空消失。只认 /etc 的
+# 话在这些发行版上永远装不上（旧版就是直接报 FILE_NOT_FOUND），正确做法
+# 是把厂商那份抄进 /etc 当 override，再往副本里插行。
+PAM_VENDOR_D="${IMMUROK_PAM_VENDOR_D:-/usr/lib/pam.d}"
+
+# 我们自己创建的文件（polkit-1 模板、厂商副本）带这个标记，remove 时据此
+# 整份删掉而不是只删行 —— 留着一份过期的 /etc 副本会一直盖住厂商文件，
+# 发行版后续对该服务 PAM 栈的更新就再也到不了这台机器。
+IMMUROK_MARKER="Created by immurok"
 
 # 选择 polkit-1 模板的 include 目标：
 #   - Arch / Fedora 用 password-auth（system-auth 的常用别名）
@@ -273,18 +288,35 @@ process_one() {
                 echo "$POLKIT_TEMPLATE" > "$PAM_FILE"; chmod 644 "$PAM_FILE"
                 echo "OK:CREATED($SERVICE)"; return 0
             fi
+            # /etc 里没有，但厂商目录有：抄一份当 override 再插行。
+            local from_vendor=0
+            if [ ! -f "$PAM_FILE" ] && [ -f "$PAM_VENDOR_D/$SERVICE" ]; then
+                cp "$PAM_VENDOR_D/$SERVICE" "$PAM_FILE" || {
+                    echo "ERROR:VENDOR_COPY_FAILED($SERVICE)"; return 0; }
+                # 标记追加在末尾：厂商内容（含首行 #%PAM-1.0）保持原样。
+                printf '# %s: copy of %s, so the immurok auth line could be added.\n# Removing immurok deletes this file and restores the vendor config.\n' \
+                    "$IMMUROK_MARKER" "$PAM_VENDOR_D/$SERVICE" >> "$PAM_FILE"
+                chmod 644 "$PAM_FILE"
+                from_vendor=1
+            fi
             if [ ! -f "$PAM_FILE" ]; then echo "ERROR:FILE_NOT_FOUND($SERVICE)"; return 0; fi
             if grep -q 'pam_immurok\.so' "$PAM_FILE"; then echo "OK:ALREADY_PRESENT($SERVICE)"; return 0; fi
             local first_auth
             first_auth=$(grep -nE '^(auth[[:space:]]|@include[[:space:]])' "$PAM_FILE" | head -1 | cut -d: -f1)
             if [ -z "$first_auth" ]; then echo "ERROR:NO_AUTH_LINE($SERVICE)"; return 0; fi
             sed -i "${first_auth}i\\${PAM_LINE}" "$PAM_FILE"
-            echo "OK:ADDED($SERVICE)"
+            if [ "$from_vendor" = "1" ]; then
+                echo "OK:ADDED_FROM_VENDOR($SERVICE)"
+            else
+                echo "OK:ADDED($SERVICE)"
+            fi
             ;;
         remove)
             if [ ! -f "$PAM_FILE" ]; then echo "OK:NOT_PRESENT($SERVICE)"; return 0; fi
             if ! grep -q 'pam_immurok\.so' "$PAM_FILE"; then echo "OK:NOT_PRESENT($SERVICE)"; return 0; fi
-            if [ "$SERVICE" = "polkit-1" ] && grep -q 'Created by immurok' "$PAM_FILE"; then
+            # 整份文件是我们建的（polkit-1 模板，或厂商副本）→ 删文件，
+            # 把该服务还原成发行版默认；只是我们插了一行的用户文件 → 只删行。
+            if grep -q "$IMMUROK_MARKER" "$PAM_FILE"; then
                 rm -f "$PAM_FILE"; echo "OK:REMOVED($SERVICE)"; return 0
             fi
             sed -i '/pam_immurok\.so/d' "$PAM_FILE"

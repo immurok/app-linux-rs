@@ -1808,6 +1808,17 @@ async fn do_pair(
             Err(e) => warn!("Post-pair challenge failed: {}; verifying on next reconnect", e),
         }
 
+        // Same gap as the challenge above, for the key cache: unpairing
+        // purged it (socket.rs `clear_local_pairing`), and the connect-time
+        // sync already ran for this session before there was a pairing to
+        // read keys with. Without a sync here the cache stays empty — or, on
+        // an upgrade from a build that did not purge, stays *stale* — until
+        // the next reconnect, and every reader (GUI keys page, imk LIST, SSH
+        // agent) sees that instead of the device we just linked.
+        if let Err(e) = sync_ssh_keys(helper, state, coordinator, notify_rx).await {
+            warn!("Post-pair key sync failed: {}; syncing on next reconnect", e);
+        }
+
         return Ok((RSP_OK, vec![RSP_OK]));
     }
 }

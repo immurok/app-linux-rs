@@ -1,12 +1,14 @@
 //! `immurok-cli pam` — PAM 配置安装 / 检查 / 一键修复。
 //!
 //! 修复目标集合按 daemon 开关派生：sudo→sudo、polkit→polkit-1。
-//! 登录屏 gdm-password 不进派生集（仅 make install / 手动面板处理）。
+//! 登录屏 gdm-password 不在管理范围内 —— 模块对它直接 PAM_IGNORE
+//! （pam/fp_policy.h），锁屏指纹走 daemon 的 loginctl unlock-session，
+//! 装那行不产生任何效果。详见 immurok_client::pam 的说明。
 
 use crate::socket_client::DaemonClient;
 use immurok_common::pam::pam_line_present;
 pub use immurok_client::pam::{desired_services, services_to_repair};
-use immurok_client::pam::{find_helper, run_helper as run_helper_shared, PamError};
+use immurok_client::pam::{find_helper, run_helper as run_helper_shared, PamError, PAM_SERVICES};
 
 /// 从 daemon GET:SETTINGS 读取 (sudo_on, polkit_on)。失败时默认全开（保守：宁可提示也不漏）。
 fn fetch_toggles() -> (bool, bool) {
@@ -53,12 +55,6 @@ pub fn run_check() {
         };
         println!("  {:<10} {}", svc, state);
     }
-    // 登录屏：仅当文件已存在才提示，缺文件不报警。
-    if std::path::Path::new("/etc/pam.d/gdm-password").exists() && !pam_line_present("gdm-password")
-    {
-        println!("  {:<14} \x1b[33mMISSING (login screen, optional)\x1b[0m", "gdm-password");
-    }
-
     if desired.is_empty() {
         println!("\x1b[90mNo PAM-dependent features are enabled.\x1b[0m");
     }
@@ -86,8 +82,34 @@ pub fn run_repair() {
     run_helper("add", &to_fix);
 }
 
+/// `add` 的目标不在管理范围内时，给出原因而不是 helper 那句干巴巴的
+/// "invalid request"。`remove` 不受限：旧版装过的行要能清掉。
+pub fn explain_rejected_add(action: &str, service: &str) -> Option<String> {
+    if action != "add" || PAM_SERVICES.iter().any(|p| p.service == service) {
+        return None;
+    }
+    let managed: Vec<&str> = PAM_SERVICES.iter().map(|p| p.service).collect();
+    if service == "gdm-password" {
+        return Some(format!(
+            "gdm-password is not managed: the module returns PAM_IGNORE for it \
+             (a fingerprint wait there would stall password entry), and screen \
+             unlock runs through the daemon instead — 'immurok-cli settings set \
+             screen on'. Installable services: {}. Use 'pam remove gdm-password' \
+             to strip a line left by an older version.",
+            managed.join(", ")
+        ));
+    }
+    Some(format!("Unknown PAM service '{}'. Installable services: {}.", service, managed.join(", ")))
+}
+
 /// 经 pkexec 跑 immurok-pam-helper，一次处理多个服务。
 pub fn run_helper(action: &str, services: &[&str]) {
+    for svc in services {
+        if let Some(why) = explain_rejected_add(action, svc) {
+            eprintln!("\x1b[31m{}\x1b[0m", why);
+            std::process::exit(1);
+        }
+    }
     let helper = match find_helper() {
         Some(h) => h,
         None => {
@@ -133,6 +155,19 @@ pub fn run_helper(action: &str, services: &[&str]) {
 mod tests {
     use super::*;
     use immurok_client::pam::helper_output_has_error;
+
+    #[test]
+    fn add_explains_why_gdm_password_is_refused() {
+        let why = explain_rejected_add("add", "gdm-password").expect("should be refused");
+        assert!(why.contains("PAM_IGNORE"));
+        assert!(why.contains("sudo") && why.contains("polkit-1"));
+        // remove must stay reachable for legacy machines.
+        assert_eq!(explain_rejected_add("remove", "gdm-password"), None);
+        // managed services pass through untouched.
+        assert_eq!(explain_rejected_add("add", "sudo"), None);
+        assert_eq!(explain_rejected_add("add", "polkit-1"), None);
+        assert!(explain_rejected_add("add", "login").is_some());
+    }
 
     #[test]
     fn derives_from_toggles() {

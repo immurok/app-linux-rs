@@ -498,8 +498,6 @@ fn draw_pam_summary(f: &mut Frame, app: &App, area: Rect) {
         pam_chip("sudo", app.pam_sudo),
         Span::raw("   "),
         pam_chip("polkit", app.pam_polkit),
-        Span::raw("   "),
-        pam_chip("gdm", app.pam_screen),
         Span::styled("      ❬3❭ manage", Style::default().fg(DIM)),
     ]);
     f.render_widget(Paragraph::new(line), inner);

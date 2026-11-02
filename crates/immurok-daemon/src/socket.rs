@@ -1080,10 +1080,20 @@ async fn forget_session_bond(coord: &Arc<Coordinator>) {
     }
 }
 
-/// Drop this host's pairing material. Idempotent.
+/// Drop this host's pairing material *and* everything derived from it.
+/// Idempotent.
 async fn clear_local_pairing(coord: &Arc<Coordinator>) {
     let _ = immurok_common::security::clear_pairing();
     *coord.pairing.write().await = None;
+    // The key cache belongs to the device we were paired with, and no reader
+    // checks that: the GUI keys page, `imk LIST/GET ssh` and the SSH agent
+    // all serve `ssh_keys.json` / `key_names.json` straight off disk. Left
+    // behind, the next device inherits the previous one's OTP/SSH entries —
+    // and the surviving digest file can make the fresh device's KEY_COUNT
+    // read as a cache *hit*, so the stale entries never get re-read away.
+    if let Err(e) = crate::keystore::clear_caches(&coord.state_dir) {
+        warn!("Could not clear key cache on unpair: {}", e);
+    }
     // Both verification flags derive from the shared key we just dropped;
     // leaving them set would keep a stale "device verified" badge and, worse,
     // keep claiming one of the device's slots is ours.

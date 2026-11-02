@@ -15,6 +15,17 @@ use crate::setup_wizard;
 pub struct MainWindow;
 
 impl MainWindow {
+    /// Window and header-bar title, carrying the app version.
+    ///
+    /// The version is read from the crate rather than written out, so it can
+    /// never drift. Showing it is also the quickest way to spot a resident
+    /// instance still running a replaced binary (the case
+    /// `scripts/verify-fresh.sh` guards at install time): the title bar shows
+    /// the old version.
+    fn title() -> String {
+        format!("immurok app v{}", env!("CARGO_PKG_VERSION"))
+    }
+
     pub fn present_for(app: &adw::Application) {
         if let Some(existing) = app.windows().into_iter().find(|w| w.widget_name() == "main") {
             existing.present();
@@ -22,7 +33,7 @@ impl MainWindow {
         }
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("immurok")
+            .title(Self::title())
             .default_width(900)
             .default_height(620)
             .build();
@@ -232,4 +243,26 @@ fn build_sidebar(stack: &adw::ViewStack) -> gtk::ListBox {
         list.select_row(Some(&first));
     }
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MainWindow;
+
+    /// Pins the shape the user asked for ("immurok app v<version>") and that
+    /// the version comes from the crate — a hardcoded string here would go
+    /// stale on the next release without anything noticing.
+    #[test]
+    fn title_carries_the_crate_version() {
+        let title = MainWindow::title();
+        assert_eq!(title, format!("immurok app v{}", env!("CARGO_PKG_VERSION")));
+        assert!(title.starts_with("immurok app v"));
+        // A version looks like a version: at least one dot between digits.
+        let version = title.trim_start_matches("immurok app v");
+        assert!(
+            version.split('.').count() >= 2
+                && version.split('.').all(|p| p.chars().next().is_some_and(|c| c.is_ascii_digit())),
+            "unexpected version in title: {title}"
+        );
+    }
 }

@@ -250,10 +250,11 @@ pub struct PamService {
     pub service: &'static str,
 }
 
+// 不含 gdm-password：模块对它直接 PAM_IGNORE（pam/fp_policy.h），锁屏指纹
+// 走 daemon 的 loginctl unlock-session，装那行什么也不会发生。
 pub const PAM_SERVICES: &[PamService] = &[
     PamService { display: "sudo",         service: "sudo" },
     PamService { display: "polkit",       service: "polkit-1" },
-    PamService { display: "screen (gdm)", service: "gdm-password" },
 ];
 
 /// TUI application state.
@@ -292,7 +293,6 @@ pub struct App {
     pub ssh_takeover: bool,
     pub pam_sudo: bool,
     pub pam_polkit: bool,
-    pub pam_screen: bool,
 
     // UI state
     pub tab: Tab,
@@ -413,7 +413,6 @@ impl App {
             ssh_takeover: false,
             pam_sudo: false,
             pam_polkit: false,
-            pam_screen: false,
             tab: Tab::Dashboard,
             mode: Mode::Normal,
             busy: false,
@@ -636,7 +635,6 @@ impl App {
         // PAM status
         self.pam_sudo = immurok_common::pam::pam_line_present("sudo");
         self.pam_polkit = immurok_common::pam::pam_line_present("polkit-1");
-        self.pam_screen = immurok_common::pam::pam_line_present("gdm-password");
 
         // Key cache (cheap — one socket round-trip to the daemon)
         self.refresh_keys();
@@ -1849,7 +1847,6 @@ impl App {
         match PAM_SERVICES.get(idx).map(|s| s.service) {
             Some("sudo") => self.pam_sudo,
             Some("polkit-1") => self.pam_polkit,
-            Some("gdm-password") => self.pam_screen,
             _ => false,
         }
     }

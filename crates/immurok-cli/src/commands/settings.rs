@@ -64,11 +64,12 @@ pub fn run_show() {
     // Check PAM installation status
     println!();
     println!("PAM status:");
-    for (service, label) in &[
-        ("sudo", "sudo"),
-        ("polkit-1", "polkit"),
-        ("gdm-password", "screen"),
-    ] {
+    // 只列真正经过模块的服务。曾经有一行 ("gdm-password", "screen")，但它
+    // 两头都不对：模块对 gdm-password 直接 PAM_IGNORE（pam/fp_policy.h），
+    // 而「锁屏解锁」本身是 daemon 的 unlock_screen 开关（走 loginctl
+    // unlock-session），跟 PAM 配置没关系 —— 印在 PAM 一节里只会让人以为
+    // 锁屏解锁没装上。
+    for (service, label) in &[("sudo", "sudo"), ("polkit-1", "polkit")] {
         let installed = immurok_common::pam::pam_line_present(service);
         let state = if installed {
             "\x1b[32minstalled\x1b[0m"
