@@ -53,6 +53,7 @@ install -Dm755 scripts/immurok-auth-dialog   "$BIN_DIR/immurok-auth-dialog"
 install -Dm755 scripts/immurok-pam-helper    "$HELPER"
 install -Dm755 scripts/ble-notify-helper.py  "$BIN_DIR/ble-notify-helper.py"
 install -Dm755 target/release/immurok-session-agent "$BIN_DIR/immurok-session-agent"
+install -Dm644 crates/immurok-gui/locales/app.json /usr/local/share/immurok/locales/app.json
 
 # GUI 是可选构建产物（缺 GTK 开发头时 Makefile 会跳过）。
 if [ -x target/release/immurok-gui ]; then

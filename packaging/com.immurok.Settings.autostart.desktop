@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=immurok quick-fill
+Name[zh_CN]=immurok 快速填充
 Comment=Keeps the immurok quick-fill panel one hotkey away
+Comment[zh_CN]=让 immurok 快速填充面板随时可通过快捷键打开
 Exec=immurok-gui --gapplication-service
 Terminal=false
 NoDisplay=true
