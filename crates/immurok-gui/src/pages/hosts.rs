@@ -13,6 +13,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::hosts::{clear_other_slot, clear_own_slot, HostSlots};
 use immurok_client::status::DeviceStatus;
@@ -27,9 +28,13 @@ use super::{confirm, run_blocking};
 // Shown on the other computer's slot card when there is no button to offer:
 // the slot is empty, or it is taken and this computer is not paired yet (the
 // firmware refuses SLOT:CLEAR:<n> from an unpaired host).
-const EMPTY_SLOT_HINT: &str = "To fill this slot, open immurok on that computer and click \"Link This Computer\".";
-const FOREIGN_SLOT_HINT: &str =
-    "Linked to another computer. Link this computer first to manage this slot.";
+fn empty_slot_hint() -> String {
+    t!("device.empty_slot_hint").to_string()
+}
+
+fn foreign_slot_hint() -> String {
+    t!("device.foreign_slot_hint").to_string()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -62,16 +67,21 @@ impl HostCard {
 
         let icon = gtk::Image::from_icon_name("computer-symbolic");
         icon.set_pixel_size(36);
-        let title = gtk::Label::new(Some(&format!("Host {n}")));
+        let title_text = t!("device.host_title", n = n).to_string();
+        let title = gtk::Label::new(Some(&title_text));
         title.add_css_class("heading");
-        let badge = gtk::Label::builder().label("This computer").visible(false).build();
+        let badge = gtk::Label::builder()
+            .label(t!("device.this_computer").to_string())
+            .visible(false)
+            .build();
         badge.add_css_class("caption");
         badge.add_css_class("accent");
-        let state = gtk::Label::new(Some("○ Not linked"));
+        let state = gtk::Label::new(Some(&t!("device.not_linked").to_string()));
         state.add_css_class("dim-label");
         let action = gtk::Button::builder().visible(false).halign(gtk::Align::Center).build();
+        let empty_hint = empty_slot_hint();
         let other_hint = gtk::Label::builder()
-            .label(EMPTY_SLOT_HINT)
+            .label(&empty_hint)
             .wrap(true)
             .justify(gtk::Justification::Center)
             .visible(false)
@@ -89,7 +99,12 @@ impl HostCard {
 
     fn show(&self, bound: bool, mine: bool, this_computer: bool) {
         self.badge.set_visible(this_computer);
-        self.state.set_text(if bound { "● Linked" } else { "○ Not linked" });
+        let state = if bound {
+            t!("device.linked").to_string()
+        } else {
+            t!("device.not_linked").to_string()
+        };
+        self.state.set_text(&state);
         if bound {
             self.icon.add_css_class("accent");
         } else {
@@ -103,14 +118,15 @@ impl HostCard {
         };
         self.pending.set(action);
         self.action.set_visible(action.is_some());
-        self.other_hint.set_text(EMPTY_SLOT_HINT);
+        self.other_hint.set_text(&empty_slot_hint());
         self.other_hint.set_visible(!mine && !bound);
         if let Some(a) = action {
-            self.action.set_label(match a {
-                Action::Pair => "Link This Computer",
-                Action::Unpair => "Unlink",
-                Action::Unbind(_) => "Unlink",
-            });
+            let label = match a {
+                Action::Pair => t!("device.link").to_string(),
+                Action::Unpair => t!("device.unlink").to_string(),
+                Action::Unbind(_) => t!("device.unlink").to_string(),
+            };
+            self.action.set_label(&label);
         }
     }
 
@@ -119,13 +135,13 @@ impl HostCard {
     fn show_foreign(&self) {
         self.pending.set(None);
         self.action.set_visible(false);
-        self.other_hint.set_text(FOREIGN_SLOT_HINT);
+        self.other_hint.set_text(&foreign_slot_hint());
         self.other_hint.set_visible(true);
     }
 
     fn show_unbind(&self, n: u8) {
         self.pending.set(Some(Action::Unbind(n)));
-        self.action.set_label("Unlink");
+        self.action.set_label(&t!("device.unlink").to_string());
         self.action.set_visible(true);
         self.other_hint.set_visible(false);
     }
@@ -149,12 +165,18 @@ pub struct HostsGroup {
 
 impl HostsGroup {
     pub fn new(toasts: &adw::ToastOverlay) -> Rc<Self> {
-        let group = adw::PreferencesGroup::builder().title("Two Hosts").build();
+        let group = adw::PreferencesGroup::builder()
+            .title(t!("device.two_hosts").to_string())
+            .build();
 
         let simple = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let simple_label = gtk::Label::builder().wrap(true).xalign(0.0).build();
         simple_label.add_css_class("dim-label");
-        let simple_button = gtk::Button::builder().label("Link This Computer").halign(gtk::Align::Start).visible(false).build();
+        let simple_button = gtk::Button::builder()
+            .label(t!("device.link").to_string())
+            .halign(gtk::Align::Start)
+            .visible(false)
+            .build();
         simple.append(&simple_label);
         simple.append(&simple_button);
 
@@ -214,7 +236,7 @@ impl HostsGroup {
                 }
             }
         });
-        this.simple_label.set_text("Connecting to daemon…");
+        this.simple_label.set_text(&t!("device.connecting").to_string());
         this
     }
 
@@ -249,7 +271,7 @@ impl HostsGroup {
             return;
         }
         self.stack.set_visible_child_name("simple");
-        self.simple_label.set_text("Daemon unavailable.");
+        self.simple_label.set_text(&t!("device.daemon_unavailable").to_string());
         self.simple_button.set_visible(false);
         self.hint.set_text("");
     }
@@ -264,30 +286,31 @@ impl HostsGroup {
             self.simple_label.set_text(label);
             self.simple_pending.set(action);
             self.simple_button.set_visible(action.is_some());
-            self.simple_button.set_label(match action {
-                Some(Action::Unpair) => "Unlink",
-                _ => "Link This Computer",
-            });
+            let label = match action {
+                Some(Action::Unpair) => t!("device.unlink").to_string(),
+                _ => t!("device.link").to_string(),
+            };
+            self.simple_button.set_label(&label);
             self.hint.set_text("");
         };
 
         if !connected {
             simple_mode(
-                "Device not connected. Link status will appear once connected.",
+                &t!("device.not_connected").to_string(),
                 paired.then_some(Action::Unpair),
             );
             return;
         }
         let Some(slots) = slots else {
             simple_mode(
-                "Host status unavailable.",
+                &t!("device.host_status_unavailable").to_string(),
                 Some(if paired { Action::Unpair } else { Action::Pair }),
             );
             return;
         };
         if !slots.supported {
             simple_mode(
-                "This firmware does not support two hosts.",
+                &t!("device.no_two_hosts").to_string(),
                 Some(if paired { Action::Unpair } else { Action::Pair }),
             );
             return;
@@ -300,7 +323,7 @@ impl HostsGroup {
         // a foreign — possibly empty — slot as ours and offers Unbind on
         // our own pairing.
         if paired && slots.mine.is_none() {
-            simple_mode("Could not verify which host slot belongs to this computer.", Some(Action::Unpair));
+            simple_mode(&t!("device.host_unverified").to_string(), Some(Action::Unpair));
             return;
         }
         // Not paired: the slot the device is presenting is where pairing
@@ -322,11 +345,12 @@ impl HostsGroup {
             }
         }
         self.stack.set_visible_child_name("cards");
-        self.hint.set_text(if slots.both_bound() {
-            "Both host slots are in use. To swap one out, unlink it on that computer first."
+        let hint = if slots.both_bound() {
+            t!("device.both_slots").to_string()
         } else {
-            "This device can be linked to up to two computers. Touch the switch fingerprint to move between them."
-        });
+            t!("device.dual_hint").to_string()
+        };
+        self.hint.set_text(&hint);
     }
 
     fn set_busy(&self, busy: bool) {
@@ -358,9 +382,9 @@ impl HostsGroup {
     async fn unpair(self: &Rc<Self>, win: &gtk::Window) {
         if !confirm(
             win,
-            "Unlink from this computer?",
-            "The device clears this computer's host slot and the link key stored here is deleted. Fingerprints and keys on the device, and the other host's link, are not affected.",
-            "Unlink",
+            &t!("device.confirm_unlink_title").to_string(),
+            &t!("device.confirm_unlink_body").to_string(),
+            &t!("device.unlink").to_string(),
         )
         .await
         {
@@ -370,7 +394,7 @@ impl HostsGroup {
         let r = run_blocking(clear_own_slot).await;
         match r {
             Some(Ok(())) => {
-                self.toast("Unlinked");
+                self.toast(&t!("device.unlinked").to_string());
                 let mut s = settings_store::load();
                 s.clear_fingerprint_names();
                 // The device has to be linked again before anything works,
@@ -378,7 +402,7 @@ impl HostsGroup {
                 s.setup_completed = false;
                 let _ = settings_store::save(&s);
             }
-            Some(Err(e)) => self.toast(&format!("Unlink failed: {}", glib::markup_escape_text(&friendly(&e)))),
+            Some(Err(e)) => self.toast(&t!("device.unlink_failed", error = glib::markup_escape_text(&friendly(&e))).to_string()),
             None => {}
         }
         self.set_busy(false);
@@ -393,8 +417,8 @@ impl HostsGroup {
         // The guide keeps the failure explanation on screen until the user
         // closes it, so only the outcome is echoed here.
         match link_guide::run(&win).await {
-            Ok(()) => self.toast("Linked"),
-            Err(_) => self.toast("Linking failed"),
+            Ok(()) => self.toast(&t!("device.linked_toast").to_string()),
+            Err(_) => self.toast(&t!("device.linking_failed").to_string()),
         }
         self.set_busy(false);
     }
@@ -402,9 +426,9 @@ impl HostsGroup {
     async fn unbind(self: &Rc<Self>, win: &gtk::Window, n: u8) {
         let ok = confirm(
             win,
-            &format!("Unlink Host {n}?"),
-            "That computer will no longer be able to authenticate with this device until it links again. Requires one touch of an enrolled finger.",
-            "Unlink",
+            &t!("device.host_unlink_title", n = n).to_string(),
+            &t!("device.host_unlink_body").to_string(),
+            &t!("device.unlink").to_string(),
         )
         .await;
         if !ok {
@@ -414,12 +438,12 @@ impl HostsGroup {
         let r = gate_dialog::run(
             win,
             &format!("Unlink Host {n}"),
-            "Touch an enrolled finger on the device to confirm unlinking the other host.",
+            &t!("device.touch_unlink").to_string(),
             move || clear_other_slot(n),
         )
         .await;
         match r {
-            Some(Ok(())) => self.toast(&format!("Host {n} unlinked")),
+            Some(Ok(())) => self.toast(&t!("device.host_unlinked", n = n).to_string()),
             Some(Err(e)) => {
                 self.toast(&format!("Unlink failed: {}", glib::markup_escape_text(&friendly(&e))))
             }

@@ -13,6 +13,7 @@ use libadwaita as adw;
 
 use immurok_client::status::{set_setting, SettingKey, Settings};
 
+use crate::i18n::TEXT;
 use super::run_blocking;
 
 pub struct FeaturesPage {
@@ -25,19 +26,13 @@ impl FeaturesPage {
     pub fn new(toasts: &adw::ToastOverlay) -> Rc<Self> {
         let page = adw::PreferencesPage::new();
         let group = adw::PreferencesGroup::builder()
-            .title("Features")
-            .description("Each toggle takes effect immediately.")
+            .title(TEXT.feature_title())
+            .description(TEXT.feature_description())
             .build();
         let mut switches = Vec::new();
-        for (key, title, subtitle) in [
-            (SettingKey::UnlockSudo, "sudo with fingerprint", "Touch the device instead of typing your password for sudo"),
-            (SettingKey::UnlockPolkit, "System authorization (polkit)", "Touch the device for graphical authorization prompts"),
-            (SettingKey::UnlockScreen, "Unlock screen", "Touch the device to unlock the lock screen"),
-            (SettingKey::LockScreen, "Long-press to lock", "Long-press the sensor to lock the screen"),
-            (SettingKey::SshTakeover, "SSH agent takeover", "Let ssh use the keys on the device"),
-        ] {
+        for (key, title, subtitle) in TEXT.feature_rows() {
             let sw = gtk::Switch::builder().valign(gtk::Align::Center).build();
-            let row = adw::ActionRow::builder().title(title).subtitle(subtitle).build();
+            let row = adw::ActionRow::builder().title(&title).subtitle(&subtitle).build();
             row.add_suffix(&sw);
             row.set_activatable_widget(Some(&sw));
             group.add(&row);
@@ -84,9 +79,10 @@ impl FeaturesPage {
                     match run_blocking(move || set_setting(key, wanted)).await {
                         Some(Ok(())) => sw.set_state(wanted),
                         Some(Err(e)) => {
+                            let error = glib::markup_escape_text(&e);
                             toasts.add_toast(adw::Toast::new(&format!(
-                                "Failed to save setting: {}",
-                                glib::markup_escape_text(&e)
+                                "{}",
+                                TEXT.feature_save_failed(error.as_str())
                             )));
                             sw.set_active(!wanted);
                         }
