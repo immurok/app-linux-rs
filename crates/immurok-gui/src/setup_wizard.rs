@@ -31,6 +31,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::fingerprint::{fp_list, FpSlots};
 use immurok_client::pam::{run_helper, services_to_repair, PamError};
@@ -53,14 +54,14 @@ pub enum Step {
 }
 
 impl Step {
-    fn title(self) -> &'static str {
+    fn title(self) -> String {
         match self {
-            Step::Welcome => "Welcome",
-            Step::Install => "Install Check",
-            Step::Bluetooth => "Bluetooth",
-            Step::Link => "Link This Computer",
-            Step::Fingerprint => "Add Fingerprint",
-            Step::Finish => "Done",
+            Step::Welcome => t!("setup.step.welcome").to_string(),
+            Step::Install => t!("setup.step.install").to_string(),
+            Step::Bluetooth => t!("setup.step.bluetooth").to_string(),
+            Step::Link => t!("setup.step.link").to_string(),
+            Step::Fingerprint => t!("setup.step.fingerprint").to_string(),
+            Step::Finish => t!("setup.step.finish").to_string(),
         }
     }
 
@@ -404,7 +405,7 @@ impl SetupWizard {
     fn build(app: &adw::Application) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("immurok Setup")
+            .title(t!("setup.title").to_string())
             .default_width(720)
             .default_height(540)
             .build();
@@ -446,21 +447,25 @@ impl SetupWizard {
         content.set_vexpand(true);
         content.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
 
-        let (welcome, _) = page(Step::Welcome, "Welcome to immurok");
+        let welcome_title = t!("setup.step.welcome").to_string();
+        let (welcome, _) = page(Step::Welcome, &welcome_title);
         content.add_named(&welcome, Some(Step::Welcome.name()));
 
         // install
-        let (install, install_body) = page(Step::Install, "Install Check");
+        let install_title = t!("setup.step.install").to_string();
+        let (install, install_body) = page(Step::Install, &install_title);
         let install_stack = gtk::Stack::new();
         install_stack.set_vhomogeneous(false);
         let daemon_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        let daemon_title = gtk::Label::new(Some("The immurok daemon is not running"));
+        let daemon_title_text = t!("setup.daemon_title").to_string();
+        let daemon_title = gtk::Label::new(Some(&daemon_title_text));
         daemon_title.add_css_class("heading");
         daemon_title.add_css_class("error");
         let daemon_error = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).build();
         daemon_error.add_css_class("caption");
         daemon_error.add_css_class("dim-label");
-        let daemon_cmd = gtk::Label::new(Some("sudo systemctl start immurok-daemon"));
+        let daemon_cmd_text = t!("setup.daemon_command").to_string();
+        let daemon_cmd = gtk::Label::new(Some(&daemon_cmd_text));
         daemon_cmd.set_selectable(true);
         daemon_cmd.add_css_class("monospace");
         daemon_box.append(&daemon_title);
@@ -468,11 +473,9 @@ impl SetupWizard {
         daemon_box.append(&daemon_cmd);
         install_stack.add_named(&daemon_box, Some("daemon"));
         let hooks_box = gtk::Box::new(gtk::Orientation::Vertical, 14);
-        let hooks_body = body_label(
-            "sudo and system authorization go through PAM. The package leaves /etc/pam.d alone, so the hooks \
-             are enabled here. Installing needs administrator authorization — polkit will prompt.",
-        );
-        let install_button = primary_button("Install PAM Hooks");
+        let hooks_body_text = t!("setup.hooks_body").to_string();
+        let hooks_body = body_label(&hooks_body_text);
+        let install_button = primary_button(&t!("setup.install_hooks"));
         hooks_box.append(&hooks_body);
         hooks_box.append(&install_button);
         install_stack.add_named(&hooks_box, Some("hooks"));
@@ -482,13 +485,14 @@ impl SetupWizard {
         content.add_named(&install, Some(Step::Install.name()));
 
         // bluetooth
-        let (bluetooth, bt_body) = page(Step::Bluetooth, "Connect over Bluetooth");
+        let bluetooth_title = t!("setup.connect_bluetooth").to_string();
+        let (bluetooth, bt_body) = page(Step::Bluetooth, &bluetooth_title);
         let bt_stack = gtk::Stack::new();
         bt_stack.set_vhomogeneous(false);
         let bt_waiting_box = gtk::Box::new(gtk::Orientation::Vertical, 14);
         let bt_illustration = DeviceIllustration::new(Scene::BluetoothConnect, true);
         bt_waiting_box.append(bt_illustration.widget());
-        let bt_open = primary_button("Open Bluetooth Settings");
+        let bt_open = primary_button(&t!("setup.open_bluetooth"));
         bt_waiting_box.append(&bt_open);
         let bt_waiting = StatusLine::new();
         bt_waiting_box.append(&bt_waiting.root);
@@ -503,35 +507,29 @@ impl SetupWizard {
         unsafe { bluetooth.set_data("illustration", bt_illustration) };
 
         // link
-        let (link, link_body) = page(Step::Link, "Link This Computer");
-        link_body.append(&body_label(
-            "Linking is different from the Bluetooth connection you just made: it creates an encrypted channel \
-             between the app and the device, so only this computer can use it. You'll press the button on the \
-             device once to confirm.",
-        ));
-        let link_button = primary_button("Link This Computer");
+        let link_title = t!("setup.step.link").to_string();
+        let (link, link_body) = page(Step::Link, &link_title);
+        link_body.append(&body_label(&t!("setup.link_body")));
+        let link_button = primary_button(&link_title);
         let link_status = StatusLine::new();
         link_body.append(&link_button);
         link_body.append(&link_status.root);
         content.add_named(&link, Some(Step::Link.name()));
 
         // fingerprint
-        let (fingerprint, fp_body) = page(Step::Fingerprint, "Add Your Fingerprint");
-        fp_body.append(&body_label(
-            "Just like Touch ID: repeatedly lift and rest your finger on the sensor, following the arrows to \
-             adjust the angle until the progress completes.",
-        ));
-        let fp_button = primary_button("Start Enrollment");
+        let fingerprint_title = t!("setup.add_fingerprint").to_string();
+        let (fingerprint, fp_body) = page(Step::Fingerprint, &fingerprint_title);
+        fp_body.append(&body_label(&t!("setup.fingerprint_body")));
+        let fp_button = primary_button(&t!("setup.start_enrollment"));
         let fp_status = StatusLine::new();
         fp_body.append(&fp_button);
         fp_body.append(&fp_status.root);
-        fp_body.append(&hint_card(
-            "Enroll the finger you use most (index finger or thumb). You can add more later on the Fingerprints page.",
-        ));
+        fp_body.append(&hint_card(&t!("setup.fingerprint_hint")));
         content.add_named(&fingerprint, Some(Step::Fingerprint.name()));
 
         // finish
-        let (finish, finish_body) = page(Step::Finish, "Setup Complete");
+        let finish_title = t!("setup.complete").to_string();
+        let (finish, finish_body) = page(Step::Finish, &finish_title);
         let summary_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         summary_box.set_halign(gtk::Align::Center);
         let summary = ["Bluetooth", "Link", "Fingerprint", "PAM hooks"].map(|_| {
@@ -556,10 +554,10 @@ impl SetupWizard {
         bar.set_margin_bottom(14);
         bar.set_margin_start(18);
         bar.set_margin_end(18);
-        let later = gtk::Button::builder().label("Later").build();
+        let later = gtk::Button::builder().label(t!("setup.later")).build();
         later.add_css_class("flat");
-        let back = gtk::Button::builder().label("Back").build();
-        let next = gtk::Button::builder().label("Next").build();
+        let back = gtk::Button::builder().label(t!("setup.back")).build();
+        let next = gtk::Button::builder().label(t!("setup.next")).build();
         next.add_css_class("suggested-action");
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -782,7 +780,8 @@ impl SetupWizard {
             inner.set_margin_start(6);
             inner.set_margin_end(6);
             let icon = gtk::Image::from_icon_name(s.icon());
-            let label = gtk::Label::builder().label(s.title()).xalign(0.0).hexpand(true).build();
+            let title = s.title();
+            let label = gtk::Label::builder().label(&title).xalign(0.0).hexpand(true).build();
             let check = gtk::Image::from_icon_name("object-select-symbolic");
             check.add_css_class("success");
             check.set_visible(false);
@@ -949,22 +948,22 @@ impl SetupWizard {
         self.later.set_visible(step != Step::Finish);
         match step {
             Step::Welcome => {
-                self.next.set_label("Next");
+                self.next.set_label(&t!("setup.next"));
                 self.next.set_sensitive(true);
             }
             Step::Finish => {
-                self.next.set_label("Done");
+                self.next.set_label(&t!("setup.done"));
                 self.next.set_sensitive(true);
             }
             s => {
                 if snap.complete(s) {
-                    self.next.set_label("Next");
+                    self.next.set_label(&t!("setup.next"));
                     self.next.set_sensitive(!self.busy.get());
                 } else if snap.skippable(s) {
                     self.next.set_label("Skip This Step");
                     self.next.set_sensitive(!self.busy.get());
                 } else {
-                    self.next.set_label("Next");
+                    self.next.set_label(&t!("setup.next"));
                     self.next.set_sensitive(false);
                 }
             }

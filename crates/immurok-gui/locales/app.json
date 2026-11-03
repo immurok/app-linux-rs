@@ -595,5 +595,513 @@
   "keys.delete_failed": {
     "en": "Delete failed: %{error}",
     "zh-CN": "删除失败：%{error}"
+  },
+  "keys.action.cancel": {
+    "en": "Cancel",
+    "zh-CN": "取消"
+  },
+  "keys.dialog.add_ssh": {
+    "en": "Add SSH key",
+    "zh-CN": "添加 SSH 密钥"
+  },
+  "keys.dialog.add_otp": {
+    "en": "Add OTP entry",
+    "zh-CN": "添加 OTP 条目"
+  },
+  "keys.dialog.add_api": {
+    "en": "Add API key",
+    "zh-CN": "添加 API 密钥"
+  },
+  "keys.dialog.generate": {
+    "en": "Generate on device",
+    "zh-CN": "在设备上生成"
+  },
+  "keys.dialog.add": {
+    "en": "Add",
+    "zh-CN": "添加"
+  },
+  "keys.dialog.import": {
+    "en": "Import from file…",
+    "zh-CN": "从文件导入…"
+  },
+  "keys.dialog.name": {
+    "en": "Name",
+    "zh-CN": "名称"
+  },
+  "keys.dialog.ssh_description": {
+    "en": "ECDSA P-256. The private key never leaves the device.",
+    "zh-CN": "ECDSA P-256。私钥不会离开设备。"
+  },
+  "keys.dialog.otp_description": {
+    "en": "TOTP, SHA-1, 6 digits, 30 s. Paste an otpauth:// URI into Secret to fill everything.",
+    "zh-CN": "TOTP、SHA-1、6 位、30 秒。将 otpauth:// URI 粘贴到密钥中可自动填充。"
+  },
+  "keys.dialog.service": {
+    "en": "Service",
+    "zh-CN": "服务"
+  },
+  "keys.dialog.secret": {
+    "en": "Secret",
+    "zh-CN": "密钥"
+  },
+  "keys.dialog.value": {
+    "en": "Value",
+    "zh-CN": "值"
+  },
+  "keys.dialog.touch": {
+    "en": "Touch the device…",
+    "zh-CN": "请触摸设备…"
+  },
+  "keys.dialog.name_empty": {
+    "en": "Name cannot be empty.",
+    "zh-CN": "名称不能为空。"
+  },
+  "keys.dialog.generate_failed": {
+    "en": "Generate failed: %{error}",
+    "zh-CN": "生成失败：%{error}"
+  },
+  "keys.dialog.import_failed": {
+    "en": "Import failed: %{error}",
+    "zh-CN": "导入失败：%{error}"
+  },
+  "keys.dialog.choose_private": {
+    "en": "Choose a private key file",
+    "zh-CN": "选择私钥文件"
+  },
+  "keys.dialog.unsupported_uri": {
+    "en": "Unsupported otpauth URI: only TOTP / SHA1 / 6 digits / 30 s.",
+    "zh-CN": "不支持的 otpauth URI：仅支持 TOTP / SHA1 / 6 位 / 30 秒。"
+  },
+  "keys.dialog.invalid_secret": {
+    "en": "Invalid base32 secret — check for typos.",
+    "zh-CN": "Base32 密钥无效，请检查输入。"
+  },
+  "keys.dialog.add_failed": {
+    "en": "Add failed: %{error}",
+    "zh-CN": "添加失败：%{error}"
+  },
+  "keys.dialog.choose_export": {
+    "en": "Choose an OTP export (andOTP .json or otpauth .csv)",
+    "zh-CN": "选择 OTP 导出文件（andOTP .json 或 otpauth .csv）"
+  },
+  "keys.dialog.open": {
+    "en": "Open",
+    "zh-CN": "打开"
+  },
+  "keys.dialog.import_cancel": {
+    "en": "Cancel",
+    "zh-CN": "取消"
+  },
+  "keys.dialog.import_capacity": {
+    "en": "Cannot import %{count} entries: only %{free} OTP slots remaining. Delete some entries first.",
+    "zh-CN": "无法导入 %{count} 个条目：只剩 %{free} 个 OTP 槽位。请先删除一些条目。"
+  },
+  "keys.dialog.import_skipped": {
+    "en": " (%{count} skipped: only TOTP / SHA1 / 6-digit / 30 s supported)",
+    "zh-CN": "（跳过 %{count} 个：仅支持 TOTP / SHA1 / 6 位 / 30 秒）"
+  },
+  "keys.dialog.import_confirm": {
+    "en": "Import %{count} OTP entries%{skipped}?",
+    "zh-CN": "导入 %{count} 个 OTP 条目%{skipped}？"
+  },
+  "keys.dialog.import_body": {
+    "en": "Each entry is written to the device and requires one fingerprint gate.",
+    "zh-CN": "每个条目都会写入设备，并需要通过一次指纹验证。"
+  },
+  "keys.dialog.importing": {
+    "en": "Importing…",
+    "zh-CN": "正在导入…"
+  },
+  "keys.dialog.imported": {
+    "en": "Imported %{count} entries",
+    "zh-CN": "已导入 %{count} 个条目"
+  },
+  "fingerprints.title": {
+    "en": "Fingerprints",
+    "zh-CN": "指纹"
+  },
+  "fingerprints.description": {
+    "en": "Touch the sensor to unlock and authorize sudo.",
+    "zh-CN": "触摸传感器即可解锁并授权 sudo。"
+  },
+  "fingerprints.add_switch": {
+    "en": "Add switch fingerprint",
+    "zh-CN": "添加主机切换指纹"
+  },
+  "fingerprints.test": {
+    "en": "Test",
+    "zh-CN": "测试"
+  },
+  "fingerprints.verify": {
+    "en": "Verify with an enrolled finger",
+    "zh-CN": "使用已录入的指纹验证"
+  },
+  "fingerprints.refresh": {
+    "en": "Refresh",
+    "zh-CN": "刷新"
+  },
+  "fingerprints.fetching": {
+    "en": "Fetching fingerprint info from device...",
+    "zh-CN": "正在从设备获取指纹信息…"
+  },
+  "fingerprints.not_connected": {
+    "en": "Device not connected",
+    "zh-CN": "设备未连接"
+  },
+  "fingerprints.connect_to_manage": {
+    "en": "Connect the device to manage fingerprints.",
+    "zh-CN": "连接设备后才能管理指纹。"
+  },
+  "fingerprints.switch_hint": {
+    "en": "This finger only switches hosts — it never unlocks or authenticates",
+    "zh-CN": "此指纹仅用于切换主机，不用于解锁或认证"
+  },
+  "fingerprints.delete_tooltip": {
+    "en": "Delete (requires a touch on the device)",
+    "zh-CN": "删除（需要触摸设备确认）"
+  },
+  "fingerprints.add": {
+    "en": "Add Fingerprint",
+    "zh-CN": "添加指纹"
+  },
+  "fingerprints.daemon_unavailable": {
+    "en": "Daemon unavailable: %{error}",
+    "zh-CN": "daemon 不可用：%{error}"
+  },
+  "fingerprints.add_title": {
+    "en": "Add a New Fingerprint",
+    "zh-CN": "添加新指纹"
+  },
+  "fingerprints.add_body": {
+    "en": "The device first asks you to verify with an already-enrolled finger. After that, switch to the NEW finger.",
+    "zh-CN": "设备会先要求使用已录入的指纹验证。之后，请改用新的手指。"
+  },
+  "fingerprints.start": {
+    "en": "Start",
+    "zh-CN": "开始"
+  },
+  "fingerprints.enrolled": {
+    "en": "Fingerprint enrolled successfully!",
+    "zh-CN": "指纹录入成功！"
+  },
+  "fingerprints.delete_switch_body": {
+    "en": "After this you can no longer switch between computers by touch.",
+    "zh-CN": "删除后将无法再通过触摸在电脑之间切换。"
+  },
+  "fingerprints.delete_body": {
+    "en": "This cannot be undone. You will need to enroll it again.",
+    "zh-CN": "此操作无法撤销。之后需要重新录入指纹。"
+  },
+  "fingerprints.delete_title": {
+    "en": "Delete “%{name}”?",
+    "zh-CN": "删除“%{name}”？"
+  },
+  "fingerprints.deleted": {
+    "en": "Deleted",
+    "zh-CN": "已删除"
+  },
+  "fingerprints.test_title": {
+    "en": "Test Fingerprint",
+    "zh-CN": "测试指纹"
+  },
+  "fingerprints.test_body": {
+    "en": "Touch the sensor with an enrolled finger",
+    "zh-CN": "请使用已录入的指纹触摸传感器"
+  },
+  "fingerprints.matched": {
+    "en": "Fingerprint matched",
+    "zh-CN": "指纹匹配"
+  },
+  "fingerprints.no_match": {
+    "en": "No match",
+    "zh-CN": "未匹配"
+  },
+  "pam.daemon": {
+    "en": "Daemon",
+    "zh-CN": "daemon"
+  },
+  "pam.isolation": {
+    "en": "Isolation",
+    "zh-CN": "隔离状态"
+  },
+  "pam.checking": {
+    "en": "Checking…",
+    "zh-CN": "正在检查…"
+  },
+  "pam.services": {
+    "en": "PAM services",
+    "zh-CN": "PAM 服务"
+  },
+  "pam.description": {
+    "en": "Installing or removing needs administrator authorization — polkit will prompt.",
+    "zh-CN": "安装或移除需要管理员授权，polkit 会弹出提示。"
+  },
+  "pam.install": {
+    "en": "Install",
+    "zh-CN": "安装"
+  },
+  "pam.remove": {
+    "en": "Remove",
+    "zh-CN": "移除"
+  },
+  "pam.repair": {
+    "en": "Repair",
+    "zh-CN": "修复"
+  },
+  "pam.refresh": {
+    "en": "Refresh",
+    "zh-CN": "刷新"
+  },
+  "pam.isolated": {
+    "en": "Isolated daemon — running as its own system user",
+    "zh-CN": "daemon 已隔离——以独立系统用户运行"
+  },
+  "pam.not_isolated": {
+    "en": "NOT isolated — the daemon runs as your user; any of your processes can pass sudo. Run `make install`.",
+    "zh-CN": "未隔离——daemon 以你的用户运行，你的其他进程可能通过 sudo。请运行 `make install`。"
+  },
+  "pam.unknown": {
+    "en": "Isolation unknown — daemon not reachable",
+    "zh-CN": "隔离状态未知——无法连接 daemon"
+  },
+  "pam.installed": {
+    "en": "Installed",
+    "zh-CN": "已安装"
+  },
+  "pam.not_installed": {
+    "en": "Not installed",
+    "zh-CN": "未安装"
+  },
+  "pam.needs_repair": {
+    "en": "%{count} service(s) need repair",
+    "zh-CN": "%{count} 个服务需要修复"
+  },
+  "pam.already_present": {
+    "en": "Already present for %{service}",
+    "zh-CN": "%{service} 已存在"
+  },
+  "pam.not_present": {
+    "en": "Not present for %{service}",
+    "zh-CN": "%{service} 不存在"
+  },
+  "pam.installed_for": {
+    "en": "Installed for %{service}",
+    "zh-CN": "已为 %{service} 安装"
+  },
+  "pam.removed_from": {
+    "en": "Removed from %{service}",
+    "zh-CN": "已从 %{service} 移除"
+  },
+  "pam.authorization_cancelled": {
+    "en": "Authorization cancelled",
+    "zh-CN": "授权已取消"
+  },
+  "pam.helper_failed": {
+    "en": "PAM helper failed",
+    "zh-CN": "PAM helper 执行失败"
+  },
+  "pam.no_agent_title": {
+    "en": "No authentication agent",
+    "zh-CN": "没有认证代理"
+  },
+  "pam.no_agent_body": {
+    "en": "No polkit authentication agent is running. Start your desktop's polkit agent, or run `immurok-cli pam install <service>` in a terminal.",
+    "zh-CN": "没有运行中的 polkit 认证代理。请启动桌面的 polkit 代理，或在终端运行 `immurok-cli pam install <service>`。"
+  },
+  "pam.helper_not_found_title": {
+    "en": "Helper not found",
+    "zh-CN": "找不到 helper"
+  },
+  "pam.helper_not_found_body": {
+    "en": "immurok-pam-helper was not found. Re-run `make install`.",
+    "zh-CN": "找不到 immurok-pam-helper。请重新运行 `make install`。"
+  },
+  "pam.close": {
+    "en": "Close",
+    "zh-CN": "关闭"
+  },
+  "pam.could_not_run": {
+    "en": "Could not run pkexec: %{error}",
+    "zh-CN": "无法运行 pkexec：%{error}"
+  },
+  "logs.connecting": {
+    "en": "● Connecting…",
+    "zh-CN": "● 正在连接…"
+  },
+  "logs.live": {
+    "en": "● Live",
+    "zh-CN": "● 实时"
+  },
+  "logs.paused": {
+    "en": "⏸ Paused (%{count} new lines)",
+    "zh-CN": "⏸ 已暂停（新增 %{count} 行）"
+  },
+  "logs.closed": {
+    "en": "● Stream closed",
+    "zh-CN": "● 流已关闭"
+  },
+  "logs.jump_latest": {
+    "en": "Jump to latest",
+    "zh-CN": "跳到最新"
+  },
+  "logs.reconnect": {
+    "en": "Reconnect",
+    "zh-CN": "重新连接"
+  },
+  "setup.title": {
+    "en": "immurok Setup",
+    "zh-CN": "immurok 设置"
+  },
+  "setup.step.welcome": {
+    "en": "Welcome",
+    "zh-CN": "欢迎"
+  },
+  "setup.step.install": {
+    "en": "Install Check",
+    "zh-CN": "安装检查"
+  },
+  "setup.step.bluetooth": {
+    "en": "Bluetooth",
+    "zh-CN": "蓝牙"
+  },
+  "setup.step.link": {
+    "en": "Link This Computer",
+    "zh-CN": "绑定此电脑"
+  },
+  "setup.step.fingerprint": {
+    "en": "Add Fingerprint",
+    "zh-CN": "添加指纹"
+  },
+  "setup.step.finish": {
+    "en": "Done",
+    "zh-CN": "完成"
+  },
+  "setup.next": {
+    "en": "Next",
+    "zh-CN": "下一步"
+  },
+  "setup.back": {
+    "en": "Back",
+    "zh-CN": "返回"
+  },
+  "setup.later": {
+    "en": "Later",
+    "zh-CN": "稍后"
+  },
+  "setup.done": {
+    "en": "Done",
+    "zh-CN": "完成"
+  },
+  "setup.welcome.unlock": {
+    "en": "Unlock the screen",
+    "zh-CN": "解锁屏幕"
+  },
+  "setup.welcome.sudo": {
+    "en": "Authorize sudo",
+    "zh-CN": "授权 sudo"
+  },
+  "setup.welcome.polkit": {
+    "en": "Authorize system prompts (polkit)",
+    "zh-CN": "授权系统提示（polkit）"
+  },
+  "setup.welcome.hint": {
+    "en": "You'll need your immurok fingerprint device (charged). Keep it near this computer throughout setup.",
+    "zh-CN": "你需要准备已充电的 immurok 指纹设备。设置期间请将它放在电脑附近。"
+  },
+  "setup.welcome.time": {
+    "en": "Takes about 3 minutes — click \"Later\" to exit anytime.",
+    "zh-CN": "大约需要 3 分钟——随时可以点击“稍后”退出。"
+  },
+  "setup.daemon_title": {
+    "en": "The immurok daemon is not running",
+    "zh-CN": "immurok daemon 未运行"
+  },
+  "setup.daemon_command": {
+    "en": "sudo systemctl start immurok-daemon",
+    "zh-CN": "sudo systemctl start immurok-daemon"
+  },
+  "setup.hooks_body": {
+    "en": "sudo and system authorization go through PAM. The package leaves /etc/pam.d alone, so the hooks are enabled here. Installing needs administrator authorization — polkit will prompt.",
+    "zh-CN": "sudo 和系统授权通过 PAM 完成。安装包不会自动修改 /etc/pam.d，因此需要在这里启用。安装需要管理员授权，polkit 会弹出提示。"
+  },
+  "setup.install_hooks": {
+    "en": "Install PAM Hooks",
+    "zh-CN": "安装 PAM Hook"
+  },
+  "setup.connect_bluetooth": {
+    "en": "Connect over Bluetooth",
+    "zh-CN": "通过蓝牙连接"
+  },
+  "setup.open_bluetooth": {
+    "en": "Open Bluetooth Settings",
+    "zh-CN": "打开蓝牙设置"
+  },
+  "setup.link_body": {
+    "en": "Linking is different from the Bluetooth connection you just made: it creates an encrypted channel between the app and the device, so only this computer can use it. You'll press the button on the device once to confirm.",
+    "zh-CN": "绑定不同于刚才建立的蓝牙连接：它会在应用和设备之间建立加密通道，只有这台电脑可以使用设备。你需要按一下设备按钮进行确认。"
+  },
+  "setup.add_fingerprint": {
+    "en": "Add Your Fingerprint",
+    "zh-CN": "添加你的指纹"
+  },
+  "setup.fingerprint_body": {
+    "en": "Just like Touch ID: repeatedly lift and rest your finger on the sensor, following the arrows to adjust the angle until the progress completes.",
+    "zh-CN": "就像 Touch ID 一样：反复抬起并按下手指，按照箭头调整角度，直到进度完成。"
+  },
+  "setup.start_enrollment": {
+    "en": "Start Enrollment",
+    "zh-CN": "开始录入"
+  },
+  "setup.fingerprint_hint": {
+    "en": "Enroll the finger you use most (index finger or thumb). You can add more later on the Fingerprints page.",
+    "zh-CN": "建议录入最常用的手指（食指或拇指）。之后可以在“指纹”页面添加更多指纹。"
+  },
+  "setup.complete": {
+    "en": "Setup Complete",
+    "zh-CN": "设置完成"
+  },
+  "setup.summary.bluetooth": {
+    "en": "Bluetooth connected",
+    "zh-CN": "蓝牙已连接"
+  },
+  "setup.summary.bluetooth_off": {
+    "en": "Bluetooth not connected",
+    "zh-CN": "蓝牙未连接"
+  },
+  "setup.summary.linked": {
+    "en": "Linked to this computer",
+    "zh-CN": "已绑定到这台电脑"
+  },
+  "setup.summary.not_linked": {
+    "en": "Not linked",
+    "zh-CN": "未绑定"
+  },
+  "setup.summary.fingerprint": {
+    "en": "%{count} fingerprint(s) enrolled",
+    "zh-CN": "已录入 %{count} 个指纹"
+  },
+  "setup.summary.no_fingerprint": {
+    "en": "No fingerprint enrolled",
+    "zh-CN": "未录入指纹"
+  },
+  "setup.summary.pam": {
+    "en": "PAM hooks installed",
+    "zh-CN": "PAM Hook 已安装"
+  },
+  "setup.summary.pam_missing": {
+    "en": "PAM hooks not installed",
+    "zh-CN": "PAM Hook 未安装"
+  },
+  "quickfill.title": {
+    "en": "immurok quick-fill",
+    "zh-CN": "immurok 快速填充"
+  },
+  "quickfill.search": {
+    "en": "Search OTP / API / SSH…",
+    "zh-CN": "搜索 OTP / API / SSH…"
+  },
+  "quickfill.touch": {
+    "en": "Touch the device to read “%{name}”…",
+    "zh-CN": "请触摸设备读取“%{name}”…"
   }
 }

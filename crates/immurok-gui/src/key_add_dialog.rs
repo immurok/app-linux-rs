@@ -25,6 +25,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::keys::{add_api, add_otp, generate_ssh, import_ssh, KeyCategory};
 use immurok_client::keys_import::{base32_decode, otpauth_secret_field, parse_otp_import_file, parse_otpauth_uri, OtpEntry};
@@ -96,7 +97,7 @@ fn shell(parent: &impl IsA<gtk::Window>, title: &str, primary: &str, secondary: 
     buttons.set_margin_end(24);
     buttons.set_margin_bottom(18);
     buttons.set_margin_top(6);
-    let cancel = gtk::Button::builder().label("Cancel").build();
+    let cancel = gtk::Button::builder().label(t!("keys.action.cancel")).build();
     let secondary_btn = gtk::Button::builder().label(secondary.unwrap_or("")).visible(secondary.is_some()).build();
     let primary_btn = gtk::Button::builder().label(primary).build();
     primary_btn.add_css_class("suggested-action");
@@ -132,7 +133,8 @@ impl Shell {
         self.primary.set_sensitive(!on);
         self.secondary.set_sensitive(!on);
         self.cancel.set_sensitive(!on);
-        self.primary.set_label(if on { "Touch the device…" } else { label_idle });
+        let label = if on { t!("keys.dialog.touch").to_string() } else { label_idle.to_string() };
+        self.primary.set_label(&label);
         if on {
             self.error.set_visible(false);
         }
@@ -160,9 +162,23 @@ pub async fn run(parent: &impl IsA<gtk::Window>, cat: KeyCategory) -> Option<Str
     let (done_tx, done_rx) = async_channel::bounded::<()>(1);
 
     let sh = match cat {
-        KeyCategory::Ssh => shell(parent, "Add SSH key", "Generate on device", Some("Import from file…")),
-        KeyCategory::Otp => shell(parent, "Add OTP entry", "Add", Some("Import from file…")),
-        KeyCategory::Api => shell(parent, "Add API key", "Add", None),
+        KeyCategory::Ssh => {
+            let title = t!("keys.dialog.add_ssh").to_string();
+            let primary = t!("keys.dialog.generate").to_string();
+            let secondary = t!("keys.dialog.import").to_string();
+            shell(parent, &title, &primary, Some(&secondary))
+        }
+        KeyCategory::Otp => {
+            let title = t!("keys.dialog.add_otp").to_string();
+            let primary = t!("keys.dialog.add").to_string();
+            let secondary = t!("keys.dialog.import").to_string();
+            shell(parent, &title, &primary, Some(&secondary))
+        }
+        KeyCategory::Api => {
+            let title = t!("keys.dialog.add_api").to_string();
+            let primary = t!("keys.dialog.add").to_string();
+            shell(parent, &title, &primary, None)
+        }
     };
     let sh = Rc::new(sh);
     // The only strong `Rc<Shell>` that lives for the dialog's whole lifetime
@@ -197,9 +213,10 @@ pub async fn run(parent: &impl IsA<gtk::Window>, cat: KeyCategory) -> Option<Str
         });
     }
 
+    let name_label = t!("keys.dialog.name").to_string();
     let name = entry_row(
         &sh.group,
-        "Name",
+        &name_label,
         Some(match cat {
             KeyCategory::Ssh => NAME_LEN_SSH - 1,
             KeyCategory::Otp => NAME_LEN_OTP - 1,
@@ -210,7 +227,8 @@ pub async fn run(parent: &impl IsA<gtk::Window>, cat: KeyCategory) -> Option<Str
 
     match cat {
         KeyCategory::Ssh => {
-            sh.group.set_description(Some("ECDSA P-256. The private key never leaves the device."));
+            let description = t!("keys.dialog.ssh_description").to_string();
+            sh.group.set_description(Some(&description));
             // Generate
             {
                 let (sh_weak, name, written, tx) = (sh_weak.clone(), name.clone(), written.clone(), done_tx.clone());
@@ -279,9 +297,12 @@ pub async fn run(parent: &impl IsA<gtk::Window>, cat: KeyCategory) -> Option<Str
             }
         }
         KeyCategory::Otp => {
-            sh.group.set_description(Some("TOTP, SHA-1, 6 digits, 30 s. Paste an otpauth:// URI into Secret to fill everything."));
-            let service = entry_row(&sh.group, "Service", Some(SERVICE_LEN_OTP - 1), false);
-            let secret = entry_row(&sh.group, "Secret", None, true);
+            let description = t!("keys.dialog.otp_description").to_string();
+            sh.group.set_description(Some(&description));
+            let service_label = t!("keys.dialog.service").to_string();
+            let secret_label = t!("keys.dialog.secret").to_string();
+            let service = entry_row(&sh.group, &service_label, Some(SERVICE_LEN_OTP - 1), false);
+            let secret = entry_row(&sh.group, &secret_label, None, true);
             // otpauth:// auto-fill
             {
                 let (name, service, sh_weak) = (name.clone(), service.clone(), sh_weak.clone());
