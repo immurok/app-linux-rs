@@ -1,115 +1,152 @@
 use immurok_client::enroll_hint::HintId;
+use rust_i18n::t;
 
 pub(crate) struct Catalog;
 
-pub(crate) const ENGLISH: Catalog = Catalog;
+pub(crate) const TEXT: Catalog = Catalog;
+
+pub(crate) fn init_system_locale() {
+    let values = ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"].map(|name| std::env::var(name).ok());
+    let borrowed = values.each_ref().map(|value| value.as_deref());
+    rust_i18n::set_locale(select_locale(&borrowed));
+}
+
+fn select_locale(values: &[Option<&str>]) -> &'static str {
+    let Some(value) = values
+        .iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+    else {
+        return "en";
+    };
+    for candidate in value.split(':') {
+        let normalized = candidate
+            .split(['.', '@'])
+            .next()
+            .unwrap_or(candidate)
+            .replace('_', "-")
+            .to_ascii_lowercase();
+        if normalized == "zh"
+            || normalized == "zh-cn"
+            || normalized == "zh-sg"
+            || normalized.starts_with("zh-hans")
+        {
+            return "zh-CN";
+        }
+        if normalized == "en" || normalized.starts_with("en-") {
+            return "en";
+        }
+    }
+    "en"
+}
 
 impl Catalog {
-    pub(crate) const fn enrollment_title(&self, is_switch: bool) -> &'static str {
+    pub(crate) fn enrollment_title(&self, is_switch: bool) -> String {
         if is_switch {
-            "Add switch fingerprint"
+            t!("enrollment.title.switch").to_string()
         } else {
-            "Add Fingerprint"
+            t!("enrollment.title.default").to_string()
         }
     }
 
-    pub(crate) const fn enrollment_gate_hint(&self) -> &'static str {
-        "Verify with an enrolled finger"
+    pub(crate) fn enrollment_gate_hint(&self) -> String {
+        t!("enrollment.gate_hint").to_string()
     }
 
-    pub(crate) const fn enrollment_subtitle(&self, is_switch: bool) -> &'static str {
+    pub(crate) fn enrollment_subtitle(&self, is_switch: bool) -> String {
         if is_switch {
-            "This finger will only switch between the two hosts."
+            t!("enrollment.subtitle.switch").to_string()
         } else {
-            "Press the sensor six times, shifting slightly each time."
+            t!("enrollment.subtitle.default").to_string()
         }
     }
 
-    pub(crate) const fn cancel(&self) -> &'static str {
-        "Cancel"
+    pub(crate) fn cancel(&self) -> String {
+        t!("action.cancel").to_string()
     }
 
-    pub(crate) const fn close(&self) -> &'static str {
-        "Close"
+    pub(crate) fn close(&self) -> String {
+        t!("action.close").to_string()
     }
 
-    pub(crate) const fn enrollment_hint(&self, hint: HintId) -> &'static str {
+    pub(crate) fn enrollment_hint(&self, hint: HintId) -> String {
         match hint {
-            HintId::Center => "Press finger pad on center",
-            HintId::Left => "Tilt slightly left 5–10°",
-            HintId::Right => "Tilt slightly right 5–10°",
-            HintId::TowardFingertip => "Shift slightly toward fingertip",
-            HintId::TowardWrist => "Shift slightly toward wrist",
-            HintId::BackToCenter => "Back to center, press once more",
-            HintId::HoldSteady => "Hold steady",
+            HintId::Center => t!("enrollment.hint.center").to_string(),
+            HintId::Left => t!("enrollment.hint.left").to_string(),
+            HintId::Right => t!("enrollment.hint.right").to_string(),
+            HintId::TowardFingertip => t!("enrollment.hint.toward_fingertip").to_string(),
+            HintId::TowardWrist => t!("enrollment.hint.toward_wrist").to_string(),
+            HintId::BackToCenter => t!("enrollment.hint.back_to_center").to_string(),
+            HintId::HoldSteady => t!("enrollment.hint.hold_steady").to_string(),
         }
     }
 
     pub(crate) fn enrollment_captured(&self, captured: u8, total: u8) -> String {
-        format!("Captured ({captured}/{total})")
+        t!("enrollment.progress", captured = captured, total = total).to_string()
     }
 
-    pub(crate) const fn enrollment_place_finger(&self) -> &'static str {
-        "Place your finger on the sensor..."
+    pub(crate) fn enrollment_place_finger(&self) -> String {
+        t!("enrollment.state.place_finger").to_string()
     }
 
-    pub(crate) const fn enrollment_lift_finger(&self) -> &'static str {
-        "Lift your finger, then press again..."
+    pub(crate) fn enrollment_lift_finger(&self) -> String {
+        t!("enrollment.state.lift_finger").to_string()
     }
 
-    pub(crate) const fn enrollment_overlap(&self) -> &'static str {
-        "Too similar — shift your finger and press again"
+    pub(crate) fn enrollment_overlap(&self) -> String {
+        t!("enrollment.state.overlap").to_string()
     }
 
-    pub(crate) const fn enrollment_processing(&self) -> &'static str {
-        "Processing..."
+    pub(crate) fn enrollment_processing(&self) -> String {
+        t!("enrollment.state.processing").to_string()
     }
 
-    pub(crate) const fn enrollment_disconnected(&self) -> &'static str {
-        "Device disconnected before enrollment finished. Reconnect the device and try again."
+    pub(crate) fn enrollment_disconnected(&self) -> String {
+        t!("enrollment.error.disconnected").to_string()
     }
 
-    pub(crate) const fn enrollment_failed(&self) -> &'static str {
-        "Enrollment failed. Please try again."
+    pub(crate) fn enrollment_failed(&self) -> String {
+        t!("enrollment.error.failed").to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static LOCALE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn enrollment_copy_covers_both_fingerprint_kinds() {
-        assert_eq!(ENGLISH.enrollment_title(false), "Add Fingerprint");
-        assert_eq!(ENGLISH.enrollment_title(true), "Add switch fingerprint");
-        assert_eq!(
-            ENGLISH.enrollment_subtitle(false),
-            "Press the sensor six times, shifting slightly each time."
-        );
-        assert_eq!(
-            ENGLISH.enrollment_subtitle(true),
-            "This finger will only switch between the two hosts."
-        );
+    fn selects_supported_system_locales() {
+        assert_eq!(select_locale(&[Some("zh_CN.UTF-8")]), "zh-CN");
+        assert_eq!(select_locale(&[Some("zh-Hans-CN")]), "zh-CN");
+        assert_eq!(select_locale(&[Some("fr_FR:zh_CN")]), "zh-CN");
+        assert_eq!(select_locale(&[Some("zh_TW.UTF-8")]), "en");
+        assert_eq!(select_locale(&[Some("en_US.UTF-8")]), "en");
+        assert_eq!(select_locale(&[Some("C.UTF-8")]), "en");
+        assert_eq!(select_locale(&[]), "en");
     }
 
     #[test]
-    fn enrollment_hints_have_english_copy() {
-        let cases = [
-            (HintId::Center, "Press finger pad on center"),
-            (HintId::Left, "Tilt slightly left 5–10°"),
-            (HintId::Right, "Tilt slightly right 5–10°"),
-            (HintId::TowardFingertip, "Shift slightly toward fingertip"),
-            (HintId::TowardWrist, "Shift slightly toward wrist"),
-            (HintId::BackToCenter, "Back to center, press once more"),
-            (HintId::HoldSteady, "Hold steady"),
-        ];
-        for (hint, expected) in cases {
-            assert_eq!(ENGLISH.enrollment_hint(hint), expected);
-        }
-    }
+    fn enrollment_copy_has_english_and_simplified_chinese() {
+        let _guard = LOCALE_LOCK.lock().unwrap();
 
-    #[test]
-    fn enrollment_progress_preserves_values() {
-        assert_eq!(ENGLISH.enrollment_captured(2, 6), "Captured (2/6)");
+        rust_i18n::set_locale("en");
+        assert_eq!(TEXT.enrollment_title(false), "Add Fingerprint");
+        assert_eq!(TEXT.enrollment_title(true), "Add switch fingerprint");
+        assert_eq!(
+            TEXT.enrollment_hint(HintId::Left),
+            "Tilt slightly left 5–10°"
+        );
+        assert_eq!(TEXT.enrollment_captured(2, 6), "Captured (2/6)");
+
+        rust_i18n::set_locale("zh-CN");
+        assert_eq!(TEXT.enrollment_title(false), "添加指纹");
+        assert_eq!(TEXT.enrollment_title(true), "添加主机切换指纹");
+        assert_eq!(TEXT.enrollment_hint(HintId::Left), "向左轻微倾斜 5–10°");
+        assert_eq!(TEXT.enrollment_captured(2, 6), "已采集（2/6）");
+
+        rust_i18n::set_locale("en");
     }
 }

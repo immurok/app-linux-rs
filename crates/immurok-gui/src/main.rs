@@ -6,6 +6,8 @@
 //! fires the `quick-fill` action. Portal shortcuts (phase 2) and X11 key
 //! grabs fire the same action, so every entry path converges here.
 
+rust_i18n::i18n!("locales", fallback = "en");
+
 mod cli;
 mod device_illustration;
 mod enroll_dialog;
@@ -32,6 +34,8 @@ use libadwaita as adw;
 pub const APP_ID: &str = "com.immurok.Settings";
 
 fn main() -> glib::ExitCode {
+    i18n::init_system_locale();
+
     // A resident instance started before `make install` keeps running the
     // old binary; GApplication would forward this launch to it. Only the
     // service launch itself skips the check (it is about to become primary).

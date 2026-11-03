@@ -1,0 +1,87 @@
+{
+  "_version": 2,
+  "action.cancel": {
+    "en": "Cancel",
+    "zh-CN": "取消"
+  },
+  "action.close": {
+    "en": "Close",
+    "zh-CN": "关闭"
+  },
+  "enrollment.title.default": {
+    "en": "Add Fingerprint",
+    "zh-CN": "添加指纹"
+  },
+  "enrollment.title.switch": {
+    "en": "Add switch fingerprint",
+    "zh-CN": "添加主机切换指纹"
+  },
+  "enrollment.gate_hint": {
+    "en": "Verify with an enrolled finger",
+    "zh-CN": "请使用已录入的指纹验证"
+  },
+  "enrollment.subtitle.default": {
+    "en": "Press the sensor six times, shifting slightly each time.",
+    "zh-CN": "请按压传感器六次，每次稍微移动手指。"
+  },
+  "enrollment.subtitle.switch": {
+    "en": "This finger will only switch between the two hosts.",
+    "zh-CN": "此指纹仅用于在两台主机之间切换。"
+  },
+  "enrollment.hint.center": {
+    "en": "Press finger pad on center",
+    "zh-CN": "将指腹按在传感器中央"
+  },
+  "enrollment.hint.left": {
+    "en": "Tilt slightly left 5–10°",
+    "zh-CN": "向左轻微倾斜 5–10°"
+  },
+  "enrollment.hint.right": {
+    "en": "Tilt slightly right 5–10°",
+    "zh-CN": "向右轻微倾斜 5–10°"
+  },
+  "enrollment.hint.toward_fingertip": {
+    "en": "Shift slightly toward fingertip",
+    "zh-CN": "稍微向指尖方向移动"
+  },
+  "enrollment.hint.toward_wrist": {
+    "en": "Shift slightly toward wrist",
+    "zh-CN": "稍微向手腕方向移动"
+  },
+  "enrollment.hint.back_to_center": {
+    "en": "Back to center, press once more",
+    "zh-CN": "回到中央，再按一次"
+  },
+  "enrollment.hint.hold_steady": {
+    "en": "Hold steady",
+    "zh-CN": "请保持不动"
+  },
+  "enrollment.progress": {
+    "en": "Captured (%{captured}/%{total})",
+    "zh-CN": "已采集（%{captured}/%{total}）"
+  },
+  "enrollment.state.place_finger": {
+    "en": "Place your finger on the sensor...",
+    "zh-CN": "请将手指放在传感器上…"
+  },
+  "enrollment.state.lift_finger": {
+    "en": "Lift your finger, then press again...",
+    "zh-CN": "抬起手指，然后再次按压…"
+  },
+  "enrollment.state.overlap": {
+    "en": "Too similar — shift your finger and press again",
+    "zh-CN": "位置过于相似，请移动手指后再次按压"
+  },
+  "enrollment.state.processing": {
+    "en": "Processing...",
+    "zh-CN": "正在处理…"
+  },
+  "enrollment.error.disconnected": {
+    "en": "Device disconnected before enrollment finished. Reconnect the device and try again.",
+    "zh-CN": "指纹录入完成前设备已断开连接。请重新连接设备后再试。"
+  },
+  "enrollment.error.failed": {
+    "en": "Enrollment failed. Please try again.",
+    "zh-CN": "指纹录入失败，请重试。"
+  }
+}

@@ -24,7 +24,7 @@ use immurok_client::fingerprint::{enroll_cancel, SWITCH_SLOT};
 
 use crate::errors::friendly;
 use crate::gate_dialog::{CountdownRing, ParentCloseGuard};
-use crate::i18n::ENGLISH;
+use crate::i18n::TEXT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollOutcome {
@@ -96,14 +96,14 @@ impl Guide {
 
     fn set_step(&self, next_step: u8, captured: u8, total: u8) {
         self.step_title
-            .set_text(ENGLISH.enrollment_hint(step_hint_id(next_step)));
+            .set_text(&TEXT.enrollment_hint(step_hint_id(next_step)));
         let a = step_arrow(next_step);
         self.arrow.set_text(a);
         self.arrow.set_visible((2..=5).contains(&next_step));
         let total = total.max(1);
         self.progress.set_fraction(captured as f64 / total as f64);
         self.progress
-            .set_text(Some(&ENGLISH.enrollment_captured(captured, total)));
+            .set_text(Some(&TEXT.enrollment_captured(captured, total)));
     }
 
     /// Orange flash + shake; removing and re-adding the class restarts the
@@ -132,7 +132,7 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
         .destroy_with_parent(true)
         .modal(true)
         .resizable(false)
-        .title(ENGLISH.enrollment_title(is_switch))
+        .title(TEXT.enrollment_title(is_switch))
         .default_width(420)
         .build();
 
@@ -146,7 +146,7 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
     let gate = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let ring = CountdownRing::new();
     let gate_hint = gtk::Label::builder()
-        .label(ENGLISH.enrollment_gate_hint())
+        .label(TEXT.enrollment_gate_hint())
         .wrap(true)
         .justify(gtk::Justification::Center)
         .build();
@@ -157,7 +157,7 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
     // ── guide page ──
     let guide = Guide::build();
     let subtitle = gtk::Label::builder()
-        .label(ENGLISH.enrollment_subtitle(is_switch))
+        .label(TEXT.enrollment_subtitle(is_switch))
         .wrap(true)
         .justify(gtk::Justification::Center)
         .build();
@@ -170,8 +170,8 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::Center);
     buttons.set_margin_bottom(18);
-    let cancel = gtk::Button::builder().label(ENGLISH.cancel()).build();
-    let close = gtk::Button::builder().label(ENGLISH.close()).visible(false).build();
+    let cancel = gtk::Button::builder().label(TEXT.cancel()).build();
+    let close = gtk::Button::builder().label(TEXT.close()).visible(false).build();
     close.add_css_class("suggested-action");
     buttons.append(&cancel);
     buttons.append(&close);
@@ -264,22 +264,23 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
                 ring.stop();
                 stack.set_visible_child_name("guide");
                 guide.set_step(1, 0, 6);
-                guide.subtext.set_text(ENGLISH.enrollment_place_finger());
+                guide.subtext.set_text(&TEXT.enrollment_place_finger());
             }
             EnrollProgress::Step { next_step, captured, total } => {
                 guide.set_step(next_step, captured, total);
-                guide.subtext.set_text(if captured == 0 {
-                    ENGLISH.enrollment_place_finger()
+                let subtext = if captured == 0 {
+                    TEXT.enrollment_place_finger()
                 } else {
-                    ENGLISH.enrollment_lift_finger()
-                });
+                    TEXT.enrollment_lift_finger()
+                };
+                guide.subtext.set_text(&subtext);
             }
-            EnrollProgress::LiftFinger => guide.subtext.set_text(ENGLISH.enrollment_lift_finger()),
+            EnrollProgress::LiftFinger => guide.subtext.set_text(&TEXT.enrollment_lift_finger()),
             EnrollProgress::Overlap => {
-                guide.subtext.set_text(ENGLISH.enrollment_overlap());
+                guide.subtext.set_text(&TEXT.enrollment_overlap());
                 guide.shake();
             }
-            EnrollProgress::Processing => guide.subtext.set_text(ENGLISH.enrollment_processing()),
+            EnrollProgress::Processing => guide.subtext.set_text(&TEXT.enrollment_processing()),
             EnrollProgress::Complete => {
                 outcome = EnrollOutcome::Enrolled;
                 break;
@@ -292,11 +293,11 @@ pub async fn run(parent: &impl IsA<gtk::Window>, slot: u8) -> EnrollOutcome {
                 }
                 outcome = EnrollOutcome::Failed;
                 let text = if reason.contains("disconnected") || reason.contains("NOT_CONNECTED") {
-                    ENGLISH.enrollment_disconnected().to_string()
+                    TEXT.enrollment_disconnected()
                 } else if reason.contains("FP-gate") {
                     friendly(&reason)
                 } else {
-                    ENGLISH.enrollment_failed().to_string()
+                    TEXT.enrollment_failed()
                 };
                 // The session is over: closing the window from here must
                 // not send another FP:ENROLL_CANCEL.
