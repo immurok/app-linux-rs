@@ -21,15 +21,77 @@ Exit semantics:
 """
 
 import argparse
+import json
+import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk, Pango
+
+
+_ENGLISH = {
+    "action.cancel": "Cancel",
+    "auth.title.agent": "Agent authorization request",
+    "auth.title.fingerprint": "Fingerprint authentication",
+    "auth.body.agent": "The agent is requesting permission to run a command. Touch fingerprint to approve:",
+    "auth.body.fingerprint": "Touch the fingerprint sensor to authenticate",
+    "auth.cli.description": "immurok auth dialog",
+    "auth.cli.agent_help": "agent approval mode (show command + countdown)",
+    "auth.cli.command_help": "wrapped command string (agent mode only)",
+    "auth.cli.timeout_help": "countdown seconds (default 30)",
+}
+
+
+def _locale() -> str:
+    for name in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
+        value = os.environ.get(name, "")
+        if not value:
+            continue
+        for candidate in value.split(":"):
+            normalized = candidate.split(".", 1)[0].split("@", 1)[0].replace("_", "-").lower()
+            if normalized == "zh" or normalized == "zh-cn" or normalized == "zh-sg" or normalized.startswith("zh-hans"):
+                return "zh-CN"
+            if normalized == "en" or normalized.startswith("en-"):
+                return "en"
+        return "en"
+    return "en"
+
+
+def _catalog_path() -> Path | None:
+    candidates = [
+        Path("/usr/share/immurok/locales/app.json"),
+        Path("/usr/local/share/immurok/locales/app.json"),
+        Path(__file__).resolve().parents[1] / "crates/immurok-gui/locales/app.json",
+    ]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _load_catalog() -> dict[str, dict[str, str]]:
+    path = _catalog_path()
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {key: value for key, value in data.items() if key != "_version" and isinstance(value, dict)}
+
+
+_CATALOG = _load_catalog()
+
+
+def _tr(key: str, **values: object) -> str:
+    translations = _CATALOG.get(key, {})
+    text = translations.get(_locale()) or translations.get("en") or _ENGLISH.get(key, key)
+    for name, value in values.items():
+        text = text.replace("%{" + name + "}", str(value))
+    return text
 
 
 def _truncate(text: str, limit: int = 300) -> str:
@@ -80,16 +142,16 @@ class AuthDialog(Adw.Application):
         content.append(icon)
 
         # Title
-        title_text = "Agent authorization request" if self.agent_mode else "Fingerprint authentication"
+        title_text = _tr("auth.title.agent" if self.agent_mode else "auth.title.fingerprint")
         title = Gtk.Label(label=title_text)
         title.add_css_class("title-2")
         content.append(title)
 
         # Prompt text
         body_text = (
-            "The agent is requesting permission to run a command. Touch fingerprint to approve:"
+            _tr("auth.body.agent")
             if self.agent_mode
-            else "Touch the fingerprint sensor to authenticate"
+            else _tr("auth.body.fingerprint")
         )
         body = Gtk.Label(label=body_text)
         body.add_css_class("body")
@@ -170,7 +232,7 @@ class AuthDialog(Adw.Application):
         btn_box.set_margin_end(12)
         btn_box.set_halign(Gtk.Align.END)
 
-        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn = Gtk.Button(label=_tr("action.cancel"))
         cancel_btn.add_css_class("pill")
         if self.agent_mode:
             cancel_btn.add_css_class("destructive-action")
@@ -218,13 +280,13 @@ class AuthDialog(Adw.Application):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="immurok auth dialog")
+    p = argparse.ArgumentParser(description=_tr("auth.cli.description"))
     p.add_argument("--agent", action="store_true",
-                   help="agent approval mode (show command + countdown)")
+                   help=_tr("auth.cli.agent_help"))
     p.add_argument("--command", default="",
-                   help="wrapped command string (agent mode only)")
+                   help=_tr("auth.cli.command_help"))
     p.add_argument("--timeout", type=int, default=30,
-                   help="countdown seconds (default 30)")
+                   help=_tr("auth.cli.timeout_help"))
     return p.parse_args()
 
 

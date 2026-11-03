@@ -24,6 +24,7 @@ for f in usr/bin/immurok-daemon usr/bin/immurok-cli usr/bin/imk usr/bin/immurok-
          usr/lib/sysusers.d/immurok.conf usr/lib/tmpfiles.d/immurok.conf \
          usr/share/dbus-1/system.d/immurok.conf usr/share/dbus-1/services/com.immurok.Settings.service \
          usr/share/polkit-1/rules.d/49-immurok.rules usr/share/polkit-1/actions/com.immurok.pam-helper.policy \
+         usr/share/immurok/locales/app.json \
          usr/share/applications/com.immurok.Settings.desktop etc/xdg/autostart/com.immurok.Settings.desktop \
          usr/share/icons/hicolor/48x48/apps/com.immurok.Settings.png usr/share/icons/hicolor/512x512/apps/com.immurok.Settings.png \
          usr/share/doc/immurok/README.md usr/share/doc/immurok/CHANGELOG.md; do
@@ -44,6 +45,9 @@ grep -q '<annotate key="org.freedesktop.policykit.exec.path">/usr/bin/immurok-pa
 check "$r" ok "policy exec.path substituted"
 grep -q '@HELPER_PATH@' "$R/usr/share/polkit-1/actions/com.immurok.pam-helper.policy" && r=leftover || r=ok
 check "$r" ok "no @HELPER_PATH@ left"
+
+grep -q 'auth.title.agent' "$R/usr/share/immurok/locales/app.json" && r=ok || r=no
+check "$r" ok "locale catalog staged"
 
 # autostart 变体（--gapplication-service）落到 /etc/xdg/autostart
 grep -q 'gapplication-service' "$R/etc/xdg/autostart/com.immurok.Settings.desktop" && r=ok || r=no

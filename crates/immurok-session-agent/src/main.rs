@@ -8,7 +8,7 @@
 //!   daemon → agent   UI:DIALOG:AUTH                 show the touch prompt
 //!                    UI:DIALOG:AGENT:<secs>:<cmd>   show the agent approval
 //!                    UI:DISMISS                     take it down
-//!                    NOTIFY:<text>                  desktop notification
+//!                    NOTIFY:<event>                 desktop notification
 //!                    SSH_TAKEOVER:ON|OFF            reconcile ~/.ssh/config
 //!   agent  → daemon  UI:CANCEL                      user cancelled/closed it
 //!
@@ -16,7 +16,8 @@
 //! attacker can kill it or fake it, and all that buys them is *no* dialog or a
 //! spurious cancel. Approval still requires a fingerprint on the device.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -164,10 +165,77 @@ fn spawn_dialog(args: &[&str]) -> Option<Child> {
 }
 
 fn notify(text: &str) {
+    let text = localized_notification(text);
     let _ = Command::new("notify-send")
         .arg("immurok")
         .arg(text)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+fn notification_locale() -> &'static str {
+    for name in ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
+        let Ok(value) = std::env::var(name) else { continue };
+        if value.trim().is_empty() { continue }
+        for candidate in value.split(':') {
+            let normalized = candidate
+                .split(['.', '@'])
+                .next()
+                .unwrap_or(candidate)
+                .replace('_', "-")
+                .to_ascii_lowercase();
+            if normalized == "zh"
+                || normalized == "zh-cn"
+                || normalized == "zh-sg"
+                || normalized.starts_with("zh-hans")
+            {
+                return "zh-CN";
+            }
+            if normalized == "en" || normalized.starts_with("en-") {
+                return "en";
+            }
+        }
+        return "en";
+    }
+    "en"
+}
+
+fn catalog_paths() -> [PathBuf; 2] {
+    [
+        PathBuf::from("/usr/share/immurok/locales/app.json"),
+        PathBuf::from("/usr/local/share/immurok/locales/app.json"),
+    ]
+}
+
+fn read_translation(path: &Path, key: &str, locale: &str) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let translations = root.get(key)?;
+    translations
+        .get(locale)
+        .or_else(|| translations.get("en"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn localized_notification(text: &str) -> String {
+    let key = match text {
+        "DEVICE_UNPAIRED" => "notification.device_unpaired",
+        _ => return text.to_string(),
+    };
+    let locale = notification_locale();
+    catalog_paths()
+        .iter()
+        .find_map(|path| read_translation(path, key, locale))
+        .unwrap_or_else(|| text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notification_locale;
+
+    #[test]
+    fn locale_parser_returns_supported_value() {
+        assert!(matches!(notification_locale(), "en" | "zh-CN"));
+    }
 }
