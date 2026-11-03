@@ -1,4 +1,5 @@
 use immurok_client::enroll_hint::HintId;
+use immurok_client::status::{ConnParams, SettingKey};
 use rust_i18n::t;
 
 pub(crate) struct Catalog;
@@ -107,6 +108,178 @@ impl Catalog {
 
     pub(crate) fn enrollment_failed(&self) -> String {
         t!("enrollment.error.failed").to_string()
+    }
+
+    pub(crate) fn nav_device(&self) -> String {
+        t!("nav.device").to_string()
+    }
+
+    pub(crate) fn nav_features(&self) -> String {
+        t!("nav.features").to_string()
+    }
+
+    pub(crate) fn nav_keys(&self) -> String {
+        t!("nav.keys").to_string()
+    }
+
+    pub(crate) fn nav_fingerprints(&self) -> String {
+        t!("nav.fingerprints").to_string()
+    }
+
+    pub(crate) fn nav_pam(&self) -> String {
+        t!("nav.pam").to_string()
+    }
+
+    pub(crate) fn nav_logs(&self) -> String {
+        t!("nav.logs").to_string()
+    }
+
+    pub(crate) fn menu_setup(&self) -> String {
+        t!("menu.setup").to_string()
+    }
+
+    pub(crate) fn menu_quit(&self) -> String {
+        t!("menu.quit").to_string()
+    }
+
+    pub(crate) fn menu_tooltip(&self) -> String {
+        t!("menu.tooltip").to_string()
+    }
+
+    pub(crate) fn firmware_update_wait(&self) -> String {
+        t!("firmware.update_wait").to_string()
+    }
+
+    pub(crate) fn feature_title(&self) -> String {
+        t!("feature.title").to_string()
+    }
+
+    pub(crate) fn feature_description(&self) -> String {
+        t!("feature.description").to_string()
+    }
+
+    pub(crate) fn feature_rows(&self) -> Vec<(SettingKey, String, String)> {
+        vec![
+            (
+                SettingKey::UnlockSudo,
+                t!("feature.sudo.title").to_string(),
+                t!("feature.sudo.subtitle").to_string(),
+            ),
+            (
+                SettingKey::UnlockPolkit,
+                t!("feature.polkit.title").to_string(),
+                t!("feature.polkit.subtitle").to_string(),
+            ),
+            (
+                SettingKey::UnlockScreen,
+                t!("feature.screen.title").to_string(),
+                t!("feature.screen.subtitle").to_string(),
+            ),
+            (
+                SettingKey::LockScreen,
+                t!("feature.lock.title").to_string(),
+                t!("feature.lock.subtitle").to_string(),
+            ),
+            (
+                SettingKey::SshTakeover,
+                t!("feature.ssh.title").to_string(),
+                t!("feature.ssh.subtitle").to_string(),
+            ),
+        ]
+    }
+
+    pub(crate) fn feature_save_failed(&self, error: &str) -> String {
+        t!("feature.save_failed", error = error).to_string()
+    }
+
+    pub(crate) fn sidebar_connecting(&self) -> String {
+        t!("sidebar.connecting").to_string()
+    }
+
+    pub(crate) fn sidebar_bluetooth_connected(&self) -> String {
+        t!("sidebar.bluetooth.connected").to_string()
+    }
+
+    pub(crate) fn sidebar_bluetooth_starting(&self) -> String {
+        t!("sidebar.bluetooth.starting").to_string()
+    }
+
+    pub(crate) fn sidebar_bluetooth_disconnected(&self) -> String {
+        t!("sidebar.bluetooth.disconnected").to_string()
+    }
+
+    pub(crate) fn sidebar_link_no_longer(&self) -> String {
+        t!("sidebar.link.no_longer").to_string()
+    }
+
+    pub(crate) fn sidebar_linked(&self) -> String {
+        t!("sidebar.link.linked").to_string()
+    }
+
+    pub(crate) fn sidebar_not_linked(&self) -> String {
+        t!("sidebar.link.not_linked").to_string()
+    }
+
+    pub(crate) fn sidebar_shown_once(&self) -> String {
+        t!("sidebar.link.shown_once").to_string()
+    }
+
+    pub(crate) fn sidebar_tooltip_unpaired(&self) -> String {
+        t!("sidebar.tooltip.unpaired").to_string()
+    }
+
+    pub(crate) fn sidebar_tooltip_bluetooth_only(&self) -> String {
+        t!("sidebar.tooltip.bluetooth_only").to_string()
+    }
+
+    pub(crate) fn sidebar_daemon_unavailable(&self) -> String {
+        t!("sidebar.daemon_unavailable").to_string()
+    }
+
+    pub(crate) fn sidebar_show_params(&self) -> String {
+        t!("sidebar.show_params").to_string()
+    }
+
+    pub(crate) fn sidebar_reading_params(&self) -> String {
+        t!("sidebar.reading_params").to_string()
+    }
+
+    pub(crate) fn sidebar_read_params_failed(&self, error: &str) -> String {
+        t!("sidebar.read_params_failed", error = error).to_string()
+    }
+
+    pub(crate) fn sidebar_read_params_unavailable(&self) -> String {
+        t!("sidebar.read_params_unavailable").to_string()
+    }
+
+    pub(crate) fn sidebar_firmware(&self, version: &str) -> String {
+        t!("sidebar.firmware", version = version).to_string()
+    }
+
+    pub(crate) fn conn_params_markup(&self, p: &ConnParams) -> String {
+        let verdict = if p.ecc_ok() {
+            t!("sidebar.connection.long_enough").to_string()
+        } else {
+            t!(
+                "sidebar.connection.too_short",
+                minimum = ConnParams::ECC_MIN_TIMEOUT_MS,
+                requested = 6000
+            )
+            .to_string()
+        };
+        t!(
+            "sidebar.connection.markup",
+            title = t!("sidebar.connection.title"),
+            interval = t!("sidebar.connection.interval", value = p.interval_ms()),
+            latency = t!(
+                "sidebar.connection.latency",
+                value = p.latency,
+                effective = p.effective_interval_ms()
+            ),
+            timeout = t!("sidebar.connection.timeout", value = p.timeout_ms()),
+            verdict = verdict
+        )
+        .to_string()
     }
 }
 
