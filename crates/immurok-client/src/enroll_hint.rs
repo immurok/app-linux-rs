@@ -6,17 +6,44 @@
 //! `enrollTitleKeyForStep` / `enrollOffsetForStep` 保持一致：
 //! 正中 → 左 → 右 → 指尖 → 手腕 → 回正中。
 
-/// 6 帧引导文案，mirrors the macOS `enroll.step.*` English strings.
-pub fn step_hint(step: u8) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintId {
+    Center,
+    Left,
+    Right,
+    TowardFingertip,
+    TowardWrist,
+    BackToCenter,
+    HoldSteady,
+}
+
+pub const fn step_hint_id(step: u8) -> HintId {
     match step {
-        1 => "Press finger pad on center",
-        2 => "Tilt slightly left 5–10°",
-        3 => "Tilt slightly right 5–10°",
-        4 => "Shift slightly toward fingertip",
-        5 => "Shift slightly toward wrist",
-        6 => "Back to center, press once more",
-        _ => "Hold steady",
+        1 => HintId::Center,
+        2 => HintId::Left,
+        3 => HintId::Right,
+        4 => HintId::TowardFingertip,
+        5 => HintId::TowardWrist,
+        6 => HintId::BackToCenter,
+        _ => HintId::HoldSteady,
     }
+}
+
+pub const fn english_step_hint(hint: HintId) -> &'static str {
+    match hint {
+        HintId::Center => "Press finger pad on center",
+        HintId::Left => "Tilt slightly left 5–10°",
+        HintId::Right => "Tilt slightly right 5–10°",
+        HintId::TowardFingertip => "Shift slightly toward fingertip",
+        HintId::TowardWrist => "Shift slightly toward wrist",
+        HintId::BackToCenter => "Back to center, press once more",
+        HintId::HoldSteady => "Hold steady",
+    }
+}
+
+/// 6 帧引导文案，mirrors the macOS `enroll.step.*` English strings.
+pub const fn step_hint(step: u8) -> &'static str {
+    english_step_hint(step_hint_id(step))
 }
 
 /// 与 step_hint 对应的方向符号。
@@ -47,9 +74,21 @@ mod tests {
 
     #[test]
     fn hints_cover_boundaries() {
-        assert_eq!(step_hint(1), "Press finger pad on center");
-        assert_eq!(step_hint(2), "Tilt slightly left 5–10°");
-        assert_eq!(step_hint(6), "Back to center, press once more");
+        let cases = [
+            (1, HintId::Center, "Press finger pad on center"),
+            (2, HintId::Left, "Tilt slightly left 5–10°"),
+            (3, HintId::Right, "Tilt slightly right 5–10°"),
+            (4, HintId::TowardFingertip, "Shift slightly toward fingertip"),
+            (5, HintId::TowardWrist, "Shift slightly toward wrist"),
+            (6, HintId::BackToCenter, "Back to center, press once more"),
+        ];
+        for (step, id, expected) in cases {
+            assert_eq!(step_hint_id(step), id);
+            assert_eq!(english_step_hint(id), expected);
+            assert_eq!(step_hint(step), expected);
+        }
+        assert_eq!(step_hint_id(0), HintId::HoldSteady);
+        assert_eq!(step_hint_id(7), HintId::HoldSteady);
         assert_eq!(step_hint(0), "Hold steady");
         assert_eq!(step_hint(7), "Hold steady");
     }

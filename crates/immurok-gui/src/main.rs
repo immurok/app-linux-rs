@@ -12,6 +12,7 @@ mod enroll_dialog;
 mod errors;
 mod filter;
 mod gate_dialog;
+mod i18n;
 mod key_add_dialog;
 mod link_guide;
 mod main_window;
