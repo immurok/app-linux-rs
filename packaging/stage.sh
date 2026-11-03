@@ -25,6 +25,7 @@ done
 for s in immurok-auth-dialog immurok-pam-helper ble-notify-helper.py; do
     install -Dm755 "$SRC/scripts/$s" "$ROOT/usr/bin/$s"
 done
+install -Dm644 "$SRC/crates/immurok-gui/locales/app.json" "$ROOT/usr/share/immurok/locales/app.json"
 
 # systemd / sysusers / tmpfiles
 install -Dm644 "$SRC/packaging/immurok-daemon.service"        "$ROOT/usr/lib/systemd/system/immurok-daemon.service"

@@ -18,6 +18,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::keys::{
     cancel_gate, get_api, get_otp, list_keys, ssh_public_key_line, KeyCategory, KeyEntry,
@@ -81,7 +82,7 @@ impl Panel {
             .decorated(false)
             .resizable(false)
             .default_width(480)
-            .title("immurok quick-fill")
+            .title(t!("quickfill.title").to_string())
             .build();
         window.set_widget_name(PANEL_NAME);
 
@@ -91,7 +92,7 @@ impl Panel {
         root.set_margin_start(8);
         root.set_margin_end(8);
 
-        let search = gtk::SearchEntry::builder().placeholder_text("Search OTP / API / SSH…").build();
+        let search = gtk::SearchEntry::builder().placeholder_text(t!("quickfill.search").to_string()).build();
         let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
         list.add_css_class("boxed-list");
         let scroller = gtk::ScrolledWindow::builder()
@@ -313,7 +314,7 @@ impl Panel {
         // title/subtitle, `GtkProgressBar:text` is plain text (its internal
         // label leaves `use-markup` at FALSE), so escaping would show a
         // literal `&amp;` for an entry named `a&b`.
-        self.progress.set_text(Some(&format!("Touch the device to read \"{}\"…", entry.name)));
+        self.progress.set_text(Some(&t!("quickfill.touch", name = entry.name).to_string()));
         self.progress.set_show_text(true);
 
         // Countdown bar: 1.0 → 0.0 over the device's 30 s gate.

@@ -10,6 +10,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::pam::{run_helper, service_status, services_to_repair, HelperReport, PamError, PamServiceStatus, PAM_SERVICES};
 use immurok_client::probe_isolation;
@@ -56,14 +57,14 @@ impl PamPage {
     pub fn new(toasts: &adw::ToastOverlay) -> Rc<Self> {
         let root = adw::PreferencesPage::new();
 
-        let daemon = adw::PreferencesGroup::builder().title("Daemon").build();
-        let isolation = adw::ActionRow::builder().title("Isolation").subtitle("Checking…").build();
+        let daemon = adw::PreferencesGroup::builder().title(t!("pam.daemon")).build();
+        let isolation = adw::ActionRow::builder().title(t!("pam.isolation")).subtitle(t!("pam.checking")).build();
         daemon.add(&isolation);
         root.add(&daemon);
 
         let group = adw::PreferencesGroup::builder()
-            .title("PAM services")
-            .description("Installing or removing needs administrator authorization — polkit will prompt.")
+            .title(t!("pam.services"))
+            .description(t!("pam.description"))
             .build();
         let mut rows = Vec::new();
         // NOTE (deviation from brief): iterate `PAM_SERVICES` directly rather
@@ -76,7 +77,7 @@ impl PamPage {
             let row = adw::ActionRow::builder().title(s.label).subtitle(s.path).build();
             let state = gtk::Label::new(Some("…"));
             state.add_css_class("dim-label");
-            let button = gtk::Button::builder().label("Install").valign(gtk::Align::Center).build();
+            let button = gtk::Button::builder().label(t!("pam.install")).valign(gtk::Align::Center).build();
             row.add_suffix(&state);
             row.add_suffix(&button);
             group.add(&row);
@@ -84,9 +85,9 @@ impl PamPage {
         }
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let repair = gtk::Button::builder().label("Repair").valign(gtk::Align::Center).visible(false).build();
+        let repair = gtk::Button::builder().label(t!("pam.repair")).valign(gtk::Align::Center).visible(false).build();
         repair.add_css_class("suggested-action");
-        let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").valign(gtk::Align::Center).tooltip_text("Refresh").build();
+        let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").valign(gtk::Align::Center).tooltip_text(t!("pam.refresh")).build();
         refresh.add_css_class("flat");
         header_actions.append(&repair);
         header_actions.append(&refresh);
@@ -178,27 +179,29 @@ impl PamPage {
 
     fn apply(&self, snap: Snapshot) {
         let (text, class) = match snap.isolated {
-            Some(true) => ("Isolated daemon — running as its own system user", "success"),
+            Some(true) => (t!("pam.isolated").to_string(), "success"),
             Some(false) => (
-                "NOT isolated — the daemon runs as your user; any of your processes can pass sudo. Run `make install`.",
+                t!("pam.not_isolated").to_string(),
                 "error",
             ),
-            None => ("Isolation unknown — daemon not reachable", "dim-label"),
+            None => (t!("pam.unknown").to_string(), "dim-label"),
         };
         for c in ["success", "error", "dim-label"] {
             self.isolation.remove_css_class(c);
         }
         self.isolation.add_css_class(class);
-        self.isolation.set_subtitle(text);
+        self.isolation.set_subtitle(&text);
 
         for (row, st) in self.rows.iter().zip(snap.services.iter()) {
             row.installed.set(st.installed);
-            row.state.set_text(if st.installed { "Installed" } else { "Not installed" });
-            row.button.set_label(if st.installed { "Remove" } else { "Install" });
+            let state = if st.installed { t!("pam.installed").to_string() } else { t!("pam.not_installed").to_string() };
+            let action = if st.installed { t!("pam.remove").to_string() } else { t!("pam.install").to_string() };
+            row.state.set_text(&state);
+            row.button.set_label(&action);
         }
 
         if !snap.to_repair.is_empty() {
-            self.repair.set_tooltip_text(Some(&format!("{} service(s) need repair", snap.to_repair.len())));
+            self.repair.set_tooltip_text(Some(&t!("pam.needs_repair", count = snap.to_repair.len())));
         }
         *self.to_repair.borrow_mut() = snap.to_repair;
     }
@@ -227,14 +230,14 @@ impl PamPage {
             // `OK:ADDED(sudo)` / `OK:ALREADY_PRESENT(polkit-1)` / `OK:REMOVED(sudo)` …
             let svc = line.rsplit('(').next().map(|s| s.trim_end_matches(')')).unwrap_or("");
             let text = if line.contains("ALREADY_PRESENT") {
-                format!("Already present for {}", glib::markup_escape_text(svc))
+                t!("pam.already_present", service = glib::markup_escape_text(svc)).to_string()
             } else if line.contains("NOT_PRESENT") {
                 // `OK:NOT_PRESENT(gdm-password)` — a remove that had nothing to do.
-                format!("Not present for {}", glib::markup_escape_text(svc))
+                t!("pam.not_present", service = glib::markup_escape_text(svc)).to_string()
             } else if action == "add" {
-                format!("Installed for {}", glib::markup_escape_text(svc))
+                t!("pam.installed_for", service = glib::markup_escape_text(svc)).to_string()
             } else {
-                format!("Removed from {}", glib::markup_escape_text(svc))
+                t!("pam.removed_from", service = glib::markup_escape_text(svc)).to_string()
             };
             self.toast(&text);
         }
@@ -242,27 +245,31 @@ impl PamPage {
 
     async fn report_err(&self, e: PamError) {
         match e {
-            PamError::AuthCancelled => self.toast("Authorization cancelled"),
+            PamError::AuthCancelled => self.toast(&t!("pam.authorization_cancelled")),
             PamError::HelperFailed { lines, .. } => {
                 let errs: Vec<&String> = lines.iter().filter(|l| l.starts_with("ERROR:")).collect();
                 if errs.is_empty() {
-                    self.toast("PAM helper failed");
+                    self.toast(&t!("pam.helper_failed"));
                 }
                 for l in errs {
                     self.toast(&glib::markup_escape_text(l));
                 }
             }
             PamError::NoPolkitAgent => {
+                let title = t!("pam.no_agent_title").to_string();
+                let body = t!("pam.no_agent_body").to_string();
                 self.dialog(
-                    "No authentication agent",
-                    "No polkit authentication agent is running. Start your desktop's polkit agent, or run `immurok-cli pam install <service>` in a terminal.",
+                    &title,
+                    &body,
                 )
                 .await
             }
             PamError::HelperNotFound => {
-                self.dialog("Helper not found", "immurok-pam-helper was not found. Re-run `make install`.").await
+                let title = t!("pam.helper_not_found_title").to_string();
+                let body = t!("pam.helper_not_found_body").to_string();
+                self.dialog(&title, &body).await
             }
-            PamError::Spawn(s) => self.toast(&format!("Could not run pkexec: {}", glib::markup_escape_text(&s))),
+            PamError::Spawn(s) => self.toast(&t!("pam.could_not_run", error = glib::markup_escape_text(&s))),
         }
     }
 
@@ -275,7 +282,8 @@ impl PamPage {
             .text(title)
             .secondary_text(body)
             .build();
-        dialog.add_button("Close", gtk::ResponseType::Close);
+        let close = t!("pam.close").to_string();
+        dialog.add_button(&close, gtk::ResponseType::Close);
         let _ = dialog.run_future().await;
         dialog.close();
     }

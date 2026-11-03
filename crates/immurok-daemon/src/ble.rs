@@ -805,7 +805,7 @@ async fn connect_and_serve(
             .device_reports_unpaired
             .store(true, Ordering::Relaxed);
         coordinator
-            .push_ui("NOTIFY:Device is no longer paired with this computer — run 'immurok-cli pair' to pair again")
+            .push_ui("NOTIFY:DEVICE_UNPAIRED")
             .await;
     } else {
         coordinator

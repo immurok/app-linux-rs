@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=immurok
+Name[zh_CN]=immurok
 Comment=Fingerprint key settings and quick-fill
+Comment[zh_CN]=指纹密钥设置和快速填充
 Exec=immurok-gui
 Icon=com.immurok.Settings
 Terminal=false

@@ -13,6 +13,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::open_log_stream;
 
@@ -88,11 +89,12 @@ impl LogsPage {
         root.set_margin_end(12);
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let badge = gtk::Label::new(Some("● Connecting…"));
+        let connecting = t!("logs.connecting").to_string();
+        let badge = gtk::Label::new(Some(&connecting));
         badge.set_hexpand(true);
         badge.set_xalign(0.0);
-        let jump = gtk::Button::builder().label("Jump to latest").sensitive(false).build();
-        let reconnect = gtk::Button::builder().label("Reconnect").sensitive(false).build();
+        let jump = gtk::Button::builder().label(t!("logs.jump_latest")).sensitive(false).build();
+        let reconnect = gtk::Button::builder().label(t!("logs.reconnect")).sensitive(false).build();
         header.append(&badge);
         header.append(&jump);
         header.append(&reconnect);
@@ -197,10 +199,10 @@ impl LogsPage {
     fn set_state(&self, s: StreamState) {
         self.state.set(s);
         let text = match s {
-            StreamState::Connecting => "● Connecting…".to_string(),
-            StreamState::Live => "● Live".to_string(),
-            StreamState::Paused(n) => format!("⏸ Paused ({n} new lines)"),
-            StreamState::Closed => "● Stream closed".to_string(),
+            StreamState::Connecting => t!("logs.connecting").to_string(),
+            StreamState::Live => t!("logs.live").to_string(),
+            StreamState::Paused(n) => t!("logs.paused", count = n).to_string(),
+            StreamState::Closed => t!("logs.closed").to_string(),
         };
         self.badge.set_text(&text);
         self.jump.set_sensitive(matches!(s, StreamState::Paused(_)));

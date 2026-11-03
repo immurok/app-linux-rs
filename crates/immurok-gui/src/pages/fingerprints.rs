@@ -14,6 +14,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::fingerprint::{fp_delete, fp_list, fp_verify, FpSlots, SWITCH_SLOT};
 use immurok_client::hosts::slot_status;
@@ -56,8 +57,8 @@ impl FingerprintsPage {
         // ── content ──
         let page = adw::PreferencesPage::new();
         let group = adw::PreferencesGroup::builder()
-            .title("Fingerprints")
-            .description("Touch the sensor to unlock and authorize sudo.")
+            .title(t!("fingerprints.title"))
+            .description(t!("fingerprints.description"))
             .build();
         let flow = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -70,9 +71,9 @@ impl FingerprintsPage {
         group.add(&flow);
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let add_switch = gtk::Button::builder().label("Add switch fingerprint").valign(gtk::Align::Center).visible(false).build();
-        let test_button = gtk::Button::builder().label("Test").valign(gtk::Align::Center).tooltip_text("Verify with an enrolled finger").build();
-        let refresh_button = gtk::Button::builder().icon_name("view-refresh-symbolic").valign(gtk::Align::Center).tooltip_text("Refresh").build();
+        let add_switch = gtk::Button::builder().label(t!("fingerprints.add_switch")).valign(gtk::Align::Center).visible(false).build();
+        let test_button = gtk::Button::builder().label(t!("fingerprints.test")).valign(gtk::Align::Center).tooltip_text(t!("fingerprints.verify")).build();
+        let refresh_button = gtk::Button::builder().icon_name("view-refresh-symbolic").valign(gtk::Align::Center).tooltip_text(t!("fingerprints.refresh")).build();
         refresh_button.add_css_class("flat");
         header_actions.append(&add_switch);
         header_actions.append(&test_button);
@@ -86,12 +87,13 @@ impl FingerprintsPage {
         let spinner = gtk::Spinner::new();
         spinner.set_spinning(true);
         loading.append(&spinner);
-        loading.append(&gtk::Label::new(Some("Fetching fingerprint info from device...")));
+        let fetching = t!("fingerprints.fetching").to_string();
+        loading.append(&gtk::Label::new(Some(&fetching)));
 
         let disconnected = adw::StatusPage::builder()
             .icon_name("bluetooth-disabled-symbolic")
-            .title("Device not connected")
-            .description("Connect the device to manage fingerprints.")
+            .title(t!("fingerprints.not_connected"))
+            .description(t!("fingerprints.connect_to_manage"))
             .build();
 
         let root = gtk::Stack::new();
@@ -226,7 +228,8 @@ impl FingerprintsPage {
                     this.connected.set(false);
                     this.have_data.set(false);
                     if !e.contains("NOT_CONNECTED") {
-                        this.toast(&format!("Daemon unavailable: {}", glib::markup_escape_text(&e)));
+                        let escaped = glib::markup_escape_text(&e);
+                        this.toast(&t!("fingerprints.daemon_unavailable", error = escaped.as_str()));
                     }
                     this.root.set_visible_child_name("disconnected");
                 }
