@@ -27,7 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use immurok_common::pam::pam_line_present_in;
+use immurok_common::pam::{broken_include_in, pam_line_present_in, PAM_VENDOR_DIR};
 
 pub const PAM_DIR: &str = "/etc/pam.d";
 
@@ -89,12 +89,26 @@ pub fn desired_services(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
     v
 }
 
-/// Desired-but-missing services.
-pub fn services_to_repair_in(dir: &Path, sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
+/// Desired-but-missing services, plus ones whose config we wrote is broken —
+/// an `include` target PAM cannot open (`immurok_common::pam::broken_include_in`).
+/// A broken config still carries the auth line, so `pam_line_present_in` alone
+/// reports it installed and repair used to answer "nothing to repair" on a
+/// machine whose polkit auth was looping. `add` rebuilds such a file.
+pub fn services_to_repair_in_with_vendor(
+    dir: &Path,
+    vendor_dir: &Path,
+    sudo_on: bool,
+    polkit_on: bool,
+) -> Vec<&'static str> {
     desired_services(sudo_on, polkit_on)
         .into_iter()
-        .filter(|s| !pam_line_present_in(dir, s))
+        .filter(|s| !pam_line_present_in(dir, s) || broken_include_in(dir, vendor_dir, s).is_some())
         .collect()
+}
+
+/// Desired-but-missing services.
+pub fn services_to_repair_in(dir: &Path, sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
+    services_to_repair_in_with_vendor(dir, Path::new(PAM_VENDOR_DIR), sudo_on, polkit_on)
 }
 
 pub fn services_to_repair(sudo_on: bool, polkit_on: bool) -> Vec<&'static str> {
@@ -268,6 +282,45 @@ mod tests {
         assert_eq!(services_to_repair_in(dir.path(), true, true), vec!["sudo"]);
         assert_eq!(services_to_repair_in(dir.path(), false, true), Vec::<&str>::new());
         assert_eq!(services_to_repair_in(dir.path(), true, false), vec!["sudo"]);
+    }
+
+    /// 0.9.1–0.9.3 留下的坏 polkit-1：auth 行在，但 include 打不开。
+    /// 旧逻辑会说「无需修复」，而那台机器的 polkit 正在死循环。
+    #[test]
+    fn repair_offers_our_broken_config() {
+        let dir = tmp_pam_dir(&[
+            ("system-auth", "auth required pam_unix.so\n"),
+            ("sudo", "# Created by immurok\nauth sufficient pam_immurok.so\nauth include system-auth\n"),
+            (
+                "polkit-1",
+                "# Created by immurok\nauth sufficient pam_immurok.so timeout=10\nauth include password-auth\n",
+            ),
+        ]);
+        let vendor = tmp_pam_dir(&[]);
+        // sudo 健康、polkit-1 坏 → 只修 polkit-1
+        assert_eq!(
+            services_to_repair_in_with_vendor(dir.path(), vendor.path(), true, true),
+            vec!["polkit-1"]
+        );
+        // 关掉 polkit 开关就不该再提它
+        assert_eq!(
+            services_to_repair_in_with_vendor(dir.path(), vendor.path(), true, false),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// 用户自己维护的文件不由我们论断，哪怕 include 是坏的。
+    #[test]
+    fn repair_leaves_foreign_configs_alone() {
+        let dir = tmp_pam_dir(&[
+            ("sudo", "auth sufficient pam_immurok.so\nauth include nowhere\n"),
+            ("polkit-1", "auth sufficient pam_immurok.so\nauth include nowhere\n"),
+        ]);
+        let vendor = tmp_pam_dir(&[]);
+        assert_eq!(
+            services_to_repair_in_with_vendor(dir.path(), vendor.path(), true, true),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]

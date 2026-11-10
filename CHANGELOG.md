@@ -7,6 +7,30 @@ module) are documented here. Versions follow the workspace crate version.
 
 ### Fixed
 
+- PAM: on Arch the generated `/etc/pam.d/polkit-1` had all four stacks
+  `include password-auth` — a file Arch does not ship (it is called
+  `system-auth`; `password-auth` is Fedora/RHEL). PAM can only report
+  "unable to open config" for an include it cannot find, which takes down
+  the account stack along with auth: the fingerprint was approved, yet
+  `pam_acct_mgmt()` still failed, polkit read that as a failed
+  authentication and re-prompted — an endless authentication loop. The
+  include target is now picked by what the machine actually has
+  (`password-auth` → `system-auth` → `common-auth`) and the helper refuses
+  to write a config at all rather than fall back to a guessed name. A
+  distribution's own `/usr/lib/pam.d/polkit-1` (Arch's polkit ships one,
+  with the correct `include system-auth`) is now copied in preference to
+  our template, so there is nothing left to guess. Affected 0.9.1 through
+  0.9.3 on Arch and its derivatives; Fedora, Debian, Ubuntu and openSUSE
+  were never affected.
+- PAM: a config broken that way is now repaired instead of being left
+  alone. It still carries the immurok auth line, so `pam install` reported
+  `ALREADY_PRESENT` and `pam repair` answered "nothing to repair" on a
+  machine whose polkit was looping. The helper now rebuilds a config it
+  wrote whose `include` target exists in neither `/etc/pam.d` nor
+  `/usr/lib/pam.d`, package upgrades run that repair for services already
+  enabled, and `pam check` reports `BROKEN` with the missing target instead
+  of `OK`. Configs you maintain yourself are never rebuilt, and a config
+  that cannot be rebuilt is kept rather than deleted.
 - ssh-agent: the fingerprint hint on the client's terminal ("Please verify
   your fingerprint...", the per-attempt "not recognized — N attempts left",
   and "Verified — signing...") was silently gone since the daemon moved to

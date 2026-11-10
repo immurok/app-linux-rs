@@ -13,6 +13,8 @@ main() {
         [ -d "$PKG_ROOT$d" ] && run chown -R immurok:immurok "$PKG_ROOT$d"
     done
     run systemd-tmpfiles --create immurok.conf
+    # 旧版本留下的坏 PAM 配置在这里自愈（只修已经开过的服务，见 lib.sh）。
+    repair_pam_configs
 
     if have_systemd; then
         run systemctl daemon-reload
@@ -29,7 +31,7 @@ main() {
     fi
     # 常驻的 immurok-gui（--gapplication-service）跑的还是旧二进制，GApplication
     # 会把之后每次启动都转发给它。结束掉，下次启动由 D-Bus 拉起新版本。
-    if pgrep -f 'immurok-gui --gapplication-service' >/dev/null 2>&1; then
+    if gui_service_running; then
         run pkill -f 'immurok-gui --gapplication-service'
     fi
 

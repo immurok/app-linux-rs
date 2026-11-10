@@ -6,7 +6,7 @@
 //! 装那行不产生任何效果。详见 immurok_client::pam 的说明。
 
 use crate::socket_client::DaemonClient;
-use immurok_common::pam::pam_line_present;
+use immurok_common::pam::{broken_include, pam_line_present};
 pub use immurok_client::pam::{desired_services, services_to_repair};
 use immurok_client::pam::{find_helper, run_helper as run_helper_shared, PamError, PAM_SERVICES};
 
@@ -44,26 +44,31 @@ pub fn run_check() {
     let desired = desired_services(sudo_on, polkit_on);
 
     println!("PAM status (by enabled features):");
-    let mut missing = Vec::new();
+    let mut bad = Vec::new();
     for svc in &desired {
-        let ok = pam_line_present(svc);
-        let state = if ok {
-            "\x1b[32mOK\x1b[0m"
+        // 三态而不是两态：旧版留下的坏配置里 auth 行是在的，只看
+        // pam_line_present 会报 OK —— 而那台机器的 polkit 正在死循环。
+        // 判定细节见 immurok_common::pam::broken_include_in。
+        let state = if !pam_line_present(svc) {
+            bad.push(*svc);
+            "\x1b[33mMISSING\x1b[0m".to_string()
+        } else if let Some(target) = broken_include(svc) {
+            bad.push(*svc);
+            format!("\x1b[31mBROKEN\x1b[0m (include {target}: no such PAM config)")
         } else {
-            missing.push(*svc);
-            "\x1b[33mMISSING\x1b[0m"
+            "\x1b[32mOK\x1b[0m".to_string()
         };
         println!("  {:<10} {}", svc, state);
     }
     if desired.is_empty() {
         println!("\x1b[90mNo PAM-dependent features are enabled.\x1b[0m");
     }
-    if missing.is_empty() {
+    if bad.is_empty() {
         println!("\x1b[32mAll configured.\x1b[0m");
     } else {
         eprintln!(
-            "\x1b[33m{} missing — run 'immurok-cli pam repair' to fix.\x1b[0m",
-            missing.len()
+            "\x1b[33m{} need repair — run 'immurok-cli pam repair' to fix.\x1b[0m",
+            bad.len()
         );
         std::process::exit(1);
     }

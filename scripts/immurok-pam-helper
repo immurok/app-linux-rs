@@ -29,27 +29,68 @@ PAM_VENDOR_D="${IMMUROK_PAM_VENDOR_D:-/usr/lib/pam.d}"
 # 发行版后续对该服务 PAM 栈的更新就再也到不了这台机器。
 IMMUROK_MARKER="Created by immurok"
 
-# 选择 polkit-1 模板的 include 目标：
-#   - Arch / Fedora 用 password-auth（system-auth 的常用别名）
-#   - Debian / Ubuntu 没有 password-auth，用 common-auth 等
-# 同时存在时优先 password-auth（即使在 Debian 衍生发行版上，
-# password-auth 也是 PAM 1.0 推荐用法）。
-if [ -f "$PAM_D/password-auth" ]; then
-    PAM_INCLUDE_TARGET="password-auth"
-elif [ -f "$PAM_D/common-auth" ]; then
-    PAM_INCLUDE_TARGET="common-auth"
-else
-    PAM_INCLUDE_TARGET="password-auth"  # fallback — 至少 PAM 会报错而不是悄悄过
-fi
+# 选择 polkit-1 模板的 include 目标。按文件是否真实存在来判断，顺序：
+#   - password-auth —— Fedora / RHEL（两份都有，非控制台服务按惯例走这份，
+#     已在 Fedora 44 验证）
+#   - system-auth   —— Arch、openSUSE 等（Arch **没有** password-auth）
+#   - common-auth   —— Debian / Ubuntu
+# 三个都没有就返回失败，由调用方报错。绝不能 fallback 到某个猜的名字：
+# include 指向不存在的文件时 PAM 只会报 "unable to open config"，auth 和
+# account 两条栈一起打不开 —— 指纹明明 Approved，polkit-agent-helper 的
+# pam_acct_mgmt() 依然失败，polkit 把它当认证失败后反复弹框，变成死循环
+# （旧实现 fallback 回 password-auth，Arch 上实测就是这个下场）。
+pam_include_target() {
+    if [ -n "${IMMUROK_PAM_INCLUDE_TARGET:-}" ]; then
+        echo "$IMMUROK_PAM_INCLUDE_TARGET"; return 0
+    fi
+    local candidate
+    for candidate in password-auth system-auth common-auth; do
+        [ -f "$PAM_D/$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
 
-# polkit-1 文件不存在时需要创建完整模板
-POLKIT_TEMPLATE="#%PAM-1.0
-# Created by immurok
-auth        sufficient    pam_immurok.so timeout=10
-auth        include       $PAM_INCLUDE_TARGET
-account     include       $PAM_INCLUDE_TARGET
-password    include       $PAM_INCLUDE_TARGET
-session     include       $PAM_INCLUDE_TARGET"
+# polkit-1 在 /etc 和厂商目录都没有文件时的兜底模板。只在真要新建时调用，
+# 这样 remove / add sudo 不会被 include 目标探测失败牵连。
+polkit_template() {
+    local target
+    target=$(pam_include_target) || return 1
+    printf '#%%PAM-1.0\n# %s\n' "$IMMUROK_MARKER"
+    printf 'auth        sufficient    pam_immurok.so timeout=10\n'
+    local stack
+    for stack in auth account password session; do
+        printf '%-11s include       %s\n' "$stack" "$target"
+    done
+}
+
+# ── 坏配置自愈 ───────────────────────────────────────────────
+# 列出一份 PAM 配置里所有 include / substack 的目标，含 Debian 的 @include。
+pam_include_targets() {
+    sed -nE \
+        -e 's/^[[:space:]]*(auth|account|password|session)[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+).*/\3/p' \
+        -e 's/^[[:space:]]*@include[[:space:]]+([^[:space:]]+).*/\1/p' \
+        "$1" | sort -u
+}
+
+# 配置坏不坏：有 include 目标在 /etc/pam.d 和厂商目录里都找不到就算坏，
+# 打印第一个找不到的目标并返回 0。PAM 的查找顺序是 /etc 优先、缺失才落到
+# /usr/lib/pam.d，所以两边都没有才算真的打不开。
+#
+# 为什么要专门治这种坏法：include 指向不存在的文件时 PAM 只报
+# "unable to open config"，auth 和 account 两条栈会一起打不开 —— 指纹
+# Approved 了 pam_acct_mgmt() 依然失败，polkit 当成认证失败反复弹框，变成
+# 死循环。0.9.1–0.9.3 在 Arch 上就是这个下场（旧探测 fallback 到 Arch 并不
+# 存在的 password-auth），而那份坏文件里 pam_immurok 行是在的，于是
+# add 只会回 ALREADY_PRESENT、GUI 也照样显示已安装，光升级治不好。
+pam_config_broken() {
+    local file="$1" target
+    for target in $(pam_include_targets "$file"); do
+        [ -f "$PAM_D/$target" ] && continue
+        [ -f "$PAM_VENDOR_D/$target" ] && continue
+        echo "$target"; return 0
+    done
+    return 1
+}
 
 # ── PAM 模块目录检测 ─────────────────────────────────────────
 pam_module_dir() {
@@ -284,11 +325,26 @@ process_one() {
     case "$ACTION" in
         add)
             check_module || { echo "ERROR:MODULE_NOT_INSTALLED($SERVICE)"; return 0; }
-            if [ "$SERVICE" = "polkit-1" ] && [ ! -f "$PAM_FILE" ]; then
-                echo "$POLKIT_TEMPLATE" > "$PAM_FILE"; chmod 644 "$PAM_FILE"
-                echo "OK:CREATED($SERVICE)"; return 0
+            # 自愈：我们自己建的文件（polkit-1 模板 / 厂商副本）如果 include
+            # 指向两边都不存在的文件，整份重建 —— 否则下面会回
+            # ALREADY_PRESENT，坏配置永远留着（见 pam_config_broken 的说明）。
+            # 只动带标记的文件：用户自己维护的那份轮不到我们重建。
+            local repaired=0
+            if [ -f "$PAM_FILE" ] && grep -q "$IMMUROK_MARKER" "$PAM_FILE" \
+               && pam_config_broken "$PAM_FILE" >/dev/null; then
+                # 确认重建得出来再删。删完建不起来的话这个服务就一份配置都没
+                # 有了，PAM 会落到 /etc/pam.d/other —— 那比留着坏文件更糟。
+                if [ -f "$PAM_VENDOR_D/$SERVICE" ] \
+                   || { [ "$SERVICE" = "polkit-1" ] && pam_include_target >/dev/null; }; then
+                    rm -f "$PAM_FILE"; repaired=1
+                else
+                    echo "ERROR:CANNOT_REPAIR($SERVICE)"; return 0
+                fi
             fi
             # /etc 里没有，但厂商目录有：抄一份当 override 再插行。
+            # 这一步必须排在 polkit-1 模板之前：Arch 的 polkit 包自带
+            # /usr/lib/pam.d/polkit-1（include system-auth），发行版自己写的
+            # include 目标一定比我们猜的准，照抄就不会猜错。
             local from_vendor=0
             if [ ! -f "$PAM_FILE" ] && [ -f "$PAM_VENDOR_D/$SERVICE" ]; then
                 cp "$PAM_VENDOR_D/$SERVICE" "$PAM_FILE" || {
@@ -299,13 +355,31 @@ process_one() {
                 chmod 644 "$PAM_FILE"
                 from_vendor=1
             fi
+            # 厂商那份也没有：polkit-1 允许用模板兜底（不少发行版本来就不带
+            # 这个文件）。探测不到 include 目标时宁可报错，也不留坏配置。
+            if [ "$SERVICE" = "polkit-1" ] && [ ! -f "$PAM_FILE" ]; then
+                local template
+                template=$(polkit_template) || {
+                    echo "ERROR:NO_PAM_INCLUDE_TARGET($SERVICE)"; return 0; }
+                printf '%s\n' "$template" > "$PAM_FILE"; chmod 644 "$PAM_FILE"
+                if [ "$repaired" = "1" ]; then echo "OK:REPAIRED($SERVICE)"
+                else echo "OK:CREATED($SERVICE)"; fi
+                return 0
+            fi
             if [ ! -f "$PAM_FILE" ]; then echo "ERROR:FILE_NOT_FOUND($SERVICE)"; return 0; fi
             if grep -q 'pam_immurok\.so' "$PAM_FILE"; then echo "OK:ALREADY_PRESENT($SERVICE)"; return 0; fi
             local first_auth
             first_auth=$(grep -nE '^(auth[[:space:]]|@include[[:space:]])' "$PAM_FILE" | head -1 | cut -d: -f1)
             if [ -z "$first_auth" ]; then echo "ERROR:NO_AUTH_LINE($SERVICE)"; return 0; fi
-            sed -i "${first_auth}i\\${PAM_LINE}" "$PAM_FILE"
-            if [ "$from_vendor" = "1" ]; then
+            # polkit-1 的 timeout=10 是刻意压短的（模块默认 40s，见
+            # pam/pam_immurok.c 的 DEFAULT_TIMEOUT_SEC），走厂商副本这条路时
+            # 也要带上，不能因为换了代码路径就悄悄变回 40s。
+            local line="$PAM_LINE"
+            [ "$SERVICE" = "polkit-1" ] && line="$PAM_LINE timeout=10"
+            sed -i "${first_auth}i\\${line}" "$PAM_FILE"
+            if [ "$repaired" = "1" ]; then
+                echo "OK:REPAIRED($SERVICE)"
+            elif [ "$from_vendor" = "1" ]; then
                 echo "OK:ADDED_FROM_VENDOR($SERVICE)"
             else
                 echo "OK:ADDED($SERVICE)"

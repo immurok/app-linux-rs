@@ -11,6 +11,7 @@
 #   IMMUROK_PKG_FORCE_SYSTEMD   1/0 覆盖 have_systemd
 #   IMMUROK_PKG_FAKE_USERS      dryrun 下 logged_in_users 的返回（空格分隔）
 #   IMMUROK_PKG_FAKE_GROUPS     dryrun 下 pkg_has_group 查的组列表（空格分隔）
+#   IMMUROK_PKG_FAKE_GUI        1/0 覆盖 gui_service_running（dryrun 下默认 0）
 
 PKG_ROOT="${IMMUROK_PKG_ROOT:-}"
 
@@ -96,6 +97,41 @@ pkg_has_group() {
         return 1
     fi
     getent group "$1" >/dev/null 2>&1
+}
+
+# 常驻的 immurok-gui（--gapplication-service）在不在跑。
+gui_service_running() {
+    case "${IMMUROK_PKG_FAKE_GUI:-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    # dryrun 下不读宿主机进程表 —— 否则在开着 immurok-gui 的机器上跑测试会
+    # 多出一条 pkill，序列断言随宿主机状态飘（CI 容器里没 GUI 所以一直是绿的）。
+    [ "${IMMUROK_PKG_DRYRUN:-}" = "1" ] && return 1
+    pgrep -f 'immurok-gui --gapplication-service' >/dev/null 2>&1
+}
+
+# 自愈存量机器上的坏 PAM 配置：0.9.1–0.9.3 在 Arch 上写出的 polkit-1 里
+# include 指向并不存在的 password-auth，auth 和 account 两条栈一起打不开，
+# polkit 认证会死循环。
+#
+# 只碰已经带了 immurok 行的服务 —— 那是用户此前主动开过的，重建它不等于替他
+# 开新功能，PAM 仍然是显式 opt-in。helper 的 add 对健康配置是空操作
+# （ALREADY_PRESENT），所以这一步每次升级都跑也无妨。
+#
+# 为什么非得在包脚本里做：坏配置里 pam_immurok 行是在的，helper 只会回
+# ALREADY_PRESENT、Rust 侧的 service_status 也照样算「已安装」，用户不会想到
+# 去点修复 —— 光升级到修好的版本治不好存量机器。
+repair_pam_configs() {
+    helper="$PKG_ROOT/usr/bin/immurok-pam-helper"
+    [ -x "$helper" ] || return 0
+    for svc in sudo polkit-1; do
+        f="$PKG_ROOT/etc/pam.d/$svc"
+        [ -f "$f" ] || continue
+        grep -q 'pam_immurok\.so' "$f" 2>/dev/null || continue
+        run "$helper" add "$svc"
+    done
+    return 0
 }
 
 # make install 装到 /usr/local 的痕迹。两种装法同机会互相遮（PATH、unit 覆盖、
