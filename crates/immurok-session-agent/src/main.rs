@@ -9,12 +9,16 @@
 //!                    UI:DIALOG:AGENT:<secs>:<cmd>   show the agent approval
 //!                    UI:DISMISS                     take it down
 //!                    NOTIFY:<text>                  desktop notification
+//!                    TTY_HINT:<pid>:<code>          FP-gate hint on that
+//!                                                   client's terminal
 //!                    SSH_TAKEOVER:ON|OFF            reconcile ~/.ssh/config
 //!   agent  → daemon  UI:CANCEL                      user cancelled/closed it
 //!
 //! It holds no secrets and makes no authorization decisions — a same-uid
 //! attacker can kill it or fake it, and all that buys them is *no* dialog or a
 //! spurious cancel. Approval still requires a fingerprint on the device.
+
+mod tty;
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -57,11 +61,14 @@ async fn run() -> Result<(), String> {
 
     let mut lines = BufReader::new(rx).lines();
     let mut dialog: Option<Child> = None;
+    // Dropped when the connection does, which erases any half-drawn hint: if
+    // the daemon dies mid-gate, the user's terminal must not keep spinning.
+    let mut hints = tty::HintRenderer::default();
 
     loop {
         tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => handle(line.trim(), &mut dialog).await,
+                Ok(Some(line)) => handle(line.trim(), &mut dialog, &mut hints).await,
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(format!("read failed: {e}")),
             },
@@ -81,7 +88,7 @@ async fn run() -> Result<(), String> {
     }
 }
 
-async fn handle(line: &str, dialog: &mut Option<Child>) {
+async fn handle(line: &str, dialog: &mut Option<Child>, hints: &mut tty::HintRenderer) {
     if line == "UI:DIALOG:AUTH" {
         replace_dialog(dialog, spawn_dialog(&[]));
     } else if let Some(rest) = line.strip_prefix("UI:DIALOG:AGENT:") {
@@ -95,6 +102,8 @@ async fn handle(line: &str, dialog: &mut Option<Child>) {
         take_down(dialog.take());
     } else if let Some(text) = line.strip_prefix("NOTIFY:") {
         notify(text);
+    } else if let Some((pid, hint)) = immurok_common::tty_hint::TtyHint::parse(line) {
+        hints.apply(pid, hint);
     } else if let Some(state) = line.strip_prefix("SSH_TAKEOVER:") {
         let on = state == "ON";
         if let Err(e) = immurok_common::ssh_config::apply(on) {

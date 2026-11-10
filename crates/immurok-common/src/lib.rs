@@ -6,4 +6,5 @@ pub mod protocol;
 pub mod security;
 pub mod ssh_config;
 pub mod socket_proto;
+pub mod tty_hint;
 pub mod types;

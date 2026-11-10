@@ -3,6 +3,38 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
+## 0.9.3 — 2026-11-10
+
+### Fixed
+
+- ssh-agent: the fingerprint hint on the client's terminal ("Please verify
+  your fingerprint...", the per-attempt "not recognized — N attempts left",
+  and "Verified — signing...") was silently gone since the daemon moved to
+  the dedicated `immurok` user. It drew the line itself, which needs two
+  things that privsep took away: `readlink /proc/<ssh pid>/fd/2` (the ptrace
+  check wants the same uid) and write access to the resulting `/dev/pts/N`
+  (0600, owned by the logged-in user). Both failed best-effort, so every
+  `git push` / `ssh host` waited on a fingerprint with nothing on screen —
+  on every install, not just source builds. The daemon now pushes an enum
+  hint code plus the client's pid to `immurok-session-agent`, which runs as
+  the user and draws the spinner there. The sudo hint was never affected: it
+  lives in `pam_immurok.so`, inside sudo's own process.
+- daemon: a Bluetooth link the controller dropped without the kernel
+  delivering a Disconnection Complete left BlueZ reporting `Connected` +
+  `ServicesResolved` for a device that rejected every GATT operation with
+  "Not connected" — a ghost link. The daemon believed those properties, so
+  it re-ran a session every 30 s forever, never rebuilt the link, and every
+  UI kept saying "Bluetooth connected, device starting up" with no device
+  data behind it. A session that dies that way now forces BlueZ's state
+  back to reality with one `Disconnect()`, which lets the next active
+  connect make a real link; three ghost links in a row log that the
+  controller itself looks wedged, with the recovery command.
+- daemon: `link_up` is refreshed on every iteration of the wait-for-device
+  loop. It used to be written only at the instant a session ended, so once
+  the loop settled into its active-connect backoff (up to hours), the last
+  value froze — `immurok-cli status` and the GUI sidebar reported
+  "Bluetooth connected" for a link BlueZ already called gone.
+
 ## 0.9.2 — 2026-11-02
 
 ### Added

@@ -13,7 +13,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 use immurok_common::protocol;
+use immurok_common::tty_hint::{TtyHint, TtyHintFailure};
 
 use crate::coordinator::Coordinator;
 use crate::keystore;
@@ -282,15 +283,12 @@ async fn handle_sign_request(
 
     // The ssh-agent is a background daemon with no handle to the terminal
     // that issued this request, so it can't print a "touch your finger" hint
-    // the way the PAM module does for sudo. Resolve the client's controlling
-    // terminal from its PID (SO_PEERCRED) and animate a spinner there for the
-    // duration of the FP gate. Best-effort: no tty → no spinner, never fatal.
-    // Yellow to match the PAM (sudo) spinner. The message carries its own
-    // colour so set_message can switch to red/green mid-gate; the frame is
-    // coloured by the spinner itself.
-    let mut spinner = client_tty_path(peer_pid).and_then(|tty| {
-        spawn_tty_spinner(tty, "\x1b[33mPlease verify your fingerprint...\x1b[0m")
-    });
+    // the way the PAM module does for sudo — and since privsep it cannot write
+    // to that terminal even when it knows which one it is (see `ClientHint`).
+    // So we push the client's pid (from SO_PEERCRED) plus a hint code to the
+    // session agent, which runs as the user and draws the line there.
+    // Best-effort: no agent subscribed → no hint, never fatal.
+    let mut hint = ClientHint::open(coord.clone(), peer_pid).await;
 
     // KEY_SIGN is FP-gated. Drive the gated call while listening for gate
     // events so the client terminal tracks the device in real time: each
@@ -319,9 +317,7 @@ async fn handle_sign_request(
                     Ok(0) | Err(_) => {
                         info!("SSH agent: client disconnected during sign (Ctrl+C?) — cancelling FP gate");
                         coord.gate_cancel.notify_one();
-                        if let Some(sp) = spinner.take() {
-                            sp.finish(None);
-                        }
+                        hint.close(TtyHint::Done).await;
                         return;
                     }
                     // No pipelined data is expected mid-sign; ignore and keep
@@ -332,21 +328,13 @@ async fn handle_sign_request(
             ev = gate_events.recv() => {
                 match ev {
                     Ok(crate::coordinator::FpGateEvent::Mismatch { remaining }) => {
-                        if let Some(sp) = spinner.as_ref() {
-                            let noun = if remaining == 1 { "attempt" } else { "attempts" };
-                            sp.set_message(format!(
-                                "\x1b[31m✗ Fingerprint not recognized\x1b[0m — {} {} left, touch again…",
-                                remaining, noun
-                            ));
-                        }
+                        hint.set(TtyHint::Mismatch { remaining }).await;
                     }
                     Ok(crate::coordinator::FpGateEvent::Approved) => {
-                        // Touch matched — device is now signing. The spinner
-                        // keeps spinning until the signature is actually read
-                        // back, so the hint tracks real progress (no fixed delay).
-                        if let Some(sp) = spinner.as_ref() {
-                            sp.set_message("\x1b[32m✓ Verified — signing...\x1b[0m");
-                        }
+                        // Touch matched — device is now signing. The hint keeps
+                        // spinning until the signature is actually read back,
+                        // so it tracks real progress (no fixed delay).
+                        hint.set(TtyHint::Signing).await;
                     }
                     Err(_) => {} // Lagged/Closed → keep awaiting the gate result.
                 }
@@ -358,24 +346,20 @@ async fn handle_sign_request(
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             warn!("SSH agent: KEY_SIGN BLE error: {}", e);
-            let line = if e.contains("0x07") {
-                "\x1b[31m✗ Fingerprint not recognized — verification failed\x1b[0m"
+            let why = if e.contains("0x07") {
+                TtyHintFailure::NotRecognized
             } else if e.contains("timeout") || e.contains("0x06") {
-                "\x1b[31m✗ Fingerprint verification timed out\x1b[0m"
+                TtyHintFailure::TimedOut
             } else {
-                "\x1b[31m✗ Fingerprint verification failed\x1b[0m"
+                TtyHintFailure::Failed
             };
-            if let Some(sp) = spinner.take() {
-                sp.finish(Some(line.into()));
-            }
+            hint.close(TtyHint::Failed(why)).await;
             send_failure(stream).await;
             return;
         }
         Err(()) => {
             warn!("SSH agent: KEY_SIGN timeout");
-            if let Some(sp) = spinner.take() {
-                sp.finish(Some("\x1b[31m✗ Fingerprint verification timed out\x1b[0m".into()));
-            }
+            hint.close(TtyHint::Failed(TtyHintFailure::TimedOut)).await;
             send_failure(stream).await;
             return;
         }
@@ -383,14 +367,12 @@ async fn handle_sign_request(
 
     if status != protocol::RSP_OK && status != protocol::RSP_FP_GATE_APPROVED {
         warn!("SSH agent: KEY_SIGN failed: status=0x{:02x}", status);
-        if let Some(sp) = spinner.take() {
-            sp.finish(Some("\x1b[31m✗ Fingerprint verification failed\x1b[0m".into()));
-        }
+        hint.close(TtyHint::Failed(TtyHintFailure::Failed)).await;
         send_failure(stream).await;
         return;
     }
 
-    // FP gate approved. Keep the "✓ Verified — signing…" spinner running while
+    // FP gate approved. Keep the "✓ Verified — signing..." hint running while
     // we read the signature back over BLE (KEY_RESULT, ~1-2s) — it's erased
     // only once the signature is actually in hand, so the hint covers the real
     // duration with no blank gap and no fixed delay.
@@ -448,9 +430,7 @@ async fn handle_sign_request(
                 "SSH agent: failed to read signature (got {} bytes)",
                 signature.len()
             );
-            if let Some(sp) = spinner.take() {
-                sp.finish(Some("\x1b[31m✗ Signing failed\x1b[0m".into()));
-            }
+            hint.close(TtyHint::Failed(TtyHintFailure::SigningFailed)).await;
             send_failure(stream).await;
             return;
         }
@@ -480,11 +460,9 @@ async fn handle_sign_request(
     body.push(SSH_AGENT_SIGN_RESPONSE);
     append_ssh_string(&mut body, &sig_blob);
 
-    // Signature in hand — stop the spinner (erase, like sudo) right as we hand
-    // it back, so "signing…" spans exactly the real signing+readback window.
-    if let Some(sp) = spinner.take() {
-        sp.finish(None);
-    }
+    // Signature in hand — erase the hint (like sudo) right as we hand it back,
+    // so "signing..." spans exactly the real signing+readback window.
+    hint.close(TtyHint::Done).await;
 
     send_agent_message(stream, &body).await;
     info!(
@@ -533,112 +511,65 @@ async fn send_failure(stream: &mut UnixStream) {
     send_agent_message(stream, &[SSH_AGENT_FAILURE]).await;
 }
 
-/// Resolve the controlling terminal of the process connected to the agent
-/// socket, so the FP-gate prompt lands on the terminal that ran `git push` /
-/// `ssh host`. ssh keeps its stderr (fd 2) on the terminal even when git
-/// pipes its stdin/stdout, so try fd 2 first, then 0/1. None if no fd points
-/// at a pts/tty (e.g. fully detached / piped).
-fn client_tty_path(pid: i32) -> Option<std::path::PathBuf> {
-    for fd in [2, 0, 1] {
-        if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
-            let s = target.to_string_lossy();
-            if s.starts_with("/dev/pts/") || s.starts_with("/dev/tty") {
-                return Some(target);
-            }
-        }
-    }
-    None
+/// The fingerprint-gate hint on the client's own terminal, driven through the
+/// session agent.
+///
+/// Privsep put that terminal out of reach: as the `immurok` system user the
+/// daemon can neither `readlink /proc/<client pid>/fd/2` (the ptrace check
+/// wants the same uid) nor open the `/dev/pts/N` it would name (0600, owned by
+/// the logged-in user). So this type only *decides* — it pushes an enum code
+/// and the client's pid onto the session-agent channel, and the agent, which
+/// does run as that user, resolves the terminal and animates the line.
+///
+/// Never free text: the agent owns the strings. A pts interprets what is
+/// written to it, so daemon-side text would turn any future hint that embeds
+/// remote data into an escape-sequence injection on the user's terminal.
+///
+/// Every push is fire-and-forget. `push_ui` answers `false` when no agent is
+/// subscribed (a tty-only login, or the agent is down), which means "no hint"
+/// — never a failure, and never consent.
+struct ClientHint {
+    coord: Arc<Coordinator>,
+    pid: i32,
+    closed: bool,
 }
 
-/// Animated spinner written directly to the client's terminal while the FP
-/// gate is open — the ssh-agent equivalent of the PAM module's spinner. A
-/// dedicated OS thread re-draws the (mutable) message line every 80 ms.
-/// `set_message` swaps the text mid-gate (e.g. on a mismatch); `finish`
-/// stops the thread and either leaves a final line or erases it. `Drop`
-/// erases as a fallback for any return path that didn't call `finish`.
-struct TtySpinner {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    msg: Arc<Mutex<String>>,
-    join: Option<std::thread::JoinHandle<()>>,
-    tty: std::path::PathBuf,
-    finalized: bool,
-}
-
-impl TtySpinner {
-    /// Replace the spinning line's text (kept until the next call / finish).
-    fn set_message(&self, m: impl Into<String>) {
-        if let Ok(mut g) = self.msg.lock() {
-            *g = m.into();
-        }
+impl ClientHint {
+    /// Open the hint on `pid`'s terminal, showing the waiting line.
+    async fn open(coord: Arc<Coordinator>, pid: i32) -> Self {
+        let h = ClientHint {
+            coord,
+            pid,
+            closed: false,
+        };
+        h.set(TtyHint::Waiting).await;
+        h
     }
 
-    /// Stop the spinner. `Some(line)` leaves that line on the terminal (with a
-    /// trailing newline); `None` erases the spinner line. Consumes self.
-    fn finish(mut self, final_line: Option<String>) {
-        self.finalize(final_line);
+    /// Swap the line's state while the gate is open.
+    async fn set(&self, hint: TtyHint) {
+        self.coord.push_ui(hint.encode(self.pid)).await;
     }
 
-    fn finalize(&mut self, final_line: Option<String>) {
-        use std::io::Write;
-        if self.finalized {
+    /// Take the line down: `Done` erases it, `Failed` leaves the reason. Later
+    /// calls are ignored, so the first outcome to be decided is the one shown.
+    async fn close(&mut self, hint: TtyHint) {
+        if self.closed {
             return;
         }
-        self.finalized = true;
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.tty) {
-            match final_line {
-                Some(l) => {
-                    let _ = write!(f, "\r\x1b[K{}\n", l);
-                }
-                None => {
-                    let _ = f.write_all(b"\r\x1b[K"); // carriage return + erase to EOL
-                }
-            }
-            let _ = f.flush();
-        }
+        self.closed = true;
+        self.coord.push_ui(hint.encode(self.pid)).await;
     }
 }
 
-impl Drop for TtySpinner {
+impl Drop for ClientHint {
+    /// Backstop for a return path that forgot to `close`: without it the
+    /// user's terminal would keep spinning until the agent reconnects.
     fn drop(&mut self) {
-        self.finalize(None);
+        if !self.closed {
+            self.coord.try_push_ui(TtyHint::Done.encode(self.pid));
+        }
     }
-}
-
-/// Start a [`TtySpinner`] on `tty`. None if the terminal can't be opened.
-fn spawn_tty_spinner(tty: std::path::PathBuf, initial_msg: &str) -> Option<TtySpinner> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).open(&tty).ok()?;
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_t = stop.clone();
-    let msg = Arc::new(Mutex::new(initial_msg.to_string()));
-    let msg_t = msg.clone();
-    let join = std::thread::Builder::new()
-        .name("imk-ssh-spinner".into())
-        .spawn(move || {
-            const FRAMES: [&str; 10] =
-                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0usize;
-            while !stop_t.load(Ordering::Relaxed) {
-                let line = msg_t.lock().map(|g| g.clone()).unwrap_or_default();
-                // \r + erase-line + yellow frame + " " + message (self-coloured)
-                let _ = write!(f, "\r\x1b[K\x1b[33m{}\x1b[0m {}", FRAMES[i % FRAMES.len()], line);
-                let _ = f.flush();
-                i += 1;
-                std::thread::sleep(Duration::from_millis(80));
-            }
-        })
-        .ok()?;
-    Some(TtySpinner {
-        stop,
-        msg,
-        join: Some(join),
-        tty,
-        finalized: false,
-    })
 }
 
 // ── SSH wire format helpers ─────────────────────────────────

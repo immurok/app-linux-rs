@@ -159,6 +159,12 @@ pub const BLE_RECONNECT_BACKOFF_MAX_SECS: u64 = 30;
 // A BLE session that lasted at least this long is treated as "real work"
 // (normal connect → later disconnect) and resets the reconnect backoff.
 pub const BLE_SESSION_STABLE_SECS: u64 = 10;
+// A ghost link — BlueZ reporting Connected + ServicesResolved while every
+// GATT operation comes back "Not connected" — is normally cleared by the one
+// Disconnect() the daemon issues after such a session. This many in a row
+// means the Bluetooth controller itself is wedged, which no amount of
+// reconnecting fixes, so the daemon says so once instead of retrying silently.
+pub const BLE_GHOST_LINK_CONTROLLER_HINT_AFTER: u32 = 3;
 // How often the wait-for-device loop fires an ACTIVE Device.Connect() when the
 // device is absent. BlueZ does not reliably auto-reconnect BLE LE devices, and
 // the logind resume kick only covers the suspend case — so a plain

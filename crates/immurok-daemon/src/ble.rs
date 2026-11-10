@@ -38,19 +38,51 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCommand>) {
     let mut backoff_secs = BLE_RECONNECT_INTERVAL_SECS;
+    let mut ghost_streak: u32 = 0;
     loop {
         let session_start = tokio::time::Instant::now();
-        match connect_and_serve(&coordinator, &mut cmd_rx).await {
-            Ok(()) => info!("BLE session ended normally"),
-            Err(e) => warn!("BLE session error: {}", e),
-        }
+        let verdict = match connect_and_serve(&coordinator, &mut cmd_rx).await {
+            Ok(()) => {
+                info!("BLE session ended normally");
+                classify_session_end(None)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!("BLE session error: {}", msg);
+                classify_session_end(Some(&msg))
+            }
+        };
         coordinator.is_connected.store(false, Ordering::Relaxed);
         coordinator.is_device_verified.store(false, Ordering::Relaxed);
         coordinator.challenge_verified.store(false, Ordering::Relaxed);
         *coordinator.device_status.write().await = None;
+
+        // The session died with every GATT op saying "Not connected". If
+        // BlueZ *still* claims the device is connected, its properties are a
+        // ghost (see drop_ghost_link) and believing them is what used to wedge
+        // the daemon here forever. Clear them so the retry below can build a
+        // real link.
+        if verdict == LinkVerdict::Ghost && check_immurok_connected().await {
+            ghost_streak += 1;
+            warn!("BlueZ still reports the device connected but GATT does not — ghost link, dropping it");
+            drop_ghost_link().await;
+            if ghost_streak == BLE_GHOST_LINK_CONTROLLER_HINT_AFTER {
+                warn!(
+                    "{} ghost links in a row — the Bluetooth controller itself looks wedged. \
+                     Check `journalctl -k | grep -i 'mac access'`; reloading the controller \
+                     driver (e.g. `modprobe -r btintel_pcie && modprobe btintel_pcie`) or a \
+                     suspend/resume cycle is what recovers it.",
+                    ghost_streak
+                );
+            }
+        } else {
+            ghost_streak = 0;
+        }
+
         // The BlueZ link usually survives a failed session start (helper not
         // READY in time → retry below), so keep reporting it as up instead
-        // of flashing "not connected" at the UI for the backoff second.
+        // of flashing "not connected" at the UI for the backoff second. After
+        // a dropped ghost link this now reads back false, which is the truth.
         coordinator.link_up.store(check_immurok_connected().await, Ordering::Relaxed);
 
         // Backoff before retrying. A GATT discovery failure (transient BlueZ
@@ -76,6 +108,68 @@ pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCo
 
         info!("Waiting for device reconnection...");
         wait_for_device_connected(&coordinator).await;
+    }
+}
+
+/// What the run loop should believe about the BlueZ link once a session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkVerdict {
+    /// Re-read BlueZ's properties and take them at face value: the session
+    /// ended for a reason that says nothing about the link being fake (normal
+    /// disconnect, helper start timeout, no device, an ATT error).
+    Trust,
+    /// Every GATT operation said the link was gone. If BlueZ still reports the
+    /// device as connected, that report cannot be true.
+    Ghost,
+}
+
+/// Classify a finished session from how it ended. `None` = ended cleanly.
+fn classify_session_end(err: Option<&str>) -> LinkVerdict {
+    match err {
+        Some(msg) if is_link_lost_error(msg) => LinkVerdict::Ghost,
+        _ => LinkVerdict::Trust,
+    }
+}
+
+/// Force BlueZ's properties back to reality after a ghost link.
+///
+/// A ghost link is BlueZ reporting `Connected` + `ServicesResolved` for a
+/// device that rejects every GATT operation with "Not connected". It appears
+/// when the controller loses a connection without the kernel delivering a
+/// Disconnection Complete — e.g. Intel `btintel_pcie` going through
+/// `Failed to get mac access -62` → `ACL packet for unknown connection
+/// handle`. Nothing can be written over such a link, and because BlueZ keeps
+/// calling it connected, neither BlueZ's own reconnect nor our
+/// `wait_for_device_connected` (which reads those same properties) will ever
+/// rebuild it: the daemon retried the session every 30 s forever while every
+/// UI kept saying "Bluetooth connected, device starting up".
+///
+/// `Disconnect()` clears the stale properties so the next active connect can
+/// make a real link. Matched by name only, not `Paired` — a ghost link has
+/// nothing to do with pairing state, and a device whose pairing was cleared
+/// still needs its dead link torn down.
+async fn drop_ghost_link() {
+    let Ok(session) = bluer::Session::new().await else { return };
+    let Ok(adapter) = session.default_adapter().await else { return };
+    let Ok(addrs) = adapter.device_addresses().await else { return };
+    for addr in addrs {
+        let Ok(device) = adapter.device(addr) else { continue };
+        let name_match = device
+            .name()
+            .await
+            .ok()
+            .flatten()
+            .map(|n| n.to_lowercase().starts_with(DEVICE_NAME_PREFIX))
+            .unwrap_or(false);
+        if !name_match {
+            continue;
+        }
+        match tokio::time::timeout(Duration::from_secs(2), device.disconnect()).await {
+            Ok(Ok(())) => info!("Dropped ghost link on {}", addr),
+            Ok(Err(e)) => warn!("Ghost-link disconnect failed: {}", e),
+            Err(_) => warn!("Ghost-link disconnect timed out"),
+        }
+        return;
     }
 }
 
@@ -247,6 +341,21 @@ impl HelperIO {
 
 // ── Device discovery & connection ────────────────────────────────────────────
 
+/// Read BlueZ's view of the link and publish it as `link_up`, returning it.
+///
+/// Every wait-loop iteration goes through here. `link_up` used to be written
+/// only in the run loop, at the instant a session ended — so once the wait
+/// loop below settled into its active-connect backoff (8→16→…→max seconds,
+/// potentially for hours) the last value froze. A link that had since gone
+/// away still read as up, and `immurok-cli status` / the GUI sidebar kept
+/// saying "Bluetooth connected, device starting up" with no device data
+/// behind it.
+async fn refresh_link_up(coordinator: &Arc<Coordinator>) -> bool {
+    let up = check_immurok_connected().await;
+    coordinator.link_up.store(up, Ordering::Relaxed);
+    up
+}
+
 /// Wait for an immurok device to become connected.
 ///
 /// Three-way race:
@@ -262,7 +371,7 @@ impl HelperIO {
 ///    while waiting for the device's advertise to be scanned.
 async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
     // Quick check: device might already be connected with services resolved
-    if check_immurok_connected().await {
+    if refresh_link_up(coordinator).await {
         return;
     }
 
@@ -285,7 +394,7 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
                 msg.body().deserialize() else { continue };
             // Trigger on Connected or ServicesResolved changes
             let dominated = changed.contains_key("Connected") || changed.contains_key("ServicesResolved");
-            if dominated && check_immurok_connected().await {
+            if dominated && refresh_link_up(coordinator).await {
                 info!("Device connected as HID keyboard (via BlueZ event)");
                 return;
             }
@@ -314,7 +423,7 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
                 burst_left = BLE_RESUME_BURST_ATTEMPTS;
                 idle_secs = BLE_ACTIVE_RECONNECT_INTERVAL_SECS;
             }
-            if check_immurok_connected().await {
+            if refresh_link_up(coordinator).await {
                 return;
             }
             if try_active_connect().await {
@@ -2162,7 +2271,7 @@ fn find_helper_script() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_link_lost_error;
+    use super::{classify_session_end, is_link_lost_error, LinkVerdict};
 
     #[test]
     fn link_lost_errors_are_recognised() {
@@ -2178,5 +2287,32 @@ mod tests {
         assert!(!is_link_lost_error("Operation failed with ATT error: 0x0e"));
         assert!(!is_link_lost_error("In Progress"));
         assert!(!is_link_lost_error("timeout: 0x01"));
+    }
+
+    #[test]
+    fn a_session_that_died_on_a_dead_gatt_link_is_a_ghost() {
+        // The exact texts connect_and_serve returns when every GATT write
+        // comes back "Not connected" while BlueZ still says Connected.
+        for err in [
+            "no usable BLE link: write failed: Not connected",
+            "BLE link lost: Not connected",
+            "BLE link lost during session start: Not connected",
+            "BLE link lost: org.freedesktop.DBus.Error.UnknownObject: ...",
+        ] {
+            assert_eq!(classify_session_end(Some(err)), LinkVerdict::Ghost, "{err}");
+        }
+    }
+
+    #[test]
+    fn ordinary_session_ends_leave_bluez_trusted() {
+        assert_eq!(classify_session_end(None), LinkVerdict::Trust);
+        for err in [
+            "device disconnected",
+            "no device",
+            "helper did not report READY in time",
+            "write failed: Operation failed with ATT error: 0x0e",
+        ] {
+            assert_eq!(classify_session_end(Some(err)), LinkVerdict::Trust, "{err}");
+        }
     }
 }

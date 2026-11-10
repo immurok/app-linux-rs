@@ -591,6 +591,21 @@ impl Coordinator {
         }
     }
 
+    /// Push one line to the session agent from a non-async context (`Drop`).
+    ///
+    /// `false` means nobody is subscribed *or* the slot was momentarily
+    /// write-locked. Only for best-effort cleanup lines, where losing one is
+    /// acceptable — anything that matters must go through [`Self::push_ui`].
+    pub fn try_push_ui(&self, line: impl Into<String>) -> bool {
+        match self.ui_out.try_read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(tx) => tx.send(line.into()).is_ok(),
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     pub fn settings_path(&self) -> std::path::PathBuf {
         self.state_dir
             .join(immurok_common::protocol::SETTINGS_FILE)
