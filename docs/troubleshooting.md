@@ -31,6 +31,9 @@ your login password.
 
 - `immurok-cli pam check` must not report `polkit-1` missing; if it does, `immurok-cli pam install polkit-1`
 - `immurok-cli settings` must show polkit on; if not, `immurok-cli set polkit on`
+- Every polkit prompt fails, even with the right password, and `/etc/pam.d/polkit-1`
+  includes `password-auth` on a distro without that file (Arch): run
+  `immurok-cli pam repair`
 - Flatpak Bitwarden: the polkit action file must exist, see §4.7
 - The "system authentication" option is off inside the app, or the app was
   started before the policy file was installed — restart it

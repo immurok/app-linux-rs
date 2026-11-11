@@ -5,7 +5,8 @@
  * The daemon runs as a dedicated system user and serves the whole machine, so
  * the path is fixed; the socket directory's ownership is the trust boundary
  * (see socket_trust.h).
- * Protocol: "AUTH:username:service" -> "OK", "DENY", or "TIMEOUT"
+ * Protocol: "AUTH:username:service:hints" -> "OK", "DENY", or "TIMEOUT",
+ * optionally preceded by "RETRY:<n>" progress lines (see auth_reply.h).
  *
  * Shows an animated braille spinner on the terminal while waiting.
  */
@@ -33,6 +34,7 @@
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
 
+#include "auth_reply.h"
 #include "fp_policy.h"
 #include "socket_trust.h"
 
@@ -69,6 +71,19 @@ static void spinner_write(FILE *tty, int frame, const char *message) {
     if (!tty) return;
     fprintf(tty, ANSI_ERASE_LINE ANSI_YELLOW "%s %s" ANSI_RESET,
             spinner_frames[frame % SPINNER_COUNT], message);
+}
+
+/* Spinner frame after a finger that did not match: say so, and how many
+ * tries are left, in place of the plain prompt. `remaining` comes off the
+ * wire as at most two digits (auth_reply.h); nothing else from the daemon
+ * is ever printed. */
+static void spinner_write_retry(FILE *tty, int frame, int remaining) {
+    if (!tty) return;
+    fprintf(tty, ANSI_ERASE_LINE ANSI_YELLOW "%s" ANSI_RESET " "
+            ANSI_RED "✗ Fingerprint not recognized" ANSI_RESET
+            " — %d %s left, touch again...",
+            spinner_frames[frame % SPINNER_COUNT], remaining,
+            remaining == 1 ? "attempt" : "attempts");
 }
 
 /* Show result and clear */
@@ -198,7 +213,9 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
         return PAM_AUTH_ERR;
     }
 
-    snprintf(request, sizeof(request), "AUTH:%s:%s", user, service);
+    /* ":hints" asks for RETRY progress lines. A daemon that does not know the
+     * field ignores it (it reads only user and service) and answers as before. */
+    snprintf(request, sizeof(request), "AUTH:%s:%s:hints", user, service);
     if (send(sock, request, strlen(request), 0) < 0) {
         close(sock);
         return PAM_AUTH_ERR;
@@ -211,6 +228,8 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
     FILE *tty = open_tty();
     int tty_rd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
     int frame = 0;
+    struct immurok_reply_state reply;
+    immurok_reply_init(&reply);
     time_t start = time(NULL);
     int result = PAM_AUTH_ERR;
     int nfds = sock + 1;
@@ -245,7 +264,10 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
         }
 
         /* Show spinner */
-        spinner_write(tty, frame++, "Please verify your fingerprint...");
+        if (reply.retry_remaining >= 0)
+            spinner_write_retry(tty, frame++, reply.retry_remaining);
+        else
+            spinner_write(tty, frame++, "Please verify your fingerprint...");
 
         /* Poll socket, tty and signalfd with an 80ms timeout */
         fd_set fds;
@@ -279,9 +301,13 @@ static int authenticate_via_socket(pam_handle_t *pamh, const char *user,
             break;
         }
         if (ready > 0 && FD_ISSET(sock, &fds)) {
-            memset(response, 0, sizeof(response));
-            n = recv(sock, response, sizeof(response) - 1, 0);
-            if (n > 0 && strncmp(response, "OK", 2) == 0) {
+            enum immurok_reply verdict;
+            n = recv(sock, response, sizeof(response), 0);
+            /* recv error and peer close both feed as "closed" -> DENY. */
+            verdict = immurok_reply_feed(&reply, response, n > 0 ? (size_t)n : 0);
+            if (verdict == IMMUROK_REPLY_PENDING)
+                continue; /* progress only: keep spinning with the new text */
+            if (verdict == IMMUROK_REPLY_OK) {
                 pam_syslog(pamh, LOG_INFO, "Approved for user %s", user);
                 result = PAM_SUCCESS;
             }

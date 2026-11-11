@@ -632,6 +632,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_auth_ignores_trailing_capability_field() {
+        // pam_immurok.so appends ":hints" to say it understands RETRY progress
+        // lines (pam/auth_reply.h). A daemon that sends none must still read
+        // the service name as before — "sudo", not "sudo:hints" — or every
+        // per-service setting lookup would miss.
+        let req = parse_request("AUTH:alice:sudo:hints").expect("parse failed");
+        assert_eq!(req, Request::Auth { user: "alice".into(), service: "sudo".into() });
+    }
+
+    #[test]
     fn parse_slot_status() {
         assert_eq!(parse_request("SLOT:STATUS").unwrap(), Request::SlotStatus);
     }

@@ -10,6 +10,7 @@
 # PAM unit-test binaries (built by pam/Makefile `make test`)
 /pam/test_fp_policy
 /pam/test_socket_trust
+/pam/test_auth_reply
 
 # Python bytecode from scripts/ (ble-notify-helper, immurok-auth-dialog)
 __pycache__/
