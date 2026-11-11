@@ -156,3 +156,12 @@ jobs:
             dist/*.rpm
             dist/*.pkg.tar.zst
             dist/SHA256SUMS
+
+  # Discord card. Called from here because the release above is created with
+  # GITHUB_TOKEN, which never triggers `on: release` in another workflow.
+  announce:
+    needs: release
+    uses: ./.github/workflows/discord-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
