@@ -48,24 +48,60 @@ sudo -k && sudo true     # should ask for your fingerprint, not your password
 | **Keys** | the device's SSH / OTP / API keystore; OTP codes and API values are shown for 30 s after a touch |
 | **Fingerprints** | enroll, rename, test and delete fingers |
 | **PAM** | install / remove the PAM hooks |
-| **Logs** | live daemon log |
+| **Logs** | live daemon log — warnings and errors by default, everything with `--debug` (see [Logging](#logging)) |
 
 Bind `immurok-gui --quick-fill` to a keyboard shortcut to pull an OTP code into
 any text field with one touch.
 
+For scripts and AI agents there is `imk`: `imk run --agent -- <command>` shows
+the wrapped command in a dialog and one touch approves every `sudo` and SSH
+signature inside it; `imk get imk://<category>/<name>` reads one stored secret
+the same way. Details and the agent rules file: [imk-skill](https://github.com/immurok/imk-skill).
+
 ## Requirements
 
-Linux 5.10+, a BLE 4.2+ adapter, systemd user services, PAM 1.4+, polkit 0.120+,
-and a GTK4-capable desktop.
+Linux 5.10+, a BLE 4.2+ adapter, systemd (the daemon is a system service, the
+session agent a per-user one), PAM 1.4+, polkit 0.120+, and a GTK4-capable
+desktop.
+
+Screen unlock relies on the locker setting logind's `LockedHint`, which GNOME
+and KDE do. swaylock, i3lock and similar lockers are not detected, so the touch
+does nothing there; `sudo` and polkit still work.
 
 > musl distributions (Alpine, Void musl) are not supported — the PAM module needs glibc.
 
 ## Documentation
 
-- [Usage](docs/usage.md) — GUI pages, TUI, CLI commands, firmware updates, password-manager unlock
+- [Usage](docs/usage.md) — GUI pages, TUI, CLI commands, firmware updates, password-manager unlock, `imk run --agent`
 - [Building from source](docs/install-from-source.md)
 - [Troubleshooting](docs/troubleshooting.md) — and per-desktop notes
 - [Two-host design](docs/dual-host-port.md)
+
+## Logging
+
+The daemon logs warnings and errors only. Start it with `--debug` to log
+everything, including every BLE frame in hex. Those frames are the raw
+traffic with the device: a key import (`immurok-cli key import-ssh`,
+`import-otp`, `add`) and a secret read back from it appear in plain hex. Turn it on
+only while debugging, and turn it off again:
+
+```sh
+sudo mkdir -p /etc/immurok
+echo 'IMMUROK_DAEMON_ARGS=--debug' | sudo tee /etc/immurok/daemon.env
+sudo systemctl restart immurok-daemon
+# later
+sudo rm /etc/immurok/daemon.env && sudo systemctl restart immurok-daemon
+```
+
+Where the log goes and who can read it:
+
+- `/var/log/immurok/daemon.log`, readable by root and the `immurok` user.
+- `immurok-cli logs` and the Settings app stream the last 500 lines plus
+  live output over the daemon socket. Any user with an active logind
+  session on the machine can open that stream, so on a shared machine
+  leave `--debug` off unless you are alone on it.
+
+`RUST_LOG` overrides both modes when set.
 
 ## Uninstall
 

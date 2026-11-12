@@ -49,8 +49,8 @@ present, remove it and `sudo systemctl restart polkit`.
 
 ```bash
 bluetoothctl scan le         # should list "immurok IK-1"
-immurok-cli logs | grep BLE  # daemon log lives in /var/log/immurok (0640, daemon-owned);
-                              # the CLI reads it over the socket, not the journal
+immurok-cli logs | grep BLE  # needs the daemon started with --debug (README, "Logging");
+                              # the CLI reads the log over the socket, not the journal
 ```
 
 ## Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)

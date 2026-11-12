@@ -3,6 +3,28 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
+## 0.9.4 — 2026-11-12
+
+### Security
+
+- Daemon: BLE frames were logged in hex at info level, the packaged default.
+  That included every `KEY_WRITE` chunk — imported SSH private keys, OTP
+  seeds and API secrets in plaintext — and every `KEY_READ` reply. The log
+  file itself is root/`immurok` only, but `SUBSCRIBE:LOG` on the daemon
+  socket hands the last 500 lines and the live stream to any user with an
+  active logind session, so on a shared machine another logged-in user
+  could read secrets as they were written. The daemon now logs warnings and
+  errors only; frame dumps moved to debug level and need an explicit
+  `--debug` (`IMMUROK_DAEMON_ARGS=--debug` in `/etc/immurok/daemon.env`),
+  which also writes a warning line saying the log contains device traffic.
+  `RUST_LOG=info` no longer shows frames either.
+
+### Changed
+
+- Daemon: unit no longer sets `RUST_LOG=info`; it reads optional
+  `/etc/immurok/daemon.env` for `IMMUROK_DAEMON_ARGS`. Unknown arguments
+  make the daemon exit with status 2 instead of being ignored.
+
 ## 0.9.3 — 2026-11-10
 
 ### Fixed

@@ -9,7 +9,15 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/immurok-daemon
+# Default logging is warnings and errors only. `--debug` logs everything,
+# including every BLE frame in hex — which is the key material written to
+# or read from the device — so it is off unless asked for. To turn it on:
+#   sudo mkdir -p /etc/immurok
+#   echo 'IMMUROK_DAEMON_ARGS=--debug' | sudo tee /etc/immurok/daemon.env
+#   sudo systemctl restart immurok-daemon
+# and delete the file (or the line) to go back to the default.
+EnvironmentFile=-/etc/immurok/daemon.env
+ExecStart=/usr/bin/immurok-daemon $IMMUROK_DAEMON_ARGS
 User=immurok
 Group=immurok
 # BlueZ 授权来自 packaging/dbus/immurok.conf。不写 SupplementaryGroups=
@@ -31,7 +39,6 @@ LogsDirectoryMode=0750
 
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=info
 
 # Hardening. The three directories above stay writable; everything else is
 # read-only, so a compromised daemon cannot rewrite its own binary or the PAM

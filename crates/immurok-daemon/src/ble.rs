@@ -1090,7 +1090,9 @@ async fn route_notification(
     if len == 0 { return; }
     let first = data[0];
 
-    info!("BLE RX: [{}] gate={} auth={} pending_rsp={}",
+    // debug, not info: frames carry secrets (KEY_READ replies, OTP codes).
+    // Only `--debug` turns this on.
+    debug!("BLE RX: [{}] gate={} auth={} pending_rsp={}",
           hex::encode(data), state.gate_pending, state.auth_pending,
           state.pending_response.is_some());
 
@@ -1621,7 +1623,9 @@ async fn send_command_inner(
     packet.push(payload.len() as u8);
     packet.extend_from_slice(payload);
 
-    info!("BLE TX: cmd=0x{:02x} payload=[{}]", cmd, hex::encode(payload));
+    // debug, not info: KEY_WRITE chunks are plaintext key material (SSH
+    // private keys, OTP seeds, API secrets). Only `--debug` turns this on.
+    debug!("BLE TX: cmd=0x{:02x} payload=[{}]", cmd, hex::encode(payload));
 
     // Set up response oneshot
     let (tx, mut rx) = oneshot::channel();
