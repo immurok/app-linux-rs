@@ -14,7 +14,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use immurok_client::open_log_stream;
+use immurok_client::{open_log_stream, probe_log_level};
 
 use super::run_blocking;
 
@@ -39,6 +39,17 @@ pub fn classify(line: &str) -> Level {
         Level::Dim
     } else {
         Level::Plain
+    }
+}
+
+/// Badge text while streaming. The level comes from the daemon's `GET:INFO`;
+/// `None` is a daemon too old to report it.
+pub fn live_badge(level: Option<&str>) -> String {
+    match level {
+        Some("debug") => "● Live (debug)".to_string(),
+        Some("info") => "● Live (info)".to_string(),
+        Some(_) => "● Live (warning / error only)".to_string(),
+        None => "● Live".to_string(),
     }
 }
 
@@ -77,6 +88,10 @@ pub struct LogsPage {
     /// must not append or touch the state (ledger P4-R7).
     generation: Cell<u64>,
     loaded_once: Cell<bool>,
+    /// The daemon's effective log level, fetched on every (re)connect and
+    /// shown in the Live badge so a mostly empty page explains itself:
+    /// without `--debug` the daemon only logs warnings and errors.
+    log_level: RefCell<Option<String>>,
 }
 
 impl LogsPage {
@@ -136,6 +151,7 @@ impl LogsPage {
             stream: RefCell::new(None),
             generation: Cell::new(0),
             loaded_once: Cell::new(false),
+            log_level: RefCell::new(None),
         });
 
         let weak = Rc::downgrade(&this);
@@ -198,7 +214,7 @@ impl LogsPage {
         self.state.set(s);
         let text = match s {
             StreamState::Connecting => "● Connecting…".to_string(),
-            StreamState::Live => "● Live".to_string(),
+            StreamState::Live => live_badge(self.log_level.borrow().as_deref()),
             StreamState::Paused(n) => format!("⏸ Paused ({n} new lines)"),
             StreamState::Closed => "● Stream closed".to_string(),
         };
@@ -250,6 +266,11 @@ impl LogsPage {
                 }
             };
             *this.stream.borrow_mut() = Some(stream);
+            let level = run_blocking(probe_log_level).await.flatten();
+            if this.generation.get() != my_gen {
+                return;
+            }
+            *this.log_level.borrow_mut() = level;
             this.set_state(StreamState::Live);
 
             let (tx, rx) = async_channel::unbounded::<String>();
@@ -331,6 +352,14 @@ impl LogsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_badge_names_the_mode() {
+        assert_eq!(live_badge(Some("debug")), "● Live (debug)");
+        assert_eq!(live_badge(Some("warn")), "● Live (warning / error only)");
+        assert_eq!(live_badge(Some("info")), "● Live (info)");
+        assert_eq!(live_badge(None), "● Live");
+    }
 
     #[test]
     fn classifies_like_the_tui() {

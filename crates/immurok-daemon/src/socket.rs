@@ -1775,10 +1775,11 @@ async fn handle_get_info(coord: &Arc<Coordinator>) -> Response {
     };
     let connected = coord.is_connected.load(Ordering::Relaxed);
     let msg = format!(
-        "fw={}:model=IK-1:connected={}:battery={}:uid={}:sock={}",
+        "fw={}:model=IK-1:connected={}:battery={}:log={}:uid={}:sock={}",
         fw,
         if connected { "1" } else { "0" },
         battery,
+        crate::logbuf::effective_level(),
         unsafe { libc::getuid() },
         immurok_common::paths::pam_socket().display(),
     );

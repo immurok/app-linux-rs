@@ -21,6 +21,10 @@ module) are documented here. Versions follow the workspace crate version.
 
 ### Changed
 
+- Daemon: `GET:INFO` reports the effective log level as `log=debug|info|warn`.
+  The Settings app's Logs page shows it in the badge — "Live (warning /
+  error only)" by default, "Live (debug)" with `--debug` — so a page that
+  stays empty explains itself; `immurok-cli info` and the TUI print it too.
 - Daemon: unit no longer sets `RUST_LOG=info`; it reads optional
   `/etc/immurok/daemon.env` for `IMMUROK_DAEMON_ARGS`. Unknown arguments
   make the daemon exit with status 2 instead of being ignored.

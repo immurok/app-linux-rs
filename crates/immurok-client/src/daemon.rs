@@ -119,6 +119,22 @@ pub struct Isolation {
     pub socket: String,
 }
 
+/// One `key=value` field out of a `GET:INFO` body (the part after `OK:`).
+pub fn info_field(body: &str, key: &str) -> Option<String> {
+    body.split(':')
+        .filter_map(|f| f.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// The daemon's effective log level (`debug` / `info` / `warn`), or `None`
+/// for a daemon too old to report one.
+pub fn probe_log_level() -> Option<String> {
+    let mut client = DaemonClient::connect().ok()?;
+    let rsp = client.send("GET:INFO").ok()?;
+    info_field(rsp.strip_prefix("OK:")?, "log")
+}
+
 /// Ask the daemon whether it is privilege-separated.
 ///
 /// Worth surfacing rather than hiding: on a daemon that still runs as the
@@ -150,4 +166,27 @@ pub fn probe_isolation() -> Option<Isolation> {
         daemon_uid,
         socket,
     })
+}
+
+#[cfg(test)]
+mod info_field_tests {
+    use super::info_field;
+
+    const BODY: &str = "fw=1.8.6:model=IK-1:connected=1:battery=80:log=debug:uid=975:sock=/run/immurok/pam.sock";
+
+    #[test]
+    fn picks_the_named_field() {
+        assert_eq!(info_field(BODY, "log").as_deref(), Some("debug"));
+        assert_eq!(info_field(BODY, "uid").as_deref(), Some("975"));
+    }
+
+    #[test]
+    fn missing_field_from_an_old_daemon_is_none() {
+        assert_eq!(info_field("fw=1.8.0:model=IK-1:connected=0:battery=0", "log"), None);
+    }
+
+    #[test]
+    fn does_not_match_a_key_prefix() {
+        assert_eq!(info_field("login=x:log=warn", "log").as_deref(), Some("warn"));
+    }
 }

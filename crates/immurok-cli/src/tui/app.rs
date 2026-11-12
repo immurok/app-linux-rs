@@ -1713,6 +1713,7 @@ impl App {
                                 "fw" => "Firmware",
                                 "battery" => "Battery",
                                 "connected" => "Connected",
+                                "log" => "Log level",
                                 _ => k,
                             };
                             let display = if k == "battery" && v != "-1" {

@@ -73,6 +73,21 @@ impl LogSink {
 
 static SINK: OnceLock<Arc<LogSink>> = OnceLock::new();
 
+/// The level the installed filter actually lets through for this crate:
+/// `debug` (started with `--debug`, or an equivalent `RUST_LOG`), `info`,
+/// or `warn` (the packaged default). Asked by the subscriber itself rather
+/// than remembered from the command line, so a `RUST_LOG` override is
+/// reported as what it is.
+pub fn effective_level() -> &'static str {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        "debug"
+    } else if tracing::enabled!(tracing::Level::INFO) {
+        "info"
+    } else {
+        "warn"
+    }
+}
+
 /// Install the process-wide sink. Returns the `MakeWriter` for
 /// `tracing_subscriber`. Idempotent; a second call keeps the first sink.
 pub fn install(file: Option<std::fs::File>) -> LogMaker {
@@ -116,5 +131,27 @@ impl Drop for LogWriter {
         if let Some(sink) = global() {
             sink.emit(&self.buf);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_level;
+
+    fn with_filter(directive: &str) -> &'static str {
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(directive))
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        effective_level()
+    }
+
+    #[test]
+    fn reports_what_the_filter_lets_through() {
+        assert_eq!(with_filter("immurok=warn"), "warn");
+        assert_eq!(with_filter("immurok=info"), "info");
+        assert_eq!(with_filter("immurok=debug"), "debug");
+        assert_eq!(with_filter("immurok=trace"), "debug");
     }
 }

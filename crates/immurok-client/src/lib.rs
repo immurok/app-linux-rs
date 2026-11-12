@@ -16,4 +16,4 @@ pub mod pam;
 pub mod ssh_import;
 pub mod status;
 
-pub use daemon::{fetch_key_cache, open_log_stream, probe_isolation, DaemonClient, Isolation};
+pub use daemon::{fetch_key_cache, info_field, open_log_stream, probe_isolation, probe_log_level, DaemonClient, Isolation};
