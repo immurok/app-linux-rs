@@ -11,6 +11,8 @@ use libadwaita as adw;
 
 use immurok_client::status::{ConnParams, DeviceStatus};
 
+use crate::i18n::TEXT;
+
 // The firmware line is a button only so it can be clicked: strip the button
 // padding so it sits flush with the caption lines above it. The flat style's
 // hover background is the affordance.
@@ -71,7 +73,7 @@ impl SidebarStatus {
             .build();
         name.add_css_class("title-4");
         let state = gtk::Label::builder()
-            .label("Connecting to daemon…")
+            .label(TEXT.sidebar_connecting())
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -102,7 +104,7 @@ impl SidebarStatus {
             .has_frame(false)
             .halign(gtk::Align::Start)
             .visible(false)
-            .tooltip_text("Show the Bluetooth connection parameters")
+            .tooltip_text(TEXT.sidebar_show_params())
             .build();
         fw_button.add_css_class("flat");
         fw_button.add_css_class("sidebar-fw");
@@ -156,7 +158,7 @@ impl SidebarStatus {
     /// renegotiates, and "too short a supervision timeout" is exactly what
     /// makes linking fail with 0xFF, so stale numbers would mislead.
     fn show_conn_params(self: &Rc<Self>) {
-        self.conn_body.set_markup("Reading connection parameters from the device…");
+        self.conn_body.set_markup(&TEXT.sidebar_reading_params());
         self.conn_popover.popup();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -165,10 +167,12 @@ impl SidebarStatus {
             let text = match r {
                 Some(Ok(p)) => conn_params_markup(&p),
                 Some(Err(e)) => format!(
-                    "Could not read the connection parameters: {}",
-                    glib::markup_escape_text(&crate::errors::friendly(&e))
+                    "{}",
+                    TEXT.sidebar_read_params_failed(
+                        glib::markup_escape_text(&crate::errors::friendly(&e)).as_str()
+                    )
                 ),
-                None => "Could not read the connection parameters.".into(),
+                None => TEXT.sidebar_read_params_unavailable(),
             };
             t.conn_body.set_markup(&text);
         });
@@ -185,20 +189,20 @@ impl SidebarStatus {
     pub fn apply(&self, s: &DeviceStatus, paired: bool) {
         self.name.set_text(if s.name.is_empty() { "immurok" } else { &s.name });
         let bluetooth = if s.connected {
-            "Bluetooth: connected"
+            TEXT.sidebar_bluetooth_connected()
         } else if s.link_up {
-            "Bluetooth: connected, device starting up…"
+            TEXT.sidebar_bluetooth_starting()
         } else {
-            "Bluetooth: not connected"
+            TEXT.sidebar_bluetooth_disconnected()
         };
         let link = if s.device_unpaired {
-            "Link: no longer linked"
+            TEXT.sidebar_link_no_longer()
         } else if paired {
-            "Link: linked"
+            TEXT.sidebar_linked()
         } else if s.connected {
-            "Link: not linked"
+            TEXT.sidebar_not_linked()
         } else {
-            "Link: shown once connected"
+            TEXT.sidebar_shown_once()
         };
         let icon = if s.connected {
             "bluetooth-active-symbolic"
@@ -208,13 +212,14 @@ impl SidebarStatus {
             "bluetooth-disabled-symbolic"
         };
         self.state.set_text(&format!("{bluetooth}\n{link}"));
-        self.state.set_tooltip_text(if s.device_unpaired {
-            Some("The device no longer knows this computer. Link it again from the Device page.")
+        let tooltip = if s.device_unpaired {
+            Some(TEXT.sidebar_tooltip_unpaired())
         } else if s.connected && !paired {
-            Some("Bluetooth only lets this computer see the device. Link it so the device can authenticate you.")
+            Some(TEXT.sidebar_tooltip_bluetooth_only())
         } else {
             None
-        });
+        };
+        self.state.set_tooltip_text(tooltip.as_deref());
         self.icon.set_icon_name(Some(icon));
         if s.connected && paired && !s.device_unpaired {
             self.icon.add_css_class("accent");
@@ -225,7 +230,7 @@ impl SidebarStatus {
         if s.connected {
             self.battery_bar.set_value(f64::from(s.battery.min(100)) / 100.0);
             self.battery_pct.set_text(&format!("{}%", s.battery.min(100)));
-            self.fw.set_text(&format!("Firmware {}", s.fw_version));
+            self.fw.set_text(&TEXT.sidebar_firmware(&s.fw_version));
             self.fw_button.set_visible(true);
         } else {
             self.fw.set_text("");
@@ -235,7 +240,7 @@ impl SidebarStatus {
     }
 
     pub fn apply_daemon_down(&self, err: &str) {
-        self.state.set_text("Daemon unavailable");
+        self.state.set_text(&TEXT.sidebar_daemon_unavailable());
         self.state.set_tooltip_text(Some(err));
         self.icon.set_icon_name(Some("bluetooth-disabled-symbolic"));
         self.icon.remove_css_class("accent");
@@ -250,27 +255,7 @@ impl SidebarStatus {
 /// derived fact the user needs — whether the device will run its key
 /// exchange on this link.
 pub fn conn_params_markup(p: &ConnParams) -> String {
-    let verdict = if p.ecc_ok() {
-        "Long enough for linking and SSH signing.".to_string()
-    } else {
-        format!(
-            "Too short for linking and SSH signing (the device needs at least {} ms and asks this computer \
-             for 6000 ms). If linking fails, disconnect and reconnect the device.",
-            ConnParams::ECC_MIN_TIMEOUT_MS
-        )
-    };
-    format!(
-        "<b>Bluetooth connection parameters</b>\n\
-         Connection interval: {:.2} ms\n\
-         Peripheral latency: {} intervals (up to {:.0} ms between packets)\n\
-         Supervision timeout: {} ms\n\n\
-         <small>{}</small>",
-        p.interval_ms(),
-        p.latency,
-        p.effective_interval_ms(),
-        p.timeout_ms(),
-        verdict
-    )
+    TEXT.conn_params_markup(p)
 }
 
 #[cfg(test)]

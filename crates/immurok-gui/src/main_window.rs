@@ -9,6 +9,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::pages;
+use crate::i18n::TEXT;
 use crate::settings_store;
 use crate::setup_wizard;
 
@@ -45,46 +46,55 @@ impl MainWindow {
         let firmware = pages::firmware::FirmwarePage::new(&toasts);
 
         let dashboard = Rc::new(pages::dashboard::DashboardPage::new(&toasts, &firmware));
+        let dashboard_title = TEXT.nav_device();
         stack
-            .add_titled(dashboard.widget(), Some("dashboard"), "Device")
+            .add_titled(dashboard.widget(), Some("dashboard"), &dashboard_title)
             .set_icon_name(Some("bluetooth-active-symbolic"));
 
         let features = pages::features::FeaturesPage::new(&toasts);
+        let features_title = TEXT.nav_features();
         stack
-            .add_titled(features.widget(), Some("features"), "Features")
+            .add_titled(features.widget(), Some("features"), &features_title)
             .set_icon_name(Some("preferences-other-symbolic"));
         dashboard.set_features(&features);
 
         let keys = pages::keys::KeysPage::new(&toasts);
+        let keys_title = TEXT.nav_keys();
         stack
-            .add_titled(keys.widget(), Some("keys"), "Keys")
+            .add_titled(keys.widget(), Some("keys"), &keys_title)
             .set_icon_name(Some("dialog-password-symbolic"));
         dashboard.set_keys(&keys);
 
         let fingerprints = pages::fingerprints::FingerprintsPage::new(&toasts);
+        let fingerprints_title = TEXT.nav_fingerprints();
         stack
-            .add_titled(fingerprints.widget(), Some("fingerprints"), "Fingerprints")
+            .add_titled(fingerprints.widget(), Some("fingerprints"), &fingerprints_title)
             .set_icon_name(Some(pages::fingerprints::finger_icon_name()));
 
         let pam = pages::pam::PamPage::new(&toasts);
+        let pam_title = TEXT.nav_pam();
         stack
-            .add_titled(pam.widget(), Some("pam"), "PAM")
+            .add_titled(pam.widget(), Some("pam"), &pam_title)
             .set_icon_name(Some("security-high-symbolic"));
 
         let logs = pages::logs::LogsPage::new();
+        let logs_title = TEXT.nav_logs();
         stack
-            .add_titled(logs.widget(), Some("logs"), "Logs")
+            .add_titled(logs.widget(), Some("logs"), &logs_title)
             .set_icon_name(Some("utilities-terminal-symbolic"));
 
         let header = adw::HeaderBar::new();
         // Header menu: the wizard is reachable again after "Later".
         let menu = gio::Menu::new();
-        menu.append(Some("Setup Wizard…"), Some("app.setup"));
-        menu.append(Some("Quit"), Some("app.quit"));
+        let setup_label = TEXT.menu_setup();
+        let quit_label = TEXT.menu_quit();
+        menu.append(Some(&setup_label), Some("app.setup"));
+        menu.append(Some(&quit_label), Some("app.quit"));
+        let menu_tooltip = TEXT.menu_tooltip();
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
-            .tooltip_text("Menu")
+            .tooltip_text(&menu_tooltip)
             .build();
         header.pack_end(&menu_button);
 
@@ -119,7 +129,7 @@ impl MainWindow {
             let logs = Rc::downgrade(&logs);
             window.connect_close_request(move |_| {
                 if pages::firmware::updating() {
-                    toasts.add_toast(adw::Toast::new("Firmware update in progress — please wait."));
+                    toasts.add_toast(adw::Toast::new(&TEXT.firmware_update_wait()));
                     return glib::Propagation::Stop;
                 }
                 if let Some(l) = logs.upgrade() {

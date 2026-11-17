@@ -11,6 +11,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::fwupdate::error::FwUpdateError;
 use immurok_client::fwupdate::store::FwStore;
@@ -104,11 +105,11 @@ fn is_outdated(device_version: &str) -> bool {
 
 fn plan_label(hops: usize, resumed: bool, bridge: Option<(&str, &str)>) -> String {
     if resumed {
-        "Plan: resume interrupted update".into()
+        t!("firmware.plan_resume").to_string()
     } else if let Some((from, to)) = bridge.filter(|_| hops == 2) {
-        format!("Plan: 2 hops (bridge {from} → {to})")
+        t!("firmware.plan_bridge", from = from, to = to).to_string()
     } else {
-        "Plan: direct (1 hop)".into()
+        t!("firmware.plan_direct").to_string()
     }
 }
 
@@ -146,22 +147,41 @@ pub struct FirmwarePage {
 
 impl FirmwarePage {
     pub fn new(toasts: &adw::ToastOverlay) -> Rc<Self> {
-        let root = adw::PreferencesGroup::builder().title("Firmware").build();
-        let check_btn = gtk::Button::builder().icon_name("view-refresh-symbolic").valign(gtk::Align::Center).tooltip_text("Check again").build();
+        let root = adw::PreferencesGroup::builder()
+            .title(t!("firmware.title").to_string())
+            .build();
+        let check_btn = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .valign(gtk::Align::Center)
+            .tooltip_text(t!("firmware.check_again").to_string())
+            .build();
         check_btn.add_css_class("flat");
         root.set_header_suffix(Some(&check_btn));
 
-        let device_row = adw::ActionRow::builder().title("Version").subtitle("-").build();
-        let update_btn = gtk::Button::builder().label("Update").valign(gtk::Align::Center).visible(false).build();
+        let device_row = adw::ActionRow::builder()
+            .title(t!("firmware.version").to_string())
+            .subtitle("-")
+            .build();
+        let update_btn = gtk::Button::builder()
+            .label(t!("firmware.update").to_string())
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         update_btn.add_css_class("suggested-action");
         device_row.add_suffix(&update_btn);
         root.add(&device_row);
 
-        let status_row = adw::ActionRow::builder().title("Checking for updates…").build();
+        let status_row = adw::ActionRow::builder()
+            .title(t!("firmware.checking").to_string())
+            .build();
         root.add(&status_row);
 
         let progress = gtk::ProgressBar::builder().visible(false).show_text(true).margin_top(6).build();
-        let warning = gtk::Label::builder().label("Do not power off the device.").xalign(0.0).visible(false).build();
+        let warning = gtk::Label::builder()
+            .label(t!("firmware.power_warning").to_string())
+            .xalign(0.0)
+            .visible(false)
+            .build();
         warning.add_css_class("error");
         root.add(&progress);
         root.add(&warning);
@@ -220,15 +240,15 @@ impl FirmwarePage {
     fn render(&self) {
         let st = self.state.borrow();
         let (title, notes, can_update, can_check, updating) = match &*st {
-            FwState::Idle | FwState::Checking => ("Checking for updates…".to_string(), None, false, false, false),
-            FwState::UpToDate => ("Up to date".to_string(), None, false, true, false),
+            FwState::Idle | FwState::Checking => (t!("firmware.checking").to_string(), None, false, false, false),
+            FwState::UpToDate => (t!("firmware.up_to_date").to_string(), None, false, true, false),
             FwState::Ready(p) => {
                 let bridge = p.hops.first().zip(p.hops.last()).map(|(a, b)| (a.version.as_str(), b.version.as_str()));
                 (plan_label(p.hops.len(), p.resumed, bridge), p.notes.clone(), true, true, false)
             }
-            FwState::Updating => ("Updating…".to_string(), None, false, false, true),
-            FwState::Success(v) => (format!("Update complete — device is now on {v}."), None, false, true, false),
-            FwState::Failed(e) => (format!("Could not check: {e}"), None, false, true, false),
+            FwState::Updating => (t!("firmware.updating").to_string(), None, false, false, true),
+            FwState::Success(v) => (t!("firmware.update_complete", version = v).to_string(), None, false, true, false),
+            FwState::Failed(e) => (t!("firmware.could_not_check", error = e).to_string(), None, false, true, false),
         };
         if self.outdated.get() {
             self.status_row.add_css_class("error");
@@ -236,10 +256,9 @@ impl FirmwarePage {
             self.status_row.remove_css_class("error");
         }
         if !updating {
+            let old_signing_template = t!("firmware.old_signing").to_string();
             let title = if self.outdated.get() {
-                format!(
-                    "Firmware outdated (old signing era) — update to keep unlocking and key operations working. {title}"
-                )
+                old_signing_template.replace("%{status}", &title)
             } else {
                 title
             };
@@ -250,7 +269,12 @@ impl FirmwarePage {
         self.warning.set_visible(updating);
         self.update_btn.set_visible(can_update);
         self.check_btn.set_sensitive(can_check);
-        self.check_btn.set_tooltip_text(Some(if matches!(&*st, FwState::Failed(_)) { "Retry check" } else { "Check again" }));
+        let tooltip = if matches!(&*st, FwState::Failed(_)) {
+            t!("firmware.retry_check").to_string()
+        } else {
+            t!("firmware.check_again").to_string()
+        };
+        self.check_btn.set_tooltip_text(Some(&tooltip));
     }
 
     /// `force` bypasses the store's 24h manifest-check throttle (the header
@@ -304,7 +328,7 @@ impl FirmwarePage {
         };
         FW_UPDATING.store(true, Ordering::Relaxed);
         self.set_state(FwState::Updating);
-        self.status_row.set_title(&glib::markup_escape_text("Starting…"));
+        self.status_row.set_title(&glib::markup_escape_text(&t!("firmware.starting")));
         self.progress.set_fraction(0.0);
         self.progress.set_text(Some("0 %"));
 
@@ -331,7 +355,11 @@ impl FirmwarePage {
                 let Some(this) = weak.upgrade() else { break };
                 match msg {
                     Msg::Progress(m) => {
-                        let stage = if m.hops > 1 { format!("hop {}/{}: {}", m.hop, m.hops, m.stage) } else { m.stage };
+                        let stage = if m.hops > 1 {
+                            t!("firmware.hop", hop = m.hop, hops = m.hops, stage = m.stage).to_string()
+                        } else {
+                            m.stage
+                        };
                         this.status_row.set_title(&glib::markup_escape_text(&stage));
                         this.progress.set_fraction(m.fraction.clamp(0.0, 1.0));
                         this.progress.set_text(Some(&format!("{:.0} %", m.fraction * 100.0)));
@@ -342,7 +370,7 @@ impl FirmwarePage {
                             Ok(v) => {
                                 this.device_row.set_subtitle(&glib::markup_escape_text(&v));
                                 this.outdated.set(is_outdated(&v));
-                                this.toasts.add_toast(adw::Toast::new("Firmware updated"));
+                                this.toasts.add_toast(adw::Toast::new(&t!("firmware.updated")));
                                 this.set_state(FwState::Success(v));
                             }
                             Err(e) => this.set_state(FwState::Failed(e)),
@@ -399,9 +427,19 @@ mod tests {
 
     #[test]
     fn plan_text() {
-        assert_eq!(plan_label(1, false, None), "Plan: direct (1 hop)");
-        assert_eq!(plan_label(2, false, Some(("1.6.4", "1.8.0"))), "Plan: 2 hops (bridge 1.6.4 → 1.8.0)");
-        assert_eq!(plan_label(1, true, None), "Plan: resume interrupted update");
+        assert!(matches!(
+            plan_label(1, false, None).as_str(),
+            "Plan: direct (1 hop)" | "计划：直接更新（一步）"
+        ));
+        assert!(matches!(
+            plan_label(2, false, Some(("1.6.4", "1.8.0"))).as_str(),
+            "Plan: 2 hops (bridge 1.6.4 → 1.8.0)"
+                | "计划：两步更新（中间版本 1.6.4 → 1.8.0）"
+        ));
+        assert!(matches!(
+            plan_label(1, true, None).as_str(),
+            "Plan: resume interrupted update" | "计划：继续未完成的更新"
+        ));
     }
 
     #[test]

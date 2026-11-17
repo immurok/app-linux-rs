@@ -16,6 +16,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use rust_i18n::t;
 
 use immurok_client::keys::{
     capacity, delete_key, get_api, get_otp, list_keys, ssh_public_key_line, KeyCategory, KeyEntry,
@@ -39,11 +40,11 @@ fn cache_may_have_changed(previous: Option<bool>, now: bool) -> bool {
 
 /// Title/subtitle for the clickable empty-state row shown when a category
 /// has no entries yet.
-fn empty_hint(cat: KeyCategory) -> (&'static str, &'static str) {
+fn empty_hint(cat: KeyCategory) -> (String, String) {
     match cat {
-        KeyCategory::Otp => ("Add your first OTP entry", "Generates a 6-digit code after you touch the device"),
-        KeyCategory::Api => ("Add your first API key", "Shows the stored value after you touch the device"),
-        KeyCategory::Ssh => ("Add your first SSH key", "Public key can be copied; signing goes through the SSH agent"),
+        KeyCategory::Otp => (t!("keys.empty.otp.title").to_string(), t!("keys.empty.otp.subtitle").to_string()),
+        KeyCategory::Api => (t!("keys.empty.api.title").to_string(), t!("keys.empty.api.subtitle").to_string()),
+        KeyCategory::Ssh => (t!("keys.empty.ssh.title").to_string(), t!("keys.empty.ssh.subtitle").to_string()),
     }
 }
 
@@ -74,10 +75,11 @@ impl KeysPage {
             let g = adw::PreferencesGroup::builder()
                 .title(format!("{} (0/{})", cat.label(), capacity(cat)))
                 .build();
+            let add_tooltip = t!("keys.add_entry", category = cat.label()).to_string();
             let add = gtk::Button::builder()
                 .icon_name("list-add-symbolic")
                 .valign(gtk::Align::Center)
-                .tooltip_text(format!("Add {} entry", cat.label()))
+                .tooltip_text(&add_tooltip)
                 .build();
             add.add_css_class("flat");
             g.set_header_suffix(Some(&add));
@@ -160,7 +162,8 @@ impl KeysPage {
             "<span font_family=\"monospace\" size=\"x-large\" weight=\"bold\">{}</span>",
             glib::markup_escape_text(&pretty)
         ));
-        let copy = gtk::Button::builder().icon_name("edit-copy-symbolic").valign(gtk::Align::Center).tooltip_text("Copy code").build();
+        let copy_tooltip = t!("keys.copy_code").to_string();
+        let copy = gtk::Button::builder().icon_name("edit-copy-symbolic").valign(gtk::Align::Center).tooltip_text(&copy_tooltip).build();
         copy.add_css_class("flat");
         {
             let code = code.to_string();
@@ -170,7 +173,7 @@ impl KeysPage {
                     display.clipboard().set_text(&code);
                 }
                 if let Some(this) = this.upgrade() {
-                    this.toast("Code copied", 2);
+                    this.toast(&t!("keys.code_copied"), 2);
                 }
             });
         }
@@ -200,7 +203,7 @@ impl KeysPage {
             group.set_title(&format!("{} ({}/{})", cat.label(), n, capacity(*cat)));
             if n == 0 {
                 let (t, s) = empty_hint(*cat);
-                let row = adw::ActionRow::builder().title(t).subtitle(s).activatable(true).build();
+                let row = adw::ActionRow::builder().title(&t).subtitle(&s).activatable(true).build();
                 row.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
                 let weak = Rc::downgrade(self);
                 let cat = *cat;
@@ -230,18 +233,20 @@ impl KeysPage {
                 .subtitle(glib::markup_escape_text(&subtitle))
                 .build();
 
+            let primary_label = match entry.category {
+                KeyCategory::Otp => t!("keys.get_code").to_string(),
+                KeyCategory::Api => t!("keys.show").to_string(),
+                KeyCategory::Ssh => t!("keys.copy_public_key").to_string(),
+            };
             let primary = gtk::Button::builder()
-                .label(match entry.category {
-                    KeyCategory::Otp => "Get code",
-                    KeyCategory::Api => "Show",
-                    KeyCategory::Ssh => "Copy public key",
-                })
+                .label(&primary_label)
                 .valign(gtk::Align::Center)
                 .build();
+            let delete_tooltip = t!("keys.delete_tooltip").to_string();
             let delete = gtk::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .valign(gtk::Align::Center)
-                .tooltip_text("Delete (requires a touch on the device)")
+                .tooltip_text(&delete_tooltip)
                 .build();
             delete.add_css_class("flat");
             row.add_suffix(&primary);
@@ -291,11 +296,11 @@ impl KeysPage {
             let n = counts.get(cat).copied().unwrap_or(0);
             let full = n >= capacity(*cat) as usize;
             let (sensitive, tip) = if self.connected.get() != Some(true) {
-                (false, "Device not connected".to_string())
+                (false, t!("keys.device_not_connected").to_string())
             } else if full {
-                (false, "Keystore full — delete an entry first".to_string())
+                (false, t!("keys.keystore_full").to_string())
             } else {
-                (true, format!("Add {} entry", cat.label()))
+                (true, t!("keys.add_entry", category = cat.label()).to_string())
             };
             btn.set_sensitive(sensitive);
             btn.set_tooltip_text(Some(&tip));
@@ -304,14 +309,16 @@ impl KeysPage {
 
     fn open_add(self: &Rc<Self>, cat: KeyCategory) {
         if self.connected.get() != Some(true) {
-            self.toast("Device not connected", 3);
+            self.toast(&t!("keys.device_not_connected"), 3);
             return;
         }
         let this = self.clone();
         glib::spawn_future_local(async move {
             let Some(win) = this.root.root().and_then(|r| r.downcast::<gtk::Window>().ok()) else { return };
             if let Some(name) = crate::key_add_dialog::run(&win, cat).await {
-                this.toast(&format!("{} '{}' added", cat.label(), glib::markup_escape_text(&name)), 3);
+                let escaped_name = glib::markup_escape_text(&name);
+                let added = t!("keys.added", category = cat.label(), name = escaped_name.as_str()).to_string();
+                this.toast(&added, 3);
                 // The daemon re-syncs its cache after a successful write;
                 // give it a beat before re-reading.
                 glib::timeout_future(Duration::from_millis(500)).await;
@@ -328,13 +335,13 @@ impl KeysPage {
                     let line = ssh_public_key_line(&entry);
                     if let Some(display) = gtk::gdk::Display::default() {
                         display.clipboard().set_text(&line);
-                        this.toast("Public key copied", 3);
+                        this.toast(&t!("keys.public_key_copied"), 3);
                     }
                 }
                 KeyCategory::Otp | KeyCategory::Api => {
                     let original = button.label().map(|l| l.to_string()).unwrap_or_default();
                     button.set_sensitive(false);
-                    button.set_label("Touch the device…");
+                    button.set_label(&t!("keys.touch_device"));
                     let name = entry.name.clone();
                     let cat = entry.category;
                     let r = run_blocking(move || match cat {
@@ -353,7 +360,10 @@ impl KeysPage {
                             &format!("{}: {}", glib::markup_escape_text(&entry.name), glib::markup_escape_text(&value)),
                             30,
                         ),
-                        Some(Err(e)) => this.toast(&format!("Read failed: {}", glib::markup_escape_text(&e)), 5),
+                        Some(Err(e)) => {
+                            let escaped = glib::markup_escape_text(&e);
+                            this.toast(&t!("keys.read_failed", error = escaped.as_str()), 5)
+                        }
                         None => {}
                     }
                 }
@@ -365,30 +375,42 @@ impl KeysPage {
         let this = self.clone();
         glib::spawn_future_local(async move {
             let Some(win) = button.root().and_then(|r| r.downcast::<gtk::Window>().ok()) else { return };
+            let escaped_name = glib::markup_escape_text(&entry.name);
+            let title = t!(
+                "keys.delete_confirm_title",
+                category = entry.category.label(),
+                name = escaped_name.as_str()
+            )
+            .to_string();
+            let body = t!("keys.delete_confirm_body").to_string();
+            let delete_label = t!("keys.delete").to_string();
             let ok = confirm(
                 &win,
-                &format!("Delete {} \"{}\"?", entry.category.label(), entry.name),
-                "This requires a touch on the device and cannot be undone.",
-                "Delete",
+                &title,
+                &body,
+                &delete_label,
             )
             .await;
             if !ok {
                 return;
             }
             button.set_sensitive(false);
-            this.toast("Touch the device to confirm deletion…", 30);
+            this.toast(&t!("keys.touch_delete"), 30);
             let (cat, idx) = (entry.category, entry.index);
             let r = run_blocking(move || delete_key(cat, idx)).await;
             button.set_sensitive(true);
             match r {
                 Some(Ok(())) => {
-                    this.toast("Deleted", 3);
+                    this.toast(&t!("keys.deleted"), 3);
                     // The daemon re-syncs its cache after a successful delete;
                     // give it a beat before re-reading.
                     glib::timeout_future(Duration::from_millis(500)).await;
                     this.reload();
                 }
-                Some(Err(e)) => this.toast(&format!("Delete failed: {}", glib::markup_escape_text(&e)), 5),
+                Some(Err(e)) => {
+                    let escaped = glib::markup_escape_text(&e);
+                    this.toast(&t!("keys.delete_failed", error = escaped.as_str()), 5)
+                }
                 None => {}
             }
         });

@@ -1,0 +1,599 @@
+{
+  "_version": 2,
+  "action.cancel": {
+    "en": "Cancel",
+    "zh-CN": "取消"
+  },
+  "action.close": {
+    "en": "Close",
+    "zh-CN": "关闭"
+  },
+  "enrollment.title.default": {
+    "en": "Add Fingerprint",
+    "zh-CN": "添加指纹"
+  },
+  "enrollment.title.switch": {
+    "en": "Add switch fingerprint",
+    "zh-CN": "添加主机切换指纹"
+  },
+  "enrollment.gate_hint": {
+    "en": "Verify with an enrolled finger",
+    "zh-CN": "请使用已录入的指纹验证"
+  },
+  "enrollment.subtitle.default": {
+    "en": "Press the sensor six times, shifting slightly each time.",
+    "zh-CN": "请按压传感器六次，每次稍微移动手指。"
+  },
+  "enrollment.subtitle.switch": {
+    "en": "This finger will only switch between the two hosts.",
+    "zh-CN": "此指纹仅用于在两台主机之间切换。"
+  },
+  "enrollment.hint.center": {
+    "en": "Press finger pad on center",
+    "zh-CN": "将指腹按在传感器中央"
+  },
+  "enrollment.hint.left": {
+    "en": "Tilt slightly left 5–10°",
+    "zh-CN": "向左轻微倾斜 5–10°"
+  },
+  "enrollment.hint.right": {
+    "en": "Tilt slightly right 5–10°",
+    "zh-CN": "向右轻微倾斜 5–10°"
+  },
+  "enrollment.hint.toward_fingertip": {
+    "en": "Shift slightly toward fingertip",
+    "zh-CN": "稍微向指尖方向移动"
+  },
+  "enrollment.hint.toward_wrist": {
+    "en": "Shift slightly toward wrist",
+    "zh-CN": "稍微向手腕方向移动"
+  },
+  "enrollment.hint.back_to_center": {
+    "en": "Back to center, press once more",
+    "zh-CN": "回到中央，再按一次"
+  },
+  "enrollment.hint.hold_steady": {
+    "en": "Hold steady",
+    "zh-CN": "请保持不动"
+  },
+  "enrollment.progress": {
+    "en": "Captured (%{captured}/%{total})",
+    "zh-CN": "已采集（%{captured}/%{total}）"
+  },
+  "enrollment.state.place_finger": {
+    "en": "Place your finger on the sensor...",
+    "zh-CN": "请将手指放在传感器上…"
+  },
+  "enrollment.state.lift_finger": {
+    "en": "Lift your finger, then press again...",
+    "zh-CN": "抬起手指，然后再次按压…"
+  },
+  "enrollment.state.overlap": {
+    "en": "Too similar — shift your finger and press again",
+    "zh-CN": "位置过于相似，请移动手指后再次按压"
+  },
+  "enrollment.state.processing": {
+    "en": "Processing...",
+    "zh-CN": "正在处理…"
+  },
+  "enrollment.error.disconnected": {
+    "en": "Device disconnected before enrollment finished. Reconnect the device and try again.",
+    "zh-CN": "指纹录入完成前设备已断开连接。请重新连接设备后再试。"
+  },
+  "enrollment.error.failed": {
+    "en": "Enrollment failed. Please try again.",
+    "zh-CN": "指纹录入失败，请重试。"
+  },
+  "nav.device": {
+    "en": "Device",
+    "zh-CN": "设备"
+  },
+  "nav.features": {
+    "en": "Features",
+    "zh-CN": "功能"
+  },
+  "nav.keys": {
+    "en": "Keys",
+    "zh-CN": "密钥"
+  },
+  "nav.fingerprints": {
+    "en": "Fingerprints",
+    "zh-CN": "指纹"
+  },
+  "nav.pam": {
+    "en": "PAM",
+    "zh-CN": "PAM"
+  },
+  "nav.logs": {
+    "en": "Logs",
+    "zh-CN": "日志"
+  },
+  "menu.setup": {
+    "en": "Setup Wizard…",
+    "zh-CN": "设置向导…"
+  },
+  "menu.quit": {
+    "en": "Quit",
+    "zh-CN": "退出"
+  },
+  "menu.tooltip": {
+    "en": "Menu",
+    "zh-CN": "菜单"
+  },
+  "firmware.update_wait": {
+    "en": "Firmware update in progress — please wait.",
+    "zh-CN": "固件更新正在进行，请稍候。"
+  },
+  "feature.title": {
+    "en": "Features",
+    "zh-CN": "功能"
+  },
+  "feature.description": {
+    "en": "Each toggle takes effect immediately.",
+    "zh-CN": "每个开关都会立即生效。"
+  },
+  "feature.sudo.title": {
+    "en": "sudo with fingerprint",
+    "zh-CN": "使用指纹验证 sudo"
+  },
+  "feature.sudo.subtitle": {
+    "en": "Touch the device instead of typing your password for sudo",
+    "zh-CN": "触摸设备，无需为 sudo 输入密码"
+  },
+  "feature.polkit.title": {
+    "en": "System authorization (polkit)",
+    "zh-CN": "系统授权（polkit）"
+  },
+  "feature.polkit.subtitle": {
+    "en": "Touch the device for graphical authorization prompts",
+    "zh-CN": "图形化授权提示出现时触摸设备"
+  },
+  "feature.screen.title": {
+    "en": "Unlock screen",
+    "zh-CN": "解锁屏幕"
+  },
+  "feature.screen.subtitle": {
+    "en": "Touch the device to unlock the lock screen",
+    "zh-CN": "触摸设备解锁屏幕"
+  },
+  "feature.lock.title": {
+    "en": "Long-press to lock",
+    "zh-CN": "长按锁定"
+  },
+  "feature.lock.subtitle": {
+    "en": "Long-press the sensor to lock the screen",
+    "zh-CN": "长按传感器锁定屏幕"
+  },
+  "feature.ssh.title": {
+    "en": "SSH agent takeover",
+    "zh-CN": "接管 SSH agent"
+  },
+  "feature.ssh.subtitle": {
+    "en": "Let ssh use the keys on the device",
+    "zh-CN": "允许 ssh 使用设备上的密钥"
+  },
+  "feature.save_failed": {
+    "en": "Failed to save setting: %{error}",
+    "zh-CN": "保存设置失败：%{error}"
+  },
+  "sidebar.connecting": {
+    "en": "Connecting to daemon…",
+    "zh-CN": "正在连接 daemon…"
+  },
+  "sidebar.bluetooth.connected": {
+    "en": "Bluetooth: connected",
+    "zh-CN": "蓝牙：已连接"
+  },
+  "sidebar.bluetooth.starting": {
+    "en": "Bluetooth: connected, device starting up…",
+    "zh-CN": "蓝牙：已连接，设备正在启动…"
+  },
+  "sidebar.bluetooth.disconnected": {
+    "en": "Bluetooth: not connected",
+    "zh-CN": "蓝牙：未连接"
+  },
+  "sidebar.link.no_longer": {
+    "en": "Link: no longer linked",
+    "zh-CN": "绑定：设备已解除绑定"
+  },
+  "sidebar.link.linked": {
+    "en": "Link: linked",
+    "zh-CN": "绑定：已绑定"
+  },
+  "sidebar.link.not_linked": {
+    "en": "Link: not linked",
+    "zh-CN": "绑定：未绑定"
+  },
+  "sidebar.link.shown_once": {
+    "en": "Link: shown once connected",
+    "zh-CN": "绑定：连接后显示"
+  },
+  "sidebar.tooltip.unpaired": {
+    "en": "The device no longer knows this computer. Link it again from the Device page.",
+    "zh-CN": "设备已不认识这台电脑，请从“设备”页面重新绑定。"
+  },
+  "sidebar.tooltip.bluetooth_only": {
+    "en": "Bluetooth only lets this computer see the device. Link it so the device can authenticate you.",
+    "zh-CN": "蓝牙只能让这台电脑看到设备，请完成绑定后才能使用设备认证。"
+  },
+  "sidebar.daemon_unavailable": {
+    "en": "Daemon unavailable",
+    "zh-CN": "daemon 不可用"
+  },
+  "sidebar.show_params": {
+    "en": "Show the Bluetooth connection parameters",
+    "zh-CN": "显示蓝牙连接参数"
+  },
+  "sidebar.reading_params": {
+    "en": "Reading connection parameters from the device…",
+    "zh-CN": "正在从设备读取连接参数…"
+  },
+  "sidebar.read_params_failed": {
+    "en": "Could not read the connection parameters: %{error}",
+    "zh-CN": "无法读取连接参数：%{error}"
+  },
+  "sidebar.read_params_unavailable": {
+    "en": "Could not read the connection parameters.",
+    "zh-CN": "无法读取连接参数。"
+  },
+  "sidebar.firmware": {
+    "en": "Firmware %{version}",
+    "zh-CN": "固件 %{version}"
+  },
+  "sidebar.connection.title": {
+    "en": "Bluetooth connection parameters",
+    "zh-CN": "蓝牙连接参数"
+  },
+  "sidebar.connection.interval": {
+    "en": "Connection interval: %{value} ms",
+    "zh-CN": "连接间隔：%{value} ms"
+  },
+  "sidebar.connection.latency": {
+    "en": "Peripheral latency: %{value} intervals (up to %{effective} ms between packets)",
+    "zh-CN": "外设延迟：%{value} 个间隔（数据包间最长 %{effective} ms）"
+  },
+  "sidebar.connection.timeout": {
+    "en": "Supervision timeout: %{value} ms",
+    "zh-CN": "监控超时：%{value} ms"
+  },
+  "sidebar.connection.long_enough": {
+    "en": "Long enough for linking and SSH signing.",
+    "zh-CN": "连接参数足够支持绑定和 SSH 签名。"
+  },
+  "sidebar.connection.too_short": {
+    "en": "Too short for linking and SSH signing (the device needs at least %{minimum} ms and asks this computer for %{requested} ms). If linking fails, disconnect and reconnect the device.",
+    "zh-CN": "参数过短，无法可靠支持绑定和 SSH 签名（设备至少需要 %{minimum} ms，并要求这台电脑使用 %{requested} ms）。如果绑定失败，请断开并重新连接设备。"
+  },
+  "sidebar.connection.markup": {
+    "en": "<b>%{title}</b>\n%{interval}\n%{latency}\n%{timeout}\n\n<small>%{verdict}</small>",
+    "zh-CN": "<b>%{title}</b>\n%{interval}\n%{latency}\n%{timeout}\n\n<small>%{verdict}</small>"
+  },
+  "auth.title.agent": {
+    "en": "Agent authorization request",
+    "zh-CN": "代理授权请求"
+  },
+  "auth.title.fingerprint": {
+    "en": "Fingerprint authentication",
+    "zh-CN": "指纹认证"
+  },
+  "auth.body.agent": {
+    "en": "The agent is requesting permission to run a command. Touch fingerprint to approve:",
+    "zh-CN": "代理请求执行命令的权限。请触摸指纹设备以批准："
+  },
+  "auth.body.fingerprint": {
+    "en": "Touch the fingerprint sensor to authenticate",
+    "zh-CN": "请触摸指纹传感器完成认证"
+  },
+  "auth.cli.description": {
+    "en": "immurok auth dialog",
+    "zh-CN": "immurok 认证对话框"
+  },
+  "auth.cli.agent_help": {
+    "en": "agent approval mode (show command + countdown)",
+    "zh-CN": "代理授权模式（显示命令和倒计时）"
+  },
+  "auth.cli.command_help": {
+    "en": "wrapped command string (agent mode only)",
+    "zh-CN": "被包装的命令（仅代理模式）"
+  },
+  "auth.cli.timeout_help": {
+    "en": "countdown seconds (default 30)",
+    "zh-CN": "倒计时秒数（默认 30）"
+  },
+  "notification.device_unpaired": {
+    "en": "Device is no longer paired with this computer — run 'immurok-cli pair' to pair again",
+    "zh-CN": "设备已不再与这台电脑绑定，请运行“immurok-cli pair”重新绑定"
+  },
+  "device.two_hosts": {
+    "en": "Two Hosts",
+    "zh-CN": "双主机"
+  },
+  "device.host_title": {
+    "en": "Host %{n}",
+    "zh-CN": "主机 %{n}"
+  },
+  "device.this_computer": {
+    "en": "This computer",
+    "zh-CN": "这台电脑"
+  },
+  "device.not_linked": {
+    "en": "○ Not linked",
+    "zh-CN": "○ 未绑定"
+  },
+  "device.linked": {
+    "en": "● Linked",
+    "zh-CN": "● 已绑定"
+  },
+  "device.empty_slot_hint": {
+    "en": "To fill this slot, open immurok on that computer and click \"Link This Computer\".",
+    "zh-CN": "要填充此槽位，请在另一台电脑上打开 immurok，然后点击“绑定此电脑”。"
+  },
+  "device.foreign_slot_hint": {
+    "en": "Linked to another computer. Link this computer first to manage this slot.",
+    "zh-CN": "此槽位已绑定另一台电脑。请先绑定这台电脑后再管理此槽位。"
+  },
+  "device.link": {
+    "en": "Link This Computer",
+    "zh-CN": "绑定此电脑"
+  },
+  "device.unlink": {
+    "en": "Unlink",
+    "zh-CN": "解除绑定"
+  },
+  "device.connecting": {
+    "en": "Connecting to daemon…",
+    "zh-CN": "正在连接 daemon…"
+  },
+  "device.daemon_unavailable": {
+    "en": "Daemon unavailable.",
+    "zh-CN": "daemon 不可用。"
+  },
+  "device.not_connected": {
+    "en": "Device not connected. Link status will appear once connected.",
+    "zh-CN": "设备未连接。连接设备后将显示绑定状态。"
+  },
+  "device.host_status_unavailable": {
+    "en": "Host status unavailable.",
+    "zh-CN": "主机状态不可用。"
+  },
+  "device.no_two_hosts": {
+    "en": "This firmware does not support two hosts.",
+    "zh-CN": "此固件不支持双主机。"
+  },
+  "device.host_unverified": {
+    "en": "Could not verify which host slot belongs to this computer.",
+    "zh-CN": "无法确认哪个主机槽位属于这台电脑。"
+  },
+  "device.both_slots": {
+    "en": "Both host slots are in use. To swap one out, unlink it on that computer first.",
+    "zh-CN": "两个主机槽位都已使用。如需更换，请先在对应电脑上解除绑定。"
+  },
+  "device.dual_hint": {
+    "en": "This device can be linked to up to two computers. Touch the switch fingerprint to move between them.",
+    "zh-CN": "此设备最多可绑定两台电脑。触摸切换指纹即可在两台电脑之间切换。"
+  },
+  "device.confirm_unlink_title": {
+    "en": "Unlink from this computer?",
+    "zh-CN": "解除与这台电脑的绑定？"
+  },
+  "device.confirm_unlink_body": {
+    "en": "The device clears this computer's host slot and the link key stored here is deleted. Fingerprints and keys on the device, and the other host's link, are not affected.",
+    "zh-CN": "设备将清除这台电脑的主机槽位，并删除本机保存的绑定密钥。设备上的指纹和密钥，以及另一台电脑的绑定不会受到影响。"
+  },
+  "device.unlinked": {
+    "en": "Unlinked",
+    "zh-CN": "已解除绑定"
+  },
+  "device.unlink_failed": {
+    "en": "Unlink failed: %{error}",
+    "zh-CN": "解除绑定失败：%{error}"
+  },
+  "device.linked_toast": {
+    "en": "Linked",
+    "zh-CN": "已绑定"
+  },
+  "device.linking_failed": {
+    "en": "Linking failed",
+    "zh-CN": "绑定失败"
+  },
+  "device.host_unlink_title": {
+    "en": "Unlink Host %{n}?",
+    "zh-CN": "解除主机 %{n} 的绑定？"
+  },
+  "device.host_unlink_body": {
+    "en": "That computer will no longer be able to authenticate with this device until it links again. Requires one touch of an enrolled finger.",
+    "zh-CN": "在重新绑定前，那台电脑将无法使用此设备进行认证。需要触摸一次已录入的指纹。"
+  },
+  "device.touch_unlink": {
+    "en": "Touch an enrolled finger on the device to confirm unlinking the other host.",
+    "zh-CN": "请触摸设备上的已录入指纹，以确认解除另一台主机的绑定。"
+  },
+  "device.host_unlinked": {
+    "en": "Host %{n} unlinked",
+    "zh-CN": "主机 %{n} 已解除绑定"
+  },
+  "firmware.title": {
+    "en": "Firmware",
+    "zh-CN": "固件"
+  },
+  "firmware.check_again": {
+    "en": "Check again",
+    "zh-CN": "再次检查"
+  },
+  "firmware.retry_check": {
+    "en": "Retry check",
+    "zh-CN": "重试检查"
+  },
+  "firmware.version": {
+    "en": "Version",
+    "zh-CN": "版本"
+  },
+  "firmware.update": {
+    "en": "Update",
+    "zh-CN": "更新"
+  },
+  "firmware.checking": {
+    "en": "Checking for updates…",
+    "zh-CN": "正在检查更新…"
+  },
+  "firmware.up_to_date": {
+    "en": "Up to date",
+    "zh-CN": "已是最新版本"
+  },
+  "firmware.plan_resume": {
+    "en": "Plan: resume interrupted update",
+    "zh-CN": "计划：继续未完成的更新"
+  },
+  "firmware.plan_bridge": {
+    "en": "Plan: 2 hops (bridge %{from} → %{to})",
+    "zh-CN": "计划：两步更新（中间版本 %{from} → %{to}）"
+  },
+  "firmware.plan_direct": {
+    "en": "Plan: direct (1 hop)",
+    "zh-CN": "计划：直接更新（一步）"
+  },
+  "firmware.updating": {
+    "en": "Updating…",
+    "zh-CN": "正在更新…"
+  },
+  "firmware.update_complete": {
+    "en": "Update complete — device is now on %{version}.",
+    "zh-CN": "更新完成——设备当前版本为 %{version}。"
+  },
+  "firmware.could_not_check": {
+    "en": "Could not check: %{error}",
+    "zh-CN": "无法检查：%{error}"
+  },
+  "firmware.power_warning": {
+    "en": "Do not power off the device.",
+    "zh-CN": "请勿关闭设备电源。"
+  },
+  "firmware.old_signing": {
+    "en": "Firmware outdated (old signing era) — update to keep unlocking and key operations working. %{status}",
+    "zh-CN": "固件已过时（旧签名版本）——请更新以继续使用解锁和密钥功能。%{status}"
+  },
+  "firmware.starting": {
+    "en": "Starting…",
+    "zh-CN": "正在启动…"
+  },
+  "firmware.updated": {
+    "en": "Firmware updated",
+    "zh-CN": "固件已更新"
+  },
+  "firmware.check_failed": {
+    "en": "Check failed",
+    "zh-CN": "检查失败"
+  },
+  "firmware.writing": {
+    "en": "writing firmware",
+    "zh-CN": "正在写入固件"
+  },
+  "firmware.waiting_reboot": {
+    "en": "waiting for device reboot",
+    "zh-CN": "等待设备重启"
+  },
+  "firmware.hop": {
+    "en": "hop %{hop}/%{hops}: %{stage}",
+    "zh-CN": "第 %{hop}/%{hops} 步：%{stage}"
+  },
+  "keys.add_entry": {
+    "en": "Add %{category} entry",
+    "zh-CN": "添加 %{category} 条目"
+  },
+  "keys.empty.otp.title": {
+    "en": "Add your first OTP entry",
+    "zh-CN": "添加第一个 OTP 条目"
+  },
+  "keys.empty.otp.subtitle": {
+    "en": "Generates a 6-digit code after you touch the device",
+    "zh-CN": "触摸设备后生成 6 位验证码"
+  },
+  "keys.empty.api.title": {
+    "en": "Add your first API key",
+    "zh-CN": "添加第一个 API 密钥"
+  },
+  "keys.empty.api.subtitle": {
+    "en": "Shows the stored value after you touch the device",
+    "zh-CN": "触摸设备后显示保存的值"
+  },
+  "keys.empty.ssh.title": {
+    "en": "Add your first SSH key",
+    "zh-CN": "添加第一个 SSH 密钥"
+  },
+  "keys.empty.ssh.subtitle": {
+    "en": "Public key can be copied; signing goes through the SSH agent",
+    "zh-CN": "可复制公钥；签名通过 SSH agent 完成"
+  },
+  "keys.copy_code": {
+    "en": "Copy code",
+    "zh-CN": "复制验证码"
+  },
+  "keys.code_copied": {
+    "en": "Code copied",
+    "zh-CN": "验证码已复制"
+  },
+  "keys.get_code": {
+    "en": "Get code",
+    "zh-CN": "获取验证码"
+  },
+  "keys.show": {
+    "en": "Show",
+    "zh-CN": "显示"
+  },
+  "keys.copy_public_key": {
+    "en": "Copy public key",
+    "zh-CN": "复制公钥"
+  },
+  "keys.delete_tooltip": {
+    "en": "Delete (requires a touch on the device)",
+    "zh-CN": "删除（需要触摸设备确认）"
+  },
+  "keys.device_not_connected": {
+    "en": "Device not connected",
+    "zh-CN": "设备未连接"
+  },
+  "keys.keystore_full": {
+    "en": "Keystore full — delete an entry first",
+    "zh-CN": "密钥库已满——请先删除一个条目"
+  },
+  "keys.added": {
+    "en": "%{category} “%{name}” added",
+    "zh-CN": "%{category}“%{name}”已添加"
+  },
+  "keys.public_key_copied": {
+    "en": "Public key copied",
+    "zh-CN": "公钥已复制"
+  },
+  "keys.touch_device": {
+    "en": "Touch the device…",
+    "zh-CN": "请触摸设备…"
+  },
+  "keys.read_failed": {
+    "en": "Read failed: %{error}",
+    "zh-CN": "读取失败：%{error}"
+  },
+  "keys.delete_confirm_title": {
+    "en": "Delete %{category} “%{name}”?",
+    "zh-CN": "删除 %{category}“%{name}”？"
+  },
+  "keys.delete_confirm_body": {
+    "en": "This requires a touch on the device and cannot be undone.",
+    "zh-CN": "此操作需要触摸设备确认，且无法撤销。"
+  },
+  "keys.delete": {
+    "en": "Delete",
+    "zh-CN": "删除"
+  },
+  "keys.touch_delete": {
+    "en": "Touch the device to confirm deletion…",
+    "zh-CN": "请触摸设备确认删除…"
+  },
+  "keys.deleted": {
+    "en": "Deleted",
+    "zh-CN": "已删除"
+  },
+  "keys.delete_failed": {
+    "en": "Delete failed: %{error}",
+    "zh-CN": "删除失败：%{error}"
+  }
+}
