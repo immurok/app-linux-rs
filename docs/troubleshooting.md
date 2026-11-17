@@ -53,6 +53,17 @@ immurok-cli logs | grep BLE  # needs the daemon started with --debug (README, "L
                               # the CLI reads the log over the socket, not the journal
 ```
 
+The daemon uses `hci0` by default. If the device is connected through another
+adapter, point the daemon at it by name or MAC:
+
+```bash
+sudo mkdir -p /etc/immurok
+echo 'IMMUROK_ADAPTER=A8:29:DC:30:78:7A' | sudo tee -a /etc/immurok/daemon.env
+sudo systemctl restart immurok-daemon
+```
+
+The MAC is safer than `hci1`, since the numbering can change between boots.
+
 ## Device repeatedly disconnects/reconnects (`ATT error: 0x0e` in logs)
 
 BlueZ cached stale GATT handles from an old firmware layout. Forget and re-pair once:

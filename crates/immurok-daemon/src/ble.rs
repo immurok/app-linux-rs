@@ -34,6 +34,39 @@ use crate::keystore;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Environment variable that pins the daemon to one Bluetooth adapter.
+/// Accepts an adapter name (`hci1`) or its MAC address (`A8:29:DC:30:78:7A`).
+/// The MAC form is preferred: `hciN` numbering follows USB enumeration order
+/// and can swap between boots on machines with more than one adapter.
+const ADAPTER_ENV: &str = "IMMUROK_ADAPTER";
+
+/// The adapter the daemon talks to. Without `IMMUROK_ADAPTER` this is bluer's
+/// default (hci0 if present), so behaviour is unchanged for single-adapter
+/// machines. When it is set but matches nothing, fail instead of silently
+/// falling back: a fallback to the wrong adapter is exactly the "device
+/// connected in Bluetooth settings but invisible to immurok" symptom.
+async fn select_adapter(session: &bluer::Session) -> bluer::Result<bluer::Adapter> {
+    let wanted = match std::env::var(ADAPTER_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => return session.default_adapter().await,
+    };
+    for name in session.adapter_names().await? {
+        let adapter = session.adapter(&name)?;
+        if name.eq_ignore_ascii_case(&wanted) {
+            return Ok(adapter);
+        }
+        if let Ok(addr) = adapter.address().await {
+            if addr.to_string().eq_ignore_ascii_case(&wanted) {
+                return Ok(adapter);
+            }
+        }
+    }
+    Err(bluer::Error {
+        kind: bluer::ErrorKind::NotFound,
+        message: format!("{}={} matches no Bluetooth adapter", ADAPTER_ENV, wanted),
+    })
+}
+
 // ── Main run loop ───────────────────────────────────────────────────────────
 
 pub async fn run(coordinator: Arc<Coordinator>, mut cmd_rx: mpsc::Receiver<BleCommand>) {
@@ -150,7 +183,7 @@ fn classify_session_end(err: Option<&str>) -> LinkVerdict {
 /// still needs its dead link torn down.
 async fn drop_ghost_link() {
     let Ok(session) = bluer::Session::new().await else { return };
-    let Ok(adapter) = session.default_adapter().await else { return };
+    let Ok(adapter) = select_adapter(&session).await else { return };
     let Ok(addrs) = adapter.device_addresses().await else { return };
     for addr in addrs {
         let Ok(device) = adapter.device(addr) else { continue };
@@ -464,7 +497,7 @@ async fn wait_for_device_connected(coordinator: &Arc<Coordinator>) {
 /// don't want to wedge the wait loop behind a stuck D-Bus call.
 async fn try_active_connect() -> bool {
     let Ok(session) = bluer::Session::new().await else { return false };
-    let Ok(adapter) = session.default_adapter().await else { return false };
+    let Ok(adapter) = select_adapter(&session).await else { return false };
     let Ok(addrs) = adapter.device_addresses().await else { return false };
 
     for addr in addrs {
@@ -538,7 +571,7 @@ async fn cancel_connect_on(device: &bluer::Device) {
 /// suspend so no LE create-connection is carried across the sleep boundary.
 pub async fn cancel_pending_connect() {
     let Ok(session) = bluer::Session::new().await else { return };
-    let Ok(adapter) = session.default_adapter().await else { return };
+    let Ok(adapter) = select_adapter(&session).await else { return };
     let Ok(addrs) = adapter.device_addresses().await else { return };
     for addr in addrs {
         let Ok(device) = adapter.device(addr) else { continue };
@@ -560,7 +593,7 @@ pub async fn cancel_pending_connect() {
 pub async fn forget_bond(addr: &str) -> Result<(), String> {
     let parsed: bluer::Address = addr.parse().map_err(|e| format!("bad address {}: {}", addr, e))?;
     let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
-    let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
+    let adapter = select_adapter(&session).await.map_err(|e| e.to_string())?;
     match tokio::time::timeout(Duration::from_secs(5), adapter.remove_device(parsed)).await {
         Ok(Ok(())) => {
             info!("Removed stale BlueZ bond {}", addr);
@@ -574,7 +607,7 @@ pub async fn forget_bond(addr: &str) -> Result<(), String> {
 /// Check if any immurok device is connected with services resolved (HID keyboard ready).
 async fn check_immurok_connected() -> bool {
     let Ok(session) = bluer::Session::new().await else { return false };
-    let Ok(adapter) = session.default_adapter().await else { return false };
+    let Ok(adapter) = select_adapter(&session).await else { return false };
     let Ok(addrs) = adapter.device_addresses().await else { return false };
     for addr in addrs {
         let Ok(device) = adapter.device(addr) else { continue };
@@ -593,7 +626,7 @@ async fn check_immurok_connected() -> bool {
 /// Also waits for GATT services to be resolved (instead of fixed sleep).
 async fn find_immurok_device_path() -> Result<Option<(String, String)>, BoxError> {
     let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
+    let adapter = select_adapter(&session).await?;
     let adapter_name = adapter.name().to_string();
 
     for addr in adapter.device_addresses().await? {
