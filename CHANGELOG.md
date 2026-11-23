@@ -3,6 +3,14 @@
 All notable changes to the immurok Linux companion (daemon, CLI/TUI and PAM
 module) are documented here. Versions follow the workspace crate version.
 
+## Unreleased
+
+### Fixed
+
+- Daemon: fingerprint unlock now works on lockers that honour logind's
+  `Unlock` but never set `LockedHint` (COSMIC). Polkit/login follow-up
+  pre-auth still needs an observed `LockedHint` lock.
+
 ## 0.9.4 — 2026-11-12
 
 ### Security

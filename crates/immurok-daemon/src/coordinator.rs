@@ -4,7 +4,7 @@
 //! - Shared state (pairing, settings, device_status, verified flag, screen_locked flag)
 //! - Channels for cross-module communication (BLE commands, FP match events, enroll events)
 //! - PAM pre-authorization window management
-//! - FP match routing: pending PAM → approve | screen locked → loginctl unlock | else → set pre-auth
+//! - FP match routing: pending PAM → approve | unlock enabled → loginctl unlock | else → ignore
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -292,7 +292,7 @@ impl Coordinator {
         true
     }
 
-    /// Core FP match routing logic — 3-way: pending PAM → approve | screen locked → unlock | else → pre-auth
+    /// Core FP match routing logic — 3-way: pending PAM → approve | unlock enabled → unlock | else → ignore
     pub async fn on_fp_match(&self, page_id: u16) {
         // Broadcast to all subscribers (TUI, socket status)
         let _ = self.fp_match_tx.send(FpMatchEvent { page_id });
@@ -312,13 +312,20 @@ impl Coordinator {
             return;
         }
 
-        // 2. Screen locked + unlock enabled? → loginctl unlock-session
+        // 2. Unlock enabled? → loginctl unlock-session
         let settings = self.settings.read().await;
-        if self.screen_locked.load(Ordering::Relaxed) && settings.unlock_screen {
+        if settings.unlock_screen {
             drop(settings);
-            info!("FP match → unlocking screen");
+            let known_locked = self.screen_locked.load(Ordering::Relaxed);
+            info!("FP match → unlocking screen (LockedHint locked: {known_locked})");
             *self.last_auth_flow.write().await = Some(Instant::now());
-            self.unlock_screen().await;
+            if self.unlock_screen().await && known_locked {
+                self.set_pre_auth(
+                    Duration::from_secs(immurok_common::protocol::PRE_AUTH_DURATION_SECS),
+                    UNLOCK_FOLLOWUP_SERVICES,
+                )
+                .await;
+            }
             return;
         }
 
@@ -401,10 +408,10 @@ impl Coordinator {
         crate::session::graphical_session_id(uid).await
     }
 
-    async fn unlock_screen(&self) {
+    async fn unlock_screen(&self) -> bool {
         let Some(session_id) = self.target_session().await else {
             warn!("Cannot unlock: no graphical session for the device owner");
-            return;
+            return false;
         };
         let result = tokio::process::Command::new("loginctl")
             .arg("unlock-session")
@@ -414,14 +421,16 @@ impl Coordinator {
         match result {
             Ok(output) if output.status.success() => {
                 info!("Screen unlocked via loginctl (session {})", session_id);
-                self.set_pre_auth(
-                    Duration::from_secs(immurok_common::protocol::PRE_AUTH_DURATION_SECS),
-                    UNLOCK_FOLLOWUP_SERVICES,
-                )
-                .await;
+                true
             }
-            Ok(output) => warn!("loginctl unlock-session failed: {:?}", output.status),
-            Err(e) => warn!("Failed to run loginctl: {}", e),
+            Ok(output) => {
+                warn!("loginctl unlock-session failed: {:?}", output.status);
+                false
+            }
+            Err(e) => {
+                warn!("Failed to run loginctl: {}", e);
+                false
+            }
         }
     }
 

@@ -12,9 +12,10 @@
 //! object) and then ask logind for the authoritative state, plus a slow poll
 //! so a missed signal self-corrects.
 //!
-//! Compositors that never set LockedHint (swaylock, i3lock) look permanently
-//! unlocked — the same blind spot the screensaver-signal version had, since
-//! they do not emit those signals either.
+//! Lockers that never set LockedHint (COSMIC, swaylock, i3lock) look
+//! permanently unlocked. A touch still sends logind's Unlock, which COSMIC
+//! honours, but the follow-up pre-auth window is only armed after a lock seen
+//! here.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

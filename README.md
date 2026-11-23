@@ -64,9 +64,9 @@ Linux 5.10+, a BLE 4.2+ adapter, systemd (the daemon is a system service, the
 session agent a per-user one), PAM 1.4+, polkit 0.120+, and a GTK4-capable
 desktop.
 
-Screen unlock relies on the locker setting logind's `LockedHint`, which GNOME
-and KDE do. swaylock, i3lock and similar lockers are not detected, so the touch
-does nothing there; `sudo` and polkit still work.
+Screen unlock sends logind's `Unlock`, so it works on GNOME, KDE and COSMIC.
+swaylock, i3lock and similar lockers ignore it, so the touch does nothing
+there; `sudo` and polkit still work.
 
 > musl distributions (Alpine, Void musl) are not supported — the PAM module needs glibc.
 
