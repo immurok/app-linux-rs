@@ -20,7 +20,7 @@ sudo cp pam/pam_immurok.so /usr/lib64/security/   # use the path found above
 
 ## sudo asks for a password instead of popping the fingerprint dialog
 
-- The daemon isn't running: `sudo systemctl start immurok-daemon`
+- The daemon isn't running: `sudo systemctl start immurok-daemon` to start once, or `sudo systemctl enable immurok-daemon` to start on boot
 - The device isn't connected: `immurok-cli status` should show `Status: Connected`
 - PAM doesn't have immurok: `sudo grep pam_immurok /etc/pam.d/sudo`; if empty, run `immurok-cli pam install sudo` (a wrapper around `sudo immurok-pam-helper add sudo`)
 
@@ -92,6 +92,10 @@ than 0.9 — it has no `retire` action — stop it once by hand:
 pkill -f 'immurok-gui --gapplication-service'
 immurok-gui
 ```
+
+## unable to login after boot/resume
+
+Run `sudo systemctl enable immurok-daemon` to start the service on boot.
 
 ## Notes per desktop environment
 
