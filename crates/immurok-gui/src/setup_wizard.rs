@@ -460,7 +460,7 @@ impl SetupWizard {
         let daemon_error = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).build();
         daemon_error.add_css_class("caption");
         daemon_error.add_css_class("dim-label");
-        let daemon_cmd = gtk::Label::new(Some("sudo systemctl start immurok-daemon"));
+        let daemon_cmd = gtk::Label::new(Some("sudo systemctl enable immurok-daemon"));
         daemon_cmd.set_selectable(true);
         daemon_cmd.add_css_class("monospace");
         daemon_box.append(&daemon_title);
